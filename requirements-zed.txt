@@ -1,0 +1,4 @@
+# Install into the dedicated Windows ZED virtual environment.
+# pyzed itself is installed by ZED SDK/get_python_api.py.
+numpy>=2.0,<3
+opencv-python>=4.10,<5

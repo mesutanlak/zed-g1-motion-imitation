@@ -1,0 +1,32 @@
+{
+  "schema": "zed_g1_isaaclab_environment/v1",
+  "created": "2026-07-29",
+  "wsl_distribution": "Ubuntu-22.04",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "python": {
+    "isaac": "3.11",
+    "gmr": "3.10"
+  },
+  "packages": {
+    "isaac_sim": "5.0.0",
+    "isaac_lab": "v2.2.0",
+    "torch": "2.7.0+cu128",
+    "torchvision": "0.22.0+cu128",
+    "torchaudio": "2.7.0+cu128"
+  },
+  "repositories": {
+    "unitreerobotics/unitree_sim_isaaclab": "e30c25b1dffdf92ada1d6c8c1fe9a47bdde0fecc",
+    "YanjieZe/GMR": "bb1bbe40774794fceb2a7c579a3464a28e68c844",
+    "isaac-sim/IsaacLab": "46dff135f44683f031edf346e544fcfd8456b2bb",
+    "unitreerobotics/unitree_rl_lab": "4960b84732b0c2ec593dccbfe963fda1bcd7b1e3",
+    "unitreerobotics/unitree_ros": "ac7714828e1a4cc2a8ddd5c78a1305475b913a73",
+    "unitreerobotics/unitree_mujoco": "ae6a8403e272733e9996ef59990880330496177f",
+    "unitreerobotics/unitree_sdk2_python": "65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5",
+    "eclipse-cyclonedds/cyclonedds": "5041f3560c088c99e5088b2b8520b69169621196"
+  },
+  "legal_gates": {
+    "nvidia_omniverse_eula": "user_acceptance_required_before_first_run",
+    "anaconda_default_channels_tos": "not_accepted; GMR uses Python venv",
+    "amass_smplx_motionx": "not_downloaded; registration/license required"
+  }
+}

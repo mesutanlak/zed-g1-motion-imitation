@@ -1,0 +1,17 @@
+{
+  "schema": "g1_23dof_tracking_dataset/v1",
+  "clips": [
+    {
+      "file": "zed_body38_20260729_101507_gmr_clip_001.npz",
+      "frames": 69,
+      "duration_s": 2.2666666666666666,
+      "source_segment": 1
+    },
+    {
+      "file": "zed_body38_20260729_101507_gmr_clip_003.npz",
+      "frames": 1477,
+      "duration_s": 49.2,
+      "source_segment": 3
+    }
+  ]
+}

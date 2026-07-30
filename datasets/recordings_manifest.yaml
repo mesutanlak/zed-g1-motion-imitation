@@ -1,0 +1,91 @@
+schema: zed_g1_motion_dataset/v1
+purpose: perception_and_retargeting_references_only
+safety: no_physical_robot_commands
+analysis_quality_manifest: C:/Users/Misafir/Desktop/ZED_G1_Projesi/datasets/analysis_quality_manifest.json
+records:
+  - id: zed_body38_20260730_130903
+    jsonl: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260730_130903.jsonl
+    gmr_npz: C:/Users/Misafir/Desktop/ZED_G1_Projesi/datasets/zed_body38_20260730_130903_gmr.npz
+    tracking_index: C:/Users/Misafir/Desktop/ZED_G1_Projesi/datasets/tracking/zed_body38_20260730_130903/index.json
+    frames: 3323
+    retargeted_frames: 3245
+    active_fps: 15.00
+    use:
+      role: upper_body_baseline
+      upper_body_tracking_weight: 1.0
+      lower_body_tracking_weight: 0.0
+    quality:
+      upper_body_observability_percent: 98.89
+      whole_body_core_percent: 97.74
+      distance_inside_2_4m_percent: 99.52
+    notes: Best new long upper-body baseline; use after GMR retargeting.
+  - id: zed_body38_20260730_102827
+    jsonl: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260730_102827.jsonl
+    frames: 2926
+    active_fps: 15.00
+    use:
+      role: upper_body_validation
+      upper_body_tracking_weight: 0.9
+      lower_body_tracking_weight: 0.0
+    quality:
+      upper_body_observability_percent: 98.43
+      whole_body_core_percent: 95.11
+      distance_inside_2_4m_percent: 98.39
+    notes: Independent long validation sequence with stable distance.
+  - id: zed_body38_20260730_114421
+    jsonl: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260730_114421.jsonl
+    frames: 2716
+    active_fps: 14.99
+    use:
+      role: hands_and_occlusion_validation
+      upper_body_tracking_weight: 0.75
+      lower_body_tracking_weight: 0.0
+    quality:
+      upper_body_observability_percent: 97.68
+      left_dex3_source_percent: 88.51
+      right_dex3_source_percent: 85.53
+    notes: Strongest new BODY_38 hand-proxy coverage; not Dex3 motor ground truth.
+  - id: zed_body38_20260730_153223
+    jsonl: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260730_153223.jsonl
+    frames: 5376
+    active_fps: 14.99
+    use:
+      role: difficult_case_validation
+      upper_body_tracking_weight: 0.35
+      lower_body_tracking_weight: 0.0
+    quality:
+      upper_body_observability_percent: 96.32
+      whole_body_core_percent: 40.18
+      distance_inside_2_4m_percent: 96.00
+    notes: Long hard-case sequence; validation only, never a clean baseline.
+  - id: zed_body38_20260729_101507
+    jsonl: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260729_101507.jsonl
+    svo2: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260729_101507.svo2
+    frames: 1732
+    active_fps: 29.97
+    all_primary_targets_ratio: 0.835
+    use:
+      upper_body_tracking_weight: 1.0
+      lower_body_tracking_weight: 0.45
+    notes: New arm-rich capture; two long capture gaps must be split before training.
+  - id: zed_body38_20260728_174739
+    jsonl: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260728_174739.jsonl
+    svo2: C:/Users/Misafir/Desktop/ZED_G1_Projesi/recordings/zed_body38_20260728_174739.svo2
+    frames: 2087
+    active_fps: 29.97
+    all_primary_targets_ratio: 0.848
+    use:
+      upper_body_tracking_weight: 0.65
+      lower_body_tracking_weight: 1.0
+    notes: Leg-rich capture; complements the 20260729 recording.
+training_rules:
+  split_on_timestamp_gap_s: 0.20
+  reject_below_body_confidence: 50
+  reject_below_primary_target_ratio: 0.75
+  retain_svo2_for_reprocessing: true
+  never_treat_body38_finger_proxies_as_dex3_joint_ground_truth: true
+  analysis_baseline_ids:
+    - body38_analysis_20260730_144046
+  occlusion_challenge_ids:
+    - body38_analysis_20260730_153334
+  reject_metadata_only_or_short_analysis_records: true

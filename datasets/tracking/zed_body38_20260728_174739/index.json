@@ -1,0 +1,35 @@
+{
+  "schema": "g1_23dof_tracking_dataset/v1",
+  "clips": [
+    {
+      "file": "zed_body38_20260728_174739_gmr_clip_000.npz",
+      "frames": 127,
+      "duration_s": 4.2,
+      "source_segment": 0
+    },
+    {
+      "file": "zed_body38_20260728_174739_gmr_clip_003.npz",
+      "frames": 784,
+      "duration_s": 26.099999999999998,
+      "source_segment": 3
+    },
+    {
+      "file": "zed_body38_20260728_174739_gmr_clip_004.npz",
+      "frames": 570,
+      "duration_s": 18.966666666666665,
+      "source_segment": 4
+    },
+    {
+      "file": "zed_body38_20260728_174739_gmr_clip_005.npz",
+      "frames": 66,
+      "duration_s": 2.1666666666666665,
+      "source_segment": 5
+    },
+    {
+      "file": "zed_body38_20260728_174739_gmr_clip_006.npz",
+      "frames": 384,
+      "duration_s": 12.766666666666666,
+      "source_segment": 6
+    }
+  ]
+}

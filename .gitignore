@@ -1,0 +1,43 @@
+# Python and editor state
+__pycache__/
+*.py[cod]
+.venv*/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+diagnostic/*.json
+
+# Raw camera captures and generated analysis data are intentionally not in Git.
+# They can contain identifiable human imagery and routinely exceed GitHub limits.
+*.svo
+*.svo2
+recordings/**
+!recordings/README.md
+analysis_recordings/**
+!analysis_recordings/README.md
+!analysis_recordings/NEW_DATA_REPORT_20260730_TR.md
+
+# Runtime logs and generated caches
+analysis/**
+sim_mujoco/*.log
+sim_mujoco/*.err
+*.core
+core.*
+cache/
+
+# ZED SDK wheels are installed by the official SDK helper.
+kurulum/*.whl
+
+# Office temporary files
+~$*
+
+# Accidental nested/empty copy
+ZED_G1_Projesi/

@@ -1,0 +1,3 @@
+numpy>=2.0,<3
+opencv-python>=4.10
+# pyzed is installed with the official ZED SDK get_python_api.py helper.

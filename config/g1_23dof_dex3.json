@@ -1,0 +1,94 @@
+{
+  "schema": "g1_23dof_dex3_mimic_config/v1",
+  "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+  "units": {
+    "position": "meter",
+    "angle": "radian",
+    "time": "second"
+  },
+  "body": {
+    "model": "Unitree G1 23-DOF",
+    "joint_order": [
+      "left_hip_pitch_joint",
+      "left_hip_roll_joint",
+      "left_hip_yaw_joint",
+      "left_knee_joint",
+      "left_ankle_pitch_joint",
+      "left_ankle_roll_joint",
+      "right_hip_pitch_joint",
+      "right_hip_roll_joint",
+      "right_hip_yaw_joint",
+      "right_knee_joint",
+      "right_ankle_pitch_joint",
+      "right_ankle_roll_joint",
+      "waist_yaw_joint",
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint"
+    ]
+  },
+  "hands": {
+    "model": "Unitree Dex3-1",
+    "controlled_axes_total": 14,
+    "joint_order_per_hand": [
+      "thumb_0",
+      "thumb_1",
+      "thumb_2",
+      "middle_0",
+      "middle_1",
+      "index_0",
+      "index_1"
+    ],
+    "left_limits_rad": {
+      "min": [-1.05, -0.724, 0.0, -1.57, -1.75, -1.57, -1.75],
+      "max": [1.05, 1.05, 1.75, 0.0, 0.0, 0.0, 0.0]
+    },
+    "right_limits_rad": {
+      "min": [-1.05, -1.05, -1.75, 0.0, 0.0, 0.0, 0.0],
+      "max": [1.05, 0.742, 0.0, 1.57, 1.75, 1.57, 1.75]
+    },
+    "body38_source_points": [
+      "WRIST",
+      "HAND_THUMB_4",
+      "HAND_INDEX_1",
+      "HAND_MIDDLE_4"
+    ],
+    "body38_is_full_finger_solution": false
+  },
+  "capture_acceptance": {
+    "minimum_duration_s": 10.0,
+    "minimum_effective_fps": 20.0,
+    "minimum_body_confidence": 50.0,
+    "minimum_group_observability_percent": 80.0,
+    "preserve_svo2_for_hand_reprocessing": true
+  },
+  "deployment": {
+    "physical_robot_enabled": false,
+    "required_sequence": [
+      "offline_analysis",
+      "rviz_visualization",
+      "mujoco_kinematic_replay",
+      "mujoco_balance_controller",
+      "hardware_dry_run",
+      "suspended_low_speed_test"
+    ],
+    "required_safety_gates": [
+      "confidence_gate",
+      "joint_position_limits",
+      "joint_velocity_limits",
+      "joint_acceleration_limits",
+      "self_collision_check",
+      "balance_and_support_polygon_check",
+      "watchdog",
+      "dead_man_switch",
+      "operator_emergency_stop"
+    ]
+  }
+}

@@ -1,0 +1,56 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.45
+      Cell Size: 0.5
+      Class: rviz_default_plugins/Grid
+      Color: 110; 125; 135
+      Enabled: true
+      Name: Grid
+      Plane: XY
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: ZED BODY_38 Skeleton
+      Namespaces:
+        body38_bones: true
+        body38_joints: true
+        body38_labels: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /zed/body38/markers
+  Enabled: true
+  Global Options:
+    Background Color: 20; 28; 35
+    Fixed Frame: zed_camera
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 5
+      Focal Point:
+        X: 3
+        Y: 0
+        Z: 1
+      Name: Current View
+      Pitch: 0.15
+      Target Frame: zed_camera
+      Yaw: 3.14
+Window Geometry:
+  Height: 900
+  Width: 1300
