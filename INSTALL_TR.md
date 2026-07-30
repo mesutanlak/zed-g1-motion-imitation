@@ -171,6 +171,17 @@ ZED betiğinin sistem Python'u yerine özel ortamı kullanması gerekirse önce:
 - Sim2real öncesinde eklem limitleri, hız/tork sınırları, self-collision,
   watchdog, düşme engelleme, askı ve fiziksel acil durdurma zorunludur.
 
+## 11. İsteğe bağlı Rerun 3B analiz aracı
+
+Mevcut iskelet panelinden bağımsız Rerun aracı için:
+
+```powershell
+python -m pip install -r .\requirements-rerun.txt
+powershell -ExecutionPolicy Bypass -File .\start_g1_rerun_analysis.ps1
+```
+
+Ayrıntılar: [RERUN_3D_ANALIZ.md](RERUN_3D_ANALIZ.md)
+
 ## Resmi kaynaklar
 
 - ZED Windows kurulumu:
@@ -187,3 +198,5 @@ ZED betiğinin sistem Python'u yerine özel ortamı kullanması gerekirse önce:
   <https://github.com/unitreerobotics/unitree_sim_isaaclab>
 - GMR:
   <https://github.com/YanjieZe/GMR>
+- Rerun Viewer ve Python SDK:
+  <https://rerun.io/docs/getting-started/configure-the-viewer>

@@ -24,6 +24,7 @@ recordings/**
 analysis_recordings/**
 !analysis_recordings/README.md
 !analysis_recordings/NEW_DATA_REPORT_20260730_TR.md
+rerun_recordings/
 
 # Runtime logs and generated caches
 analysis/**
