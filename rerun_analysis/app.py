@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import shutil
 import socket
 import sys
+import sysconfig
 import threading
 import time
 from dataclasses import asdict
@@ -165,6 +167,21 @@ def make_blueprint() -> rrb.Blueprint:
     )
 
 
+def find_rerun_viewer() -> Path:
+    """Locate the Viewer installed by rerun-sdk even when Scripts is not on PATH."""
+    executable = "rerun.exe" if sys.platform == "win32" else "rerun"
+    on_path = shutil.which(executable)
+    if on_path:
+        return Path(on_path)
+    scripts_candidate = Path(sysconfig.get_path("scripts")) / executable
+    if scripts_candidate.is_file():
+        return scripts_candidate
+    raise RuntimeError(
+        "Rerun Viewer executable bulunamadı. "
+        "Kurulum: python -m pip install -r requirements-rerun.txt"
+    )
+
+
 class RerunSkeletonApp:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -183,7 +200,7 @@ class RerunSkeletonApp:
         self.rrd_path = args.output_dir / f"rerun_body38_{stamp}.rrd"
         rr.init("zed_g1_body38_rerun_analysis")
         if not args.no_viewer:
-            rr.spawn()
+            rr.spawn(executable_path=str(find_rerun_viewer()))
             rr.set_sinks(rr.GrpcSink(), rr.FileSink(self.rrd_path))
         else:
             rr.set_sinks(rr.FileSink(self.rrd_path))

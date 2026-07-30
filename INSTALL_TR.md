@@ -177,7 +177,7 @@ Mevcut iskelet panelinden bağımsız Rerun aracı için:
 
 ```powershell
 python -m pip install -r .\requirements-rerun.txt
-powershell -ExecutionPolicy Bypass -File .\start_g1_rerun_analysis.ps1
+powershell -ExecutionPolicy Bypass -File .\start_g1_rerun.ps1
 ```
 
 Ayrıntılar: [RERUN_3D_ANALIZ.md](RERUN_3D_ANALIZ.md)

@@ -9,8 +9,7 @@ $resolved = (Resolve-Path -LiteralPath $Recording).Path
 $scriptsDirectory = (& python -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
 $viewer = Join-Path $scriptsDirectory "rerun.exe"
 if (-not (Test-Path -LiteralPath $viewer)) {
-    throw "Rerun Viewer bulunamadı. Önce: python -m pip install -r .\requirements-rerun.txt"
+    throw "Rerun Viewer bulunamadi. Once: python -m pip install -r .\requirements-rerun.txt"
 }
-Write-Host "Rerun kaydı açılıyor: $resolved"
+Write-Host "Rerun kaydi aciliyor: $resolved"
 & $viewer $resolved
-

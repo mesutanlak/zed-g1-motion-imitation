@@ -16,7 +16,7 @@ python -m pip install -r .\requirements-rerun.txt
 Önce Rerun analizini açın:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start_g1_rerun_analysis.ps1
+powershell -ExecutionPolicy Bypass -File .\start_g1_rerun.ps1
 ```
 
 Sonra ayrı PowerShell'de mevcut ZED yayınını açın:
@@ -32,7 +32,7 @@ Rerun, mevcut analiz UDP kopyasını `15052` portundan alır. Aynı anda eski
 ## Kayıt oynatma
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start_g1_rerun_analysis.ps1 `
+powershell -ExecutionPolicy Bypass -File .\start_g1_rerun.ps1 `
   -Mode playback `
   -InputFile .\recordings\zed_body38_20260730_130903.jsonl
 ```
@@ -82,7 +82,7 @@ sensör verisini içeren özgün kamera kaydıdır. SVO2'yi ZED başlatıcısın
 `-RecordSvo2` ile kaydedin ve analiz oturumuna bağlayın:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start_g1_rerun_analysis.ps1 `
+powershell -ExecutionPolicy Bypass -File .\start_g1_rerun.ps1 `
   -Svo2Path .\recordings\ornek.svo2
 ```
 
@@ -92,7 +92,7 @@ SVO2 aynı deney oturumunda izlenebilir.
 ## Doğrulama
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start_g1_rerun_analysis.ps1 `
+powershell -ExecutionPolicy Bypass -File .\start_g1_rerun.ps1 `
   -Mode demo
 
 python .\rerun_analysis\test_rerun_analysis.py
