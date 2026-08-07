@@ -25,6 +25,7 @@ if str(ANALYSIS_PANEL) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_PANEL))
 
 from skeleton_analysis_recorder import KinematicAnalyzer  # noqa: E402
+from motion_pipeline.metrics import latency_breakdown_ms  # noqa: E402
 
 from rerun_analysis.model import (  # noqa: E402
     EDGES,
@@ -45,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--demo", action="store_true", help="Sentetik doğrulama")
     parser.add_argument("--listen-host", default="0.0.0.0")
     parser.add_argument("--listen-port", type=int, default=15052)
+    parser.add_argument("--gmr-listen-host", default="0.0.0.0")
+    parser.add_argument("--gmr-listen-port", type=int, default=15053)
     parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "rerun_recordings"
     )
@@ -142,14 +145,23 @@ def demo_packets() -> Iterable[dict[str, Any]]:
 
 def make_blueprint() -> rrb.Blueprint:
     return rrb.Blueprint(
-        rrb.Horizontal(
-            rrb.Spatial3DView(
-                name="BODY_38 — seçilebilir 3B iskelet",
-                origin="/world",
-                contents=["+ $origin/**", "- /world/metrics/**"],
-                line_grid=True,
+        rrb.Vertical(
+            rrb.Horizontal(
+                rrb.Spatial3DView(
+                    name="ZED BODY_38 — retarget öncesi",
+                    origin="/world/skeleton",
+                    contents=["+ $origin/**"],
+                    line_grid=True,
+                ),
+                rrb.Spatial3DView(
+                    name="İnsan / G1 raw / G1 safe",
+                    origin="/comparison",
+                    contents=["+ $origin/**"],
+                    line_grid=True,
+                ),
+                column_shares=[1, 1],
             ),
-            rrb.Vertical(
+            rrb.Horizontal(
                 rrb.TimeSeriesView(
                     name="Eklem açıları (deg)", origin="/world/metrics/angles"
                 ),
@@ -157,9 +169,9 @@ def make_blueprint() -> rrb.Blueprint:
                     name="Takip kalitesi ve gecikme",
                     origin="/world/metrics/quality",
                 ),
-                row_shares=[3, 2],
+                column_shares=[3, 2],
             ),
-            column_shares=[3, 2],
+            row_shares=[3, 2],
         ),
         rrb.SelectionPanel(state="expanded"),
         rrb.TimePanel(state="expanded"),
@@ -188,6 +200,8 @@ class RerunSkeletonApp:
         self.config = ConfigStore()
         self.conditioner = SkeletonConditioner()
         self.analyzer = KinematicAnalyzer()
+        self._logged_joint_names: set[str] = set()
+        self.latest_gmr: dict[str, Any] = {}
         self.stop_event = threading.Event()
         self.status_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=3)
         source = (
@@ -206,6 +220,7 @@ class RerunSkeletonApp:
             rr.set_sinks(rr.FileSink(self.rrd_path))
         rr.send_blueprint(make_blueprint())
         rr.log("/world", rr.ViewCoordinates.FLU, static=True)
+        rr.log("/comparison", rr.ViewCoordinates.FLU, static=True)
         rr.log(
             "/world/session_info",
             rr.TextDocument(
@@ -222,6 +237,166 @@ class RerunSkeletonApp:
             config=self.config.snapshot(),
         )
         self.worker = threading.Thread(target=self._run_source, daemon=True)
+        self.gmr_worker = threading.Thread(target=self._run_gmr_telemetry, daemon=True)
+
+    def _log_gmr_packet(self, packet: dict[str, Any]) -> None:
+        self.latest_gmr = packet
+        frame = int(packet.get("sequence", 0) or 0)
+        rr.set_time("frame", sequence=frame)
+        skeleton = packet.get("g1_skeleton") or {}
+        edges = skeleton.get("edges") or []
+        for variant, color, lateral_offset in (
+            ("raw", [255, 170, 50], -0.65),
+            ("safe", [80, 230, 120], 0.65),
+        ):
+            positions = skeleton.get(f"{variant}_positions_m") or {}
+            shifted = {
+                name: [float(value[0]), float(value[1]) + lateral_offset, float(value[2])]
+                for name, value in positions.items()
+                if isinstance(value, (list, tuple)) and len(value) == 3
+                and all(isinstance(item, (int, float)) and np.isfinite(item) for item in value)
+            }
+            strips = [
+                [shifted[first], shifted[second]]
+                for first, second in edges
+                if first in shifted and second in shifted
+            ]
+            root = f"/world/g1_{variant}"
+            if strips:
+                rr.log(f"{root}/bones", rr.LineStrips3D(strips, radii=0.012, colors=color))
+                rr.log(
+                    f"{root}/joints",
+                    rr.Points3D(
+                        list(shifted.values()), radii=0.022, colors=color,
+                        labels=list(shifted.keys()), show_labels=False,
+                    ),
+                )
+            else:
+                rr.log(root, rr.Clear(recursive=True))
+
+        comparison = packet.get("retarget_comparison") or {}
+        comparison_variants = (
+            (
+                "human_pre_gmr",
+                comparison.get("human_positions_m") or {},
+                comparison.get("human_edges") or [],
+                [70, 190, 255],
+                -0.80,
+                "HUMAN PRE-GMR",
+            ),
+            (
+                "g1_raw",
+                skeleton.get("raw_positions_m") or {},
+                edges,
+                [255, 170, 50],
+                0.0,
+                "G1 RAW",
+            ),
+            (
+                "g1_safe",
+                skeleton.get("safe_positions_m") or {},
+                edges,
+                [80, 230, 120],
+                0.80,
+                "G1 SAFE",
+            ),
+        )
+        for variant, positions, variant_edges, color, offset, label in comparison_variants:
+            shifted = {
+                str(name): [float(value[0]), float(value[1]) + offset, float(value[2])]
+                for name, value in positions.items()
+                if isinstance(value, (list, tuple)) and len(value) == 3
+                and all(
+                    isinstance(item, (int, float)) and np.isfinite(item)
+                    for item in value
+                )
+            }
+            strips = [
+                [shifted[first], shifted[second]]
+                for first, second in variant_edges
+                if first in shifted and second in shifted
+            ]
+            root = f"/comparison/{variant}"
+            if not strips:
+                rr.log(root, rr.Clear(recursive=True))
+                continue
+            rr.log(
+                f"{root}/bones",
+                rr.LineStrips3D(strips, radii=0.012, colors=color),
+            )
+            rr.log(
+                f"{root}/joints",
+                rr.Points3D(list(shifted.values()), radii=0.022, colors=color),
+            )
+            if "pelvis" in shifted:
+                anchor = list(shifted["pelvis"])
+                anchor[2] += 0.12
+                rr.log(
+                    f"{root}/label",
+                    rr.Points3D(
+                        [anchor], radii=0.001, colors=color,
+                        labels=[label], show_labels=True,
+                    ),
+                )
+        joint_names = packet.get("joint_names") or []
+        for variant, key in (
+            ("raw_q", "raw_joint_position_rad"),
+            ("safe_q", "safe_joint_position_rad"),
+        ):
+            values = packet.get(key) or []
+            for name, value in zip(joint_names, values):
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    rr.log(f"/world/metrics/{variant}/{name}", rr.Scalars(float(value)))
+        safety = packet.get("safety") or {}
+        bridge = packet.get("bridge_metrics") or {}
+        latency = latency_breakdown_ms(packet.get("latency_trace_ns") or {})
+        isaac = packet.get("isaac_metrics") or {}
+        rr.log(
+            "/world/g1_safety",
+            rr.AnyValues(
+                level=str(safety.get("level", "UNKNOWN")),
+                reasons=json.dumps(safety.get("reasons", []), ensure_ascii=False),
+                blend=float(safety.get("blend", 0.0)),
+                joint_limit_saturation=int(safety.get("joint_limit_saturation", 0)),
+                joint_limit_saturation_names=json.dumps(
+                    safety.get("joint_limit_saturation_names", []),
+                    ensure_ascii=False,
+                ),
+                self_collision_count=int(safety.get("safe_self_collision_count", 0)),
+                solve_ms=float(bridge.get("solve_ms", 0.0)),
+                ik_position_max_m=float(bridge.get("ik_position_max_m", 0.0)),
+            ),
+        )
+        for name, value in {**latency, **isaac}.items():
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                rr.log(f"/world/metrics/system/{name}", rr.Scalars(float(value)))
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            writer.write_imitation(packet)
+
+    def _run_gmr_telemetry(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        sock.bind((self.args.gmr_listen_host, self.args.gmr_listen_port))
+        sock.settimeout(0.2)
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    payload, _ = sock.recvfrom(2_000_000)
+                except socket.timeout:
+                    continue
+                try:
+                    packet = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if packet.get("schema") in {
+                    "zed_gmr_g1_23dof_live/v1",
+                    "zed_gmr_g1_23dof_isaac_telemetry/v1",
+                }:
+                    self._log_gmr_packet(packet)
+        finally:
+            sock.close()
 
     def _log_packet(
         self,
@@ -265,9 +440,25 @@ class RerunSkeletonApp:
                 "/world/skeleton/bones",
                 rr.LineStrips3D(strips, radii=0.009, colors=[70, 190, 255]),
             )
+        else:
+            rr.log("/world/skeleton/bones", rr.Clear(recursive=False))
+
+        # A BODY_38 packet can temporarily omit a joint name altogether. Clear
+        # any entity that existed in the previous packet but is absent now.
+        current_joint_names = set(names)
+        for removed_name in self._logged_joint_names - current_joint_names:
+            rr.log(
+                f"/world/skeleton/joints/{removed_name}",
+                rr.Clear(recursive=False),
+            )
+        self._logged_joint_names = current_joint_names
 
         for index, name in enumerate(names):
+            entity = f"/world/skeleton/joints/{name}"
             if name not in points:
+                # Rerun keeps the latest component value until explicitly
+                # cleared. Without this, an occluded joint floats indefinitely.
+                rr.log(entity, rr.Clear(recursive=False))
                 continue
             confidence = (
                 float(confidences[index])
@@ -278,10 +469,9 @@ class RerunSkeletonApp:
             state = states.get(name, "missing")
             color = (
                 [80, 220, 120] if state == "tracked"
-                else [255, 190, 50] if state == "held"
+                else [255, 190, 50] if state in {"held", "held_outlier"}
                 else [240, 80, 80]
             )
-            entity = f"/world/skeleton/joints/{name}"
             rr.log(
                 entity,
                 rr.Points3D(
@@ -348,6 +538,7 @@ class RerunSkeletonApp:
         quality = derived.get("quality", {})
         visibility = derived.get("visibility", {})
         transport = source.get("transport_metrics", {})
+        perception = source.get("perception_metrics", {})
         quality_values = {
             "body_confidence_percent": source.get("body_confidence"),
             "valid_keypoints": visibility.get("valid_keypoints"),
@@ -356,6 +547,9 @@ class RerunSkeletonApp:
             "median_filter_error_m": quality.get("median_raw_filter_error_m"),
             "capture_to_send_ms": transport.get("capture_to_send_ms"),
             "source_interval_ms": transport.get("source_interval_ms"),
+            "visible_keypoint_ratio": perception.get("visible_keypoint_ratio"),
+            "bone_length_error": perception.get("bone_length_relative_error_mean"),
+            "left_right_swap_count": perception.get("left_right_swap_count"),
         }
         for name, value in quality_values.items():
             if isinstance(value, (int, float)) and np.isfinite(value):
@@ -374,6 +568,7 @@ class RerunSkeletonApp:
     def _receive_udp(self) -> Iterable[dict[str, Any]]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         sock.bind((self.args.listen_host, self.args.listen_port))
         sock.settimeout(0.2)
         try:
@@ -437,12 +632,16 @@ class RerunSkeletonApp:
 
     def start(self) -> int:
         self.worker.start()
+        if not self.args.input and not self.args.demo:
+            self.gmr_worker.start()
         if self.args.headless:
             self.worker.join()
         else:
             self._run_ui()
         self.stop_event.set()
         self.worker.join(timeout=3.0)
+        if self.gmr_worker.is_alive():
+            self.gmr_worker.join(timeout=1.0)
         self.writer.close()
         rr.disconnect()
         print(f"Rerun RRD: {self.rrd_path}")
@@ -482,7 +681,7 @@ class RerunSkeletonApp:
             "offset_y_m": tk.DoubleVar(value=0.0),
             "offset_z_m": tk.DoubleVar(value=0.0),
             "max_joint_speed_m_s": tk.DoubleVar(value=6.0),
-            "occlusion_hold_frames": tk.IntVar(value=8),
+            "occlusion_hold_frames": tk.IntVar(value=3),
             "playback_rate": tk.DoubleVar(value=1.0),
         }
         controls = (
@@ -601,10 +800,13 @@ class RerunSkeletonApp:
                     joint_var.set(names[0])
                     selected = names[0]
                 visibility = derived.get("visibility", {})
+                safety = self.latest_gmr.get("safety") or {}
+                safety_reason = ",".join(safety.get("reasons", [])) or "normal"
                 status_var.set(
                     f"Body ID: {source.get('body_id')} | "
                     f"Güven: {float(source.get('body_confidence', 0)):.1f}% | "
                     f"Geçerli: {visibility.get('valid_keypoints', 0)}/{len(names)} | "
+                    f"G1: {safety.get('level', 'WAITING')} ({safety_reason}) | "
                     f"Kaydedilen kare: {latest['frame_count']}"
                 )
                 detail.delete("1.0", "end")
@@ -618,6 +820,15 @@ class RerunSkeletonApp:
                             "visibility": visibility,
                             "occlusion": derived.get("occlusion"),
                             "quality": derived.get("quality"),
+                            "operator_selection": source.get("operator_selection"),
+                            "calibration": source.get("calibration"),
+                            "perception_metrics": source.get("perception_metrics"),
+                            "g1_safety": self.latest_gmr.get("safety"),
+                            "gmr_metrics": self.latest_gmr.get("bridge_metrics"),
+                            "isaac_metrics": self.latest_gmr.get("isaac_metrics"),
+                            "latency_breakdown_ms": self.latest_gmr.get(
+                                "latency_breakdown_ms"
+                            ),
                             "effective_config": self.config.as_dict(),
                         },
                         ensure_ascii=False, indent=2,

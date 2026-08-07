@@ -1,0 +1,748 @@
+{
+  "schema": "zed_g1_motion_dataset_manifest/v1",
+  "source_benchmark": "reports\\all_recordings_baseline_20260805.json",
+  "split_policy": "sha256_by_complete_recording",
+  "ratios": {
+    "train": 0.75,
+    "validation": 0.15,
+    "test": 0.1
+  },
+  "counts": {
+    "train": 15,
+    "validation": 3,
+    "test": 4,
+    "excluded": 22
+  },
+  "accepted": [
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_111037.jsonl",
+      "frames": 807,
+      "effective_fps": 29.925000745340437,
+      "core_visible_ratio": 0.9798636926889716,
+      "bone_cv_p95": 0.025036942341497004,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_124005.jsonl",
+      "frames": 1347,
+      "effective_fps": 29.99918538616206,
+      "core_visible_ratio": 0.986358574610245,
+      "bone_cv_p95": 0.027834701863992818,
+      "torso_overlap_ratio": null,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "split": "train",
+      "challenge_tags": []
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_164804.jsonl",
+      "frames": 375,
+      "effective_fps": 8.28634231323216,
+      "core_visible_ratio": 0.972,
+      "bone_cv_p95": 0.030882995661428263,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "capture_fps_below_target",
+        "source_sequence_gaps"
+      ],
+      "split": "test",
+      "challenge_tags": [
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_125236.jsonl",
+      "frames": 1890,
+      "effective_fps": 29.983410237844158,
+      "core_visible_ratio": 0.9761243386243387,
+      "bone_cv_p95": 0.02565523121054679,
+      "torso_overlap_ratio": null,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "split": "validation",
+      "challenge_tags": []
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_145214.jsonl",
+      "frames": 1360,
+      "effective_fps": 29.99924571432961,
+      "core_visible_ratio": 0.9751838235294118,
+      "bone_cv_p95": 0.031488655190081066,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_172756.jsonl",
+      "frames": 729,
+      "effective_fps": 14.999638195540228,
+      "core_visible_ratio": 0.9943415637860082,
+      "bone_cv_p95": 0.02015648042650362,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_182111.jsonl",
+      "frames": 1000,
+      "effective_fps": 14.984615120160639,
+      "core_visible_ratio": 0.972375,
+      "bone_cv_p95": 0.023436126454852883,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_102827.jsonl",
+      "frames": 2926,
+      "effective_fps": 14.99962293255582,
+      "core_visible_ratio": 0.9966678058783321,
+      "bone_cv_p95": 0.009910517873335863,
+      "torso_overlap_ratio": null,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "split": "test",
+      "challenge_tags": []
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_114421.jsonl",
+      "frames": 2716,
+      "effective_fps": 14.988580854444725,
+      "core_visible_ratio": 0.9955817378497791,
+      "bone_cv_p95": 0.010075502925330519,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "validation",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_120148.jsonl",
+      "frames": 318,
+      "effective_fps": 14.999611287675936,
+      "core_visible_ratio": 0.9775943396226415,
+      "bone_cv_p95": 0.03575891457290649,
+      "torso_overlap_ratio": null,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "split": "test",
+      "challenge_tags": []
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_143922.jsonl",
+      "frames": 2102,
+      "effective_fps": 14.678243471580496,
+      "core_visible_ratio": 0.9737749762131304,
+      "bone_cv_p95": 0.015873133653760578,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_150748.jsonl",
+      "frames": 1880,
+      "effective_fps": 14.794897446951866,
+      "core_visible_ratio": 0.9824468085106383,
+      "bone_cv_p95": 0.011380849400342246,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_161522.jsonl",
+      "frames": 780,
+      "effective_fps": 14.999626646006847,
+      "core_visible_ratio": 0.9934294871794872,
+      "bone_cv_p95": 0.02276812761628829,
+      "torso_overlap_ratio": null,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "split": "train",
+      "challenge_tags": []
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_161818.jsonl",
+      "frames": 1476,
+      "effective_fps": 14.999632432736082,
+      "core_visible_ratio": 0.9736619241192412,
+      "bone_cv_p95": 0.009699183107543726,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "split": "validation",
+      "challenge_tags": [
+        "source_outlier"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260803_104052.jsonl",
+      "frames": 946,
+      "effective_fps": 14.952135130087374,
+      "core_visible_ratio": 0.9961680761099366,
+      "bone_cv_p95": 0.015453584211853093,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "test",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260803_154743.jsonl",
+      "frames": 1286,
+      "effective_fps": 14.953054043176648,
+      "core_visible_ratio": 0.9966951788491446,
+      "bone_cv_p95": 0.044063452948258454,
+      "torso_overlap_ratio": 0.11586314152410575,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260803_165803.jsonl",
+      "frames": 1900,
+      "effective_fps": 29.873376055984124,
+      "core_visible_ratio": 0.9915131578947368,
+      "bone_cv_p95": 0.010868878504467532,
+      "torso_overlap_ratio": 0.05631578947368421,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "source_outlier",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260804_134321.jsonl",
+      "frames": 1204,
+      "effective_fps": 14.97468736356837,
+      "core_visible_ratio": 0.9889950166112956,
+      "bone_cv_p95": 0.008528205170602047,
+      "torso_overlap_ratio": 0.14700996677740863,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260804_154534.jsonl",
+      "frames": 2437,
+      "effective_fps": 14.968867520741744,
+      "core_visible_ratio": 0.9983586376692655,
+      "bone_cv_p95": 0.007663531637646143,
+      "torso_overlap_ratio": 0.17152236356175626,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "torso_overlap",
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260805_102810.jsonl",
+      "frames": 1292,
+      "effective_fps": 14.987979315520462,
+      "core_visible_ratio": 0.996517027863777,
+      "bone_cv_p95": 0.009190860884330368,
+      "torso_overlap_ratio": 0.07972136222910217,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "packet_gap"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260805_111455.jsonl",
+      "frames": 592,
+      "effective_fps": 14.999581610655072,
+      "core_visible_ratio": 1.0,
+      "bone_cv_p95": 0.0034289372435959134,
+      "torso_overlap_ratio": 0.0,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "split": "train",
+      "challenge_tags": []
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260805_111700.jsonl",
+      "frames": 1650,
+      "effective_fps": 14.98142190119804,
+      "core_visible_ratio": 0.9984848484848485,
+      "bone_cv_p95": 0.002892703832746592,
+      "torso_overlap_ratio": 0.2381818181818182,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps"
+      ],
+      "split": "train",
+      "challenge_tags": [
+        "torso_overlap",
+        "packet_gap"
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_112123.jsonl",
+      "frames": 65,
+      "effective_fps": 29.999371888151092,
+      "core_visible_ratio": 0.7980769230769231,
+      "bone_cv_p95": 0.13413702289117047,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "core_visibility_below_90pct",
+        "bone_length_instability"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_134332.jsonl",
+      "frames": 5268,
+      "effective_fps": 11.239573295180156,
+      "core_visible_ratio": 0.9794276765375854,
+      "bone_cv_p95": 0.016237964063589145,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "capture_fps_below_target",
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "capture_red",
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_152359.jsonl",
+      "frames": 472,
+      "effective_fps": 6.9741605131916025,
+      "core_visible_ratio": 0.8027012711864406,
+      "bone_cv_p95": 0.15214011595748556,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "capture_fps_below_target",
+        "core_visibility_below_90pct",
+        "bone_length_instability",
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "capture_red",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct",
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260727_171506.jsonl",
+      "frames": 1099,
+      "effective_fps": 29.91754691373801,
+      "core_visible_ratio": 0.9605323020928116,
+      "bone_cv_p95": 0.07535070047624098,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260728_171026.jsonl",
+      "frames": 209,
+      "effective_fps": 25.7844420643421,
+      "core_visible_ratio": 0.8415071770334929,
+      "bone_cv_p95": 0.08113917431537732,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "core_visibility_below_90pct",
+        "bone_length_instability",
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "capture_red",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260728_171534.jsonl",
+      "frames": 62,
+      "effective_fps": 29.999355751540413,
+      "core_visible_ratio": 0.8790322580645161,
+      "bone_cv_p95": 0.04810992846103422,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "core_visibility_below_90pct"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "core_visibility_below_97pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260728_171820.jsonl",
+      "frames": 329,
+      "effective_fps": 27.954493834031272,
+      "core_visible_ratio": 0.5459726443768997,
+      "bone_cv_p95": 0.09790388067656022,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "core_visibility_below_90pct",
+        "bone_length_instability",
+        "source_sequence_gaps"
+      ],
+      "excluded_reasons": [
+        "capture_red",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260728_172439.jsonl",
+      "frames": 5867,
+      "effective_fps": 17.250816332537674,
+      "core_visible_ratio": 0.9851073802624851,
+      "bone_cv_p95": 0.14006457599568442,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "bone_length_instability",
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "capture_red",
+        "bone_length_cv_above_5pct",
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260728_174739.jsonl",
+      "frames": 2087,
+      "effective_fps": 2.803190335378059,
+      "core_visible_ratio": 0.9733469094393867,
+      "bone_cv_p95": 0.08748822723168811,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "capture_fps_below_target",
+        "bone_length_instability",
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "capture_red",
+        "bone_length_cv_above_5pct",
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_101507.jsonl",
+      "frames": 1732,
+      "effective_fps": 1.23234833562896,
+      "core_visible_ratio": 0.9740184757505773,
+      "bone_cv_p95": 0.07038704495712816,
+      "torso_overlap_ratio": null,
+      "quality_level": "RED",
+      "quality_reasons": [
+        "capture_fps_below_target",
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "capture_red",
+        "bone_length_cv_above_5pct",
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_105156.jsonl",
+      "frames": 573,
+      "effective_fps": 28.599266428816097,
+      "core_visible_ratio": 0.9533158813263525,
+      "bone_cv_p95": 0.027270114364845773,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "core_visibility_below_97pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_105355.jsonl",
+      "frames": 45,
+      "effective_fps": 29.99813193451135,
+      "core_visible_ratio": 0.7472222222222222,
+      "bone_cv_p95": 0.06853479229144849,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "core_visibility_below_90pct",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_162326.jsonl",
+      "frames": 1862,
+      "effective_fps": 29.999252517281448,
+      "core_visible_ratio": 0.9212540279269602,
+      "bone_cv_p95": 0.09280835153384373,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "bone_length_instability",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260729_165444.jsonl",
+      "frames": 946,
+      "effective_fps": 14.999610486305468,
+      "core_visible_ratio": 0.9620771670190275,
+      "bone_cv_p95": 0.029023849286486457,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "core_visibility_below_97pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_130903.jsonl",
+      "frames": 3323,
+      "effective_fps": 14.119796656226432,
+      "core_visible_ratio": 0.9968778212458622,
+      "bone_cv_p95": 0.01669909642732486,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_153223.jsonl",
+      "frames": 5376,
+      "effective_fps": 13.716051611182605,
+      "core_visible_ratio": 0.9952799479166666,
+      "bone_cv_p95": 0.03594983979623541,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "source_sequence_gaps",
+        "keypoint_teleport_events"
+      ],
+      "excluded_reasons": [
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260730_173635.jsonl",
+      "frames": 20,
+      "effective_fps": 15.001583061791521,
+      "core_visible_ratio": 0.8,
+      "bone_cv_p95": 0.1619162798088855,
+      "torso_overlap_ratio": null,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "core_visibility_below_90pct",
+        "bone_length_instability"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260803_105550.jsonl",
+      "frames": 248,
+      "effective_fps": 14.999590699427877,
+      "core_visible_ratio": 0.9919354838709677,
+      "bone_cv_p95": 0.027038674285424058,
+      "torso_overlap_ratio": null,
+      "quality_level": "GREEN",
+      "quality_reasons": [],
+      "excluded_reasons": [
+        "too_short"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260803_145901.jsonl",
+      "frames": 683,
+      "effective_fps": 12.10615887164351,
+      "core_visible_ratio": 0.9941434846266471,
+      "bone_cv_p95": 0.013860124050487775,
+      "torso_overlap_ratio": 0.017569546120058566,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "capture_fps_below_target",
+        "source_sequence_gaps"
+      ],
+      "excluded_reasons": [
+        "body_id_switch"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260803_154543.jsonl",
+      "frames": 157,
+      "effective_fps": 14.999645200700062,
+      "core_visible_ratio": 0.875,
+      "bone_cv_p95": 0.09929440077835106,
+      "torso_overlap_ratio": 0.6560509554140127,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "core_visibility_below_90pct",
+        "bone_length_instability"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "core_visibility_below_97pct",
+        "bone_length_cv_above_5pct",
+        "operator_lock_below_95pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260804_103106.jsonl",
+      "frames": 78,
+      "effective_fps": 14.999851949513225,
+      "core_visible_ratio": 1.0,
+      "bone_cv_p95": 0.0005917840537576931,
+      "torso_overlap_ratio": 0.0,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "operator_not_consistently_locked"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "operator_lock_below_95pct"
+      ]
+    },
+    {
+      "recording": "C:\\Users\\Misafir\\Desktop\\ZED_G1_Projesi\\recordings\\zed_body38_20260804_142815.jsonl",
+      "frames": 11,
+      "effective_fps": 15.000757538255682,
+      "core_visible_ratio": 0.5,
+      "bone_cv_p95": 0.003713813946915378,
+      "torso_overlap_ratio": 1.0,
+      "quality_level": "YELLOW",
+      "quality_reasons": [
+        "core_visibility_below_90pct"
+      ],
+      "excluded_reasons": [
+        "too_short",
+        "core_visibility_below_97pct"
+      ]
+    }
+  ]
+}

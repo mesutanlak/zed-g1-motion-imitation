@@ -30,7 +30,105 @@ GMR_BODY38_MAP = {
     "right_wrist": "RIGHT_WRIST",
 }
 
+# Official BODY_38 kinematic parent graph.  Stereolabs exposes every joint
+# orientation relative to its parent; a retargeter must compose the complete
+# path from PELVIS before using it as a global orientation target.
+BODY38_PARENT = {
+    "SPINE_1": "PELVIS",
+    "SPINE_2": "SPINE_1",
+    "SPINE_3": "SPINE_2",
+    "NECK": "SPINE_3",
+    "NOSE": "NECK",
+    "LEFT_EYE": "NOSE",
+    "RIGHT_EYE": "NOSE",
+    "LEFT_EAR": "LEFT_EYE",
+    "RIGHT_EAR": "RIGHT_EYE",
+    "LEFT_CLAVICLE": "SPINE_3",
+    "RIGHT_CLAVICLE": "SPINE_3",
+    "LEFT_SHOULDER": "LEFT_CLAVICLE",
+    "RIGHT_SHOULDER": "RIGHT_CLAVICLE",
+    "LEFT_ELBOW": "LEFT_SHOULDER",
+    "RIGHT_ELBOW": "RIGHT_SHOULDER",
+    "LEFT_WRIST": "LEFT_ELBOW",
+    "RIGHT_WRIST": "RIGHT_ELBOW",
+    "LEFT_HIP": "PELVIS",
+    "RIGHT_HIP": "PELVIS",
+    "LEFT_KNEE": "LEFT_HIP",
+    "RIGHT_KNEE": "RIGHT_HIP",
+    "LEFT_ANKLE": "LEFT_KNEE",
+    "RIGHT_ANKLE": "RIGHT_KNEE",
+    "LEFT_BIG_TOE": "LEFT_ANKLE",
+    "RIGHT_BIG_TOE": "RIGHT_ANKLE",
+    "LEFT_SMALL_TOE": "LEFT_ANKLE",
+    "RIGHT_SMALL_TOE": "RIGHT_ANKLE",
+    "LEFT_HEEL": "LEFT_ANKLE",
+    "RIGHT_HEEL": "RIGHT_ANKLE",
+    "LEFT_HAND_THUMB_4": "LEFT_WRIST",
+    "RIGHT_HAND_THUMB_4": "RIGHT_WRIST",
+    "LEFT_HAND_INDEX_1": "LEFT_WRIST",
+    "RIGHT_HAND_INDEX_1": "RIGHT_WRIST",
+    "LEFT_HAND_MIDDLE_4": "LEFT_WRIST",
+    "RIGHT_HAND_MIDDLE_4": "RIGHT_WRIST",
+    "LEFT_HAND_PINKY_1": "LEFT_WRIST",
+    "RIGHT_HAND_PINKY_1": "RIGHT_WRIST",
+}
+
 IDENTITY_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def _quat_xyzw_to_matrix(value: Any) -> np.ndarray | None:
+    try:
+        q = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if q.shape != (4,) or not np.isfinite(q).all():
+        return None
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-8:
+        return None
+    x, y, z, w = q / norm
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
+    """Convert a proper 3x3 rotation to a normalized scalar-first quaternion."""
+    m = np.asarray(matrix, dtype=np.float64)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    else:
+        axis = int(np.argmax(np.diag(m)))
+        if axis == 0:
+            s = np.sqrt(max(1e-12, 1.0 + m[0, 0] - m[1, 1] - m[2, 2])) * 2.0
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif axis == 1:
+            s = np.sqrt(max(1e-12, 1.0 + m[1, 1] - m[0, 0] - m[2, 2])) * 2.0
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = np.sqrt(max(1e-12, 1.0 + m[2, 2] - m[0, 0] - m[1, 1])) * 2.0
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    return q / max(float(np.linalg.norm(q)), 1e-12)
 
 
 @dataclass(frozen=True)
@@ -42,6 +140,8 @@ class AdaptedFrame:
     occlusion_held_targets: int
     pelvis_height_m: float
     ground_z_m: float
+    workspace_projection_count: int
+    operator_calibrated: bool
 
 
 class Body38ToGMR:
@@ -60,6 +160,7 @@ class Body38ToGMR:
         persistent_memory_targets: tuple[str, ...] = (),
         max_segment_turn_deg: float = 45.0,
         occluded_segment_turn_deg: float = 30.0,
+        fixed_stance: bool = False,
     ) -> None:
         self.confidence_threshold = float(confidence_threshold)
         self.max_memory_frames = max(0, int(round(memory_seconds * nominal_fps)))
@@ -71,13 +172,42 @@ class Body38ToGMR:
         self.persistent_memory_targets = frozenset(persistent_memory_targets)
         self.max_segment_turn_deg = float(max_segment_turn_deg)
         self.occluded_segment_turn_deg = float(occluded_segment_turn_deg)
+        self.fixed_stance = bool(fixed_stance)
         self._memory: dict[str, tuple[np.ndarray, int]] = {}
+        self._velocity_memory: dict[str, np.ndarray] = {}
         self._raw_fallback_streak: dict[str, int] = {}
         self._reacquire: dict[str, tuple[np.ndarray, int]] = {}
         self._just_reacquired: set[str] = set()
+        # Unit pole vectors define the arm-bend plane.  Keeping them as state
+        # removes the mirrored two-bone IK branch that appears when a nearly
+        # straight elbow or torso overlap makes the measured pole ill-defined.
+        self._arm_pole_memory: dict[str, np.ndarray] = {}
+        self.last_arm_pole_source: dict[str, str] = {
+            "left": "uninitialized", "right": "uninitialized"
+        }
         self._frame_no = 0
         self.rejected_outliers = 0
         self.last_rejection_reason = "none"
+
+    def reset(self) -> None:
+        """Forget every landmark and bend-plane from the previous operator.
+
+        Operator re-selection/calibration defines a new control session.  A
+        short dropout may use the memories below, but carrying them across an
+        explicit reset can pin one arm to the preceding session's last pose.
+        """
+        self._memory.clear()
+        self._velocity_memory.clear()
+        self._raw_fallback_streak.clear()
+        self._reacquire.clear()
+        self._just_reacquired.clear()
+        self._arm_pole_memory.clear()
+        self.last_arm_pole_source = {
+            "left": "uninitialized", "right": "uninitialized"
+        }
+        self._frame_no = 0
+        self.rejected_outliers = 0
+        self.last_rejection_reason = "control_session_reset"
 
     @staticmethod
     def _is_finite_xyz(value: Any) -> bool:
@@ -89,10 +219,48 @@ class Body38ToGMR:
         self, frame: dict[str, Any]
     ) -> tuple[dict[str, np.ndarray], int, int, int]:
         names = frame.get("keypoint_names", [])
-        points = frame.get("keypoints_3d_m")
+        pelvis_frame = frame.get("pelvis_frame") or {}
+        points = pelvis_frame.get("keypoints_m")
+        using_pelvis_frame = points is not None
+        if points is None:
+            points = frame.get("keypoints_3d_m")
         if points is None:
             points = frame.get("keypoints_3d_filtered_m", [])
-        raw_points = frame.get("keypoints_3d_raw_m", [])
+        # Camera-space raw points must never be mixed with pelvis-local points.
+        raw_points = [] if using_pelvis_frame else frame.get("keypoints_3d_raw_m", [])
+        raw_elbows_local: dict[str, list[float]] = {}
+        if using_pelvis_frame:
+            # Preserve the ZED SDK's measured elbow position instead of
+            # deriving an elbow from independently filtered XYZ landmarks.
+            # Convert the raw camera-space elbow into the same pelvis-local
+            # frame first; shoulder/wrist targets remain the stable filtered
+            # landmarks and the arm-chain projection below restores fixed G1
+            # link lengths. This is deliberately limited to the two elbows.
+            raw_camera = frame.get("keypoints_3d_raw_m") or []
+            origin = pelvis_frame.get("origin_camera_m")
+            rotation = pelvis_frame.get("rotation_camera_from_pelvis")
+            try:
+                origin_np = np.asarray(origin, dtype=np.float64)
+                rotation_np = np.asarray(rotation, dtype=np.float64)
+                if origin_np.shape == (3,) and rotation_np.shape == (3, 3):
+                    name_to_index = {
+                        str(name): idx for idx, name in enumerate(names)
+                    }
+                    for gmr_name, zed_name in (
+                        ("left_elbow", "LEFT_ELBOW"),
+                        ("right_elbow", "RIGHT_ELBOW"),
+                    ):
+                        raw_index = name_to_index.get(zed_name)
+                        if raw_index is None or raw_index >= len(raw_camera):
+                            continue
+                        raw_value = raw_camera[raw_index]
+                        if self._is_finite_xyz(raw_value):
+                            raw_elbows_local[gmr_name] = (
+                                rotation_np.T
+                                @ (np.asarray(raw_value, dtype=np.float64) - origin_np)
+                            ).tolist()
+            except (TypeError, ValueError):
+                raw_elbows_local = {}
         confidence = frame.get("keypoint_confidence", [])
         index = {str(name): i for i, name in enumerate(names)}
         self._just_reacquired.clear()
@@ -108,6 +276,8 @@ class Body38ToGMR:
             confidence_ok = conf is None or (
                 np.isfinite(float(conf)) and float(conf) >= self.confidence_threshold
             )
+            if gmr_name in raw_elbows_local and confidence_ok:
+                point = raw_elbows_local[gmr_name]
             if self._is_finite_xyz(point) and confidence_ok:
                 xyz = np.asarray(point, dtype=np.float64)
                 cached = self._memory.get(gmr_name)
@@ -140,6 +310,23 @@ class Body38ToGMR:
                         continue
                     self.rejected_outliers += 1
                 elif coherent and not cache_is_stale:
+                    if cached is not None:
+                        elapsed = max(1, self._frame_no - cached[1])
+                        measured_velocity = (
+                            (xyz - cached[0]) * self.nominal_fps / elapsed
+                        )
+                        speed = float(np.linalg.norm(measured_velocity))
+                        limit = (
+                            2.5 if gmr_name == "pelvis" else 5.0
+                        )
+                        if speed > limit:
+                            measured_velocity *= limit / max(speed, 1e-9)
+                        previous_velocity = self._velocity_memory.get(
+                            gmr_name, np.zeros(3, dtype=np.float64)
+                        )
+                        self._velocity_memory[gmr_name] = (
+                            0.65 * previous_velocity + 0.35 * measured_velocity
+                        )
                     result[gmr_name] = xyz
                     self._memory[gmr_name] = (xyz.copy(), self._frame_no)
                     self._raw_fallback_streak[gmr_name] = 0
@@ -190,9 +377,256 @@ class Body38ToGMR:
                 persistent
                 or self._frame_no - cached[1] <= self.max_memory_frames
             ):
-                result[gmr_name] = cached[0].copy()
+                age = max(0, self._frame_no - cached[1])
+                velocity = self._velocity_memory.get(gmr_name)
+                if (
+                    gmr_name in {
+                        "left_elbow", "left_wrist",
+                        "right_elbow", "right_wrist",
+                    }
+                    and velocity is not None
+                    and 0 < age <= 2
+                ):
+                    # Two-frame constant-velocity prediction bridges a brief
+                    # BODY_38 dropout without leaving the arm in mid-air.
+                    # Longer gaps still use the conservative held pose.
+                    displacement = velocity * (age / self.nominal_fps)
+                    maximum = self.max_joint_step_m * age
+                    norm = float(np.linalg.norm(displacement))
+                    if norm > maximum:
+                        displacement *= maximum / max(norm, 1e-9)
+                    result[gmr_name] = cached[0].copy() + displacement
+                else:
+                    result[gmr_name] = cached[0].copy()
                 remembered += 1
         return result, direct, remembered, raw_fallback
+
+    @staticmethod
+    def _global_orientations(
+        frame: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        """Reconstruct pelvis-local global BODY_38 rotations as WXYZ.
+
+        ZED local rotations are relative to the BODY_38 parent and identity is
+        the fitted T-pose.  They therefore cannot be sent directly to GMR.
+        The camera/world heading is removed with the same pelvis frame used by
+        the position targets, keeping motion independent of camera placement.
+        """
+        names = [str(name) for name in frame.get("keypoint_names", [])]
+        local_values = frame.get("local_orientation_per_joint_xyzw") or []
+        index = {name: idx for idx, name in enumerate(names)}
+        root = _quat_xyzw_to_matrix(frame.get("global_root_orientation_xyzw"))
+        if root is None or "PELVIS" not in index:
+            return {}
+
+        local: dict[str, np.ndarray] = {}
+        for name, idx in index.items():
+            if idx < len(local_values):
+                rotation = _quat_xyzw_to_matrix(local_values[idx])
+                if rotation is not None:
+                    local[name] = rotation
+
+        global_camera: dict[str, np.ndarray] = {"PELVIS": root}
+
+        def resolve(name: str) -> np.ndarray | None:
+            if name in global_camera:
+                return global_camera[name]
+            parent_name = BODY38_PARENT.get(name)
+            relative = local.get(name)
+            if parent_name is None or relative is None:
+                return None
+            parent = resolve(parent_name)
+            if parent is None:
+                return None
+            global_camera[name] = parent @ relative
+            return global_camera[name]
+
+        for name in names:
+            resolve(name)
+
+        pelvis_frame = frame.get("pelvis_frame") or {}
+        camera_from_pelvis = np.asarray(
+            pelvis_frame.get("rotation_camera_from_pelvis", root),
+            dtype=np.float64,
+        )
+        if (
+            camera_from_pelvis.shape != (3, 3)
+            or not np.isfinite(camera_from_pelvis).all()
+        ):
+            camera_from_pelvis = root
+        pelvis_from_camera = camera_from_pelvis.T
+        output: dict[str, np.ndarray] = {}
+        for gmr_name, zed_name in GMR_BODY38_MAP.items():
+            rotation = global_camera.get(zed_name)
+            if rotation is not None:
+                output[gmr_name] = _matrix_to_quat_wxyz(
+                    pelvis_from_camera @ rotation
+                )
+        return output
+
+    def _map_operator_to_g1_workspace(
+        self, points: dict[str, np.ndarray], frame: dict[str, Any]
+    ) -> tuple[dict[str, np.ndarray], int, bool]:
+        """Normalize calibrated human limbs into G1's reachable task space.
+
+        This is a task-space mapping, not a joint command. GMR still solves the
+        official G1 model afterwards and the feasibility layer remains the
+        final command boundary.
+        """
+        profile = ((frame.get("calibration") or {}).get("profile") or {})
+        calibrated = (frame.get("calibration") or {}).get("state") == "READY"
+        if not calibrated or not profile:
+            return points, 0, False
+        mapped = {name: value.copy() for name, value in points.items()}
+        required = {
+            "pelvis", "spine3", "left_shoulder", "right_shoulder",
+            "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+        }
+        if not required.issubset(mapped):
+            return points, 0, True
+
+        pelvis = mapped["pelvis"]
+        human_torso = float(profile.get("torso_length_m", 0.48))
+        # Nominal link centers measured from the official G1 MuJoCo model.
+        # GMR tasks target link origins, not anatomical segment endpoints.
+        mapped["spine3"] = pelvis + np.array([0.0, 0.0, 0.044])
+        lateral = mapped["left_shoulder"] - mapped["right_shoulder"]
+        lateral_norm = float(np.linalg.norm(lateral))
+        # Anatomical arm origin is the official shoulder-pitch body, before
+        # all three shoulder rotations. Targeting shoulder_yaw_link instead
+        # over-constrains pitch/roll because that body's origin itself moves.
+        shoulder_center = pelvis + np.array([0.0, 0.0, 0.29178])
+        if lateral_norm > 1e-6:
+            lateral /= lateral_norm
+            mapped["left_shoulder"] = shoulder_center + lateral * 0.10022
+            mapped["right_shoulder"] = shoulder_center - lateral * 0.10022
+
+        projection_count = 0
+        overlap = (frame.get("occlusion_analysis") or {}).get(
+            "arm_torso_overlap", {}
+        )
+        for side in ("left", "right"):
+            shoulder_name = f"{side}_shoulder"
+            elbow_name = f"{side}_elbow"
+            wrist_name = f"{side}_wrist"
+            human_shoulder = points[shoulder_name]
+            upper_vec = points[elbow_name] - human_shoulder
+            fore_vec = points[wrist_name] - points[elbow_name]
+            upper_norm = float(np.linalg.norm(upper_vec))
+            fore_norm = float(np.linalg.norm(fore_vec))
+            if upper_norm < 1e-6 or fore_norm < 1e-6:
+                continue
+            # Effective G1 shoulder-to-elbow and elbow-to-wrist lengths from
+            # the official 23-DOF kinematic chain, with a small reach margin.
+            # Official 23-DOF link origins: shoulder_pitch->elbow ~= 0.193 m,
+            # elbow->wrist_roll_rubber_hand ~= 0.101 m.  The old 0.185 m
+            # value belonged to the 29-DOF model's extra pitch/yaw wrist chain
+            # and made GMR solve a robot different from Isaac's articulation.
+            g1_upper, g1_fore = 0.1925, 0.101
+            shoulder = mapped[shoulder_name]
+            elbow_hint = shoulder + upper_vec / upper_norm * g1_upper
+            wrist = elbow_hint + fore_vec / fore_norm * g1_fore
+
+            # A single frontal stereo view is least reliable in depth when an
+            # arm is nearly vertical. Do not allow that noisy depth component
+            # to send a hand far behind G1's shoulder. A small backward reach
+            # remains available for natural lateral/upward motions.
+            minimum_wrist_x = float(shoulder[0] - 0.060)
+            if wrist[0] < minimum_wrist_x:
+                wrist[0] = minimum_wrist_x
+                projection_count += 1
+
+            shoulder_to_wrist = wrist - shoulder
+            requested = float(np.linalg.norm(shoulder_to_wrist))
+            minimum_reach = abs(g1_fore - g1_upper) + 1.0e-4
+            maximum_reach = g1_fore + g1_upper - 0.002
+            distance = float(np.clip(requested, minimum_reach, maximum_reach))
+            if abs(distance - requested) > 1.0e-8:
+                projection_count += 1
+            if requested < 1.0e-8:
+                direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                direction = shoulder_to_wrist / requested
+            wrist = shoulder + direction * distance
+
+            # Classical analytic two-bone reconstruction: preserve both G1
+            # link lengths while selecting the bend plane closest to the
+            # observed human elbow. This avoids independent XYZ clamping that
+            # would change bone lengths or flip the elbow behind the torso.
+            along = (
+                g1_upper * g1_upper
+                - g1_fore * g1_fore
+                + distance * distance
+            ) / (2.0 * distance)
+            height = float(np.sqrt(max(0.0, g1_upper * g1_upper - along * along)))
+            center = shoulder + direction * along
+            observed_pole = elbow_hint - center
+            observed_pole -= direction * float(np.dot(observed_pole, direction))
+            observed_norm = float(np.linalg.norm(observed_pole))
+
+            # Anatomical neutral: elbows prefer the operator's own lateral
+            # side with a small downward component.  It is only a fallback;
+            # a coherent ZED elbow remains the primary measurement.
+            side_sign = 1.0 if side == "left" else -1.0
+            neutral_pole = np.array([0.0, side_sign, -0.25], dtype=np.float64)
+            neutral_pole -= direction * float(np.dot(neutral_pole, direction))
+            neutral_norm = float(np.linalg.norm(neutral_pole))
+            if neutral_norm < 1.0e-8:
+                neutral_pole = np.cross(direction, np.array([1.0, 0.0, 0.0]))
+                neutral_norm = float(np.linalg.norm(neutral_pole))
+            neutral_pole /= max(neutral_norm, 1.0e-8)
+
+            previous_pole = self._arm_pole_memory.get(side)
+            if previous_pole is not None:
+                previous_pole = previous_pole - direction * float(
+                    np.dot(previous_pole, direction)
+                )
+                previous_norm = float(np.linalg.norm(previous_pole))
+                previous_pole = (
+                    previous_pole / previous_norm
+                    if previous_norm > 1.0e-8
+                    else None
+                )
+
+            ambiguous = bool(overlap.get(side)) or height < 0.025
+            if observed_norm > 1.0e-8:
+                observed_pole /= observed_norm
+                if previous_pole is None:
+                    alpha = 0.20 if ambiguous else 0.95
+                    pole = alpha * observed_pole + (1.0 - alpha) * neutral_pole
+                    source = "observed" if not ambiguous else "neutral_blend"
+                else:
+                    agreement = float(np.dot(observed_pole, previous_pole))
+                    # A sign reversal in one frame is the mirrored IK branch,
+                    # not a physically possible elbow motion.  Let a genuine
+                    # bend-plane change arrive over several coherent frames.
+                    alpha = 0.12 if ambiguous or agreement < -0.20 else 0.90
+                    pole = alpha * observed_pole + (1.0 - alpha) * previous_pole
+                    source = "continuity" if alpha < 0.5 else "observed"
+            elif previous_pole is not None:
+                pole = previous_pole
+                source = "memory"
+            else:
+                pole = neutral_pole
+                source = "neutral"
+
+            pole -= direction * float(np.dot(pole, direction))
+            pole_norm = float(np.linalg.norm(pole))
+            if pole_norm < 1.0e-8:
+                pole = neutral_pole
+                pole_norm = 1.0
+            pole /= pole_norm
+            self._arm_pole_memory[side] = pole.copy()
+            self.last_arm_pole_source[side] = source
+            elbow = center + pole * height
+            mapped[elbow_name] = elbow
+            mapped[wrist_name] = wrist
+
+        # The calibrated ratio is kept as telemetry; use it to guard against
+        # implausible profiles without allowing arbitrary task amplification.
+        if not 0.20 <= human_torso <= 0.90:
+            return points, 0, False
+        return mapped, projection_count, True
 
     @staticmethod
     def _direction_angle_deg(first: np.ndarray, second: np.ndarray) -> float:
@@ -350,6 +784,31 @@ class Body38ToGMR:
         pelvis = points.get("pelvis")
         return float(pelvis[2] - 0.90) if pelvis is not None else 0.0
 
+    @staticmethod
+    def _apply_g1_fixed_stance(points: dict[str, np.ndarray]) -> None:
+        """Replace lower-body targets with the official G1 neutral geometry.
+
+        In upper-body imitation the leg joints are intentionally fixed. Human
+        thigh/shank lengths must not remain active IK tasks because the G1
+        kinematic chain cannot satisfy them and the residual contaminates arm
+        optimization. Values are body-origin offsets measured from the
+        upstream GMR Unitree G1 model at its neutral qpos.
+        """
+        pelvis = points.get("pelvis")
+        if pelvis is None:
+            return
+        offsets = {
+            "left_hip": [0.0, 0.116452, -0.133165],
+            "left_knee": [-0.0000023309, 0.1186009, -0.4392957524],
+            "left_foot": [-0.0000023309, 0.118506455, -0.7568637524],
+            "right_hip": [0.0, -0.116452, -0.133165],
+            "right_knee": [-0.0000023309, -0.1186009, -0.4392957524],
+            "right_foot": [-0.0000023309, -0.118506455, -0.7568637524],
+        }
+        for name, offset in offsets.items():
+            if name in points:
+                points[name] = pelvis + np.asarray(offset, dtype=np.float64)
+
     def adapt(self, frame: dict[str, Any]) -> AdaptedFrame | None:
         """Return a GMR frame, or ``None`` when the essential torso is missing."""
         self._frame_no += 1
@@ -375,17 +834,30 @@ class Body38ToGMR:
             self._memory = memory_before
             self.last_rejection_reason = "implausible_geometry"
             return None
+        points, workspace_projection_count, operator_calibrated = (
+            self._map_operator_to_g1_workspace(points, frame)
+        )
+        if self.fixed_stance:
+            self._apply_g1_fixed_stance(points)
+        orientations = self._global_orientations(frame)
         self.last_rejection_reason = "none"
 
         # Remove camera translation and keep the subject upright on z=0.  This
         # prevents camera distance from becoming a robot base displacement.
         pelvis = points["pelvis"].copy()
-        ground_z = self._ground_height(points)
+        ground_z = (
+            float(pelvis[2] - 0.793)
+            if self.fixed_stance
+            else self._ground_height(points)
+        )
         origin = np.array([pelvis[0], pelvis[1], ground_z], dtype=np.float64)
 
         human_data: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for name, xyz in points.items():
-            human_data[name] = (xyz - origin, IDENTITY_WXYZ.copy())
+            human_data[name] = (
+                xyz - origin,
+                orientations.get(name, IDENTITY_WXYZ).copy(),
+            )
 
         return AdaptedFrame(
             human_data=human_data,
@@ -395,4 +867,6 @@ class Body38ToGMR:
             occlusion_held_targets=occlusion_held,
             pelvis_height_m=float(pelvis[2] - ground_z),
             ground_z_m=ground_z,
+            workspace_projection_count=workspace_projection_count,
+            operator_calibrated=operator_calibrated,
         )

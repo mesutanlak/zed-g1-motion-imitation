@@ -19,17 +19,40 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from body38_to_gmr import Body38ToGMR, GMR_BODY38_MAP
 from g1_dof_projection import (
+    AnatomicalElbowRegularizer,
     G1_23DOF_ORDER,
     constrain_gmr_to_23dof,
     named_joint_values,
+    official_g1_23dof_xml,
     project_29_to_23,
 )
+from motion_pipeline.safety import (
+    G1_23_LIMITS_RAD,
+    G1FeasibilityFilter,
+    SafetyLevel,
+)
+from motion_pipeline.metrics import PacketMetrics
 
 
 MAX_VELOCITY_RAD_S = np.asarray(
     [8.0] * 12 + [6.0] + [12.0] * 10, dtype=np.float64
+)
+
+# Joint-group One Euro ranges. Filtering happens after IK in joint space, so
+# rigid human bone lengths are not independently distorted in XYZ.
+MIN_CUTOFF_HZ_23 = np.asarray(
+    [3, 3, 3, 3, 2, 2] * 2 + [3] + [5, 5, 5, 6, 4] * 2,
+    dtype=np.float64,
+)
+MAX_CUTOFF_HZ_23 = np.asarray(
+    [6, 6, 6, 6, 5, 5] * 2 + [5] + [8, 8, 8, 10, 7] * 2,
+    dtype=np.float64,
 )
 UPPER_REQUIRED = {
     "pelvis",
@@ -41,6 +64,63 @@ UPPER_REQUIRED = {
     "left_wrist",
     "right_wrist",
 }
+
+G1_SKELETON_BODIES = (
+    "pelvis", "torso_link",
+    "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link",
+    "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link",
+    "left_shoulder_pitch_link", "left_elbow_link", "left_wrist_roll_rubber_hand",
+    "right_shoulder_pitch_link", "right_elbow_link", "right_wrist_roll_rubber_hand",
+)
+G1_SKELETON_EDGES = (
+    ("pelvis", "torso_link"),
+    ("pelvis", "left_hip_roll_link"), ("left_hip_roll_link", "left_knee_link"),
+    ("left_knee_link", "left_ankle_roll_link"),
+    ("pelvis", "right_hip_roll_link"), ("right_hip_roll_link", "right_knee_link"),
+    ("right_knee_link", "right_ankle_roll_link"),
+    ("torso_link", "left_shoulder_pitch_link"),
+    ("left_shoulder_pitch_link", "left_elbow_link"),
+    ("left_elbow_link", "left_wrist_roll_rubber_hand"),
+    ("torso_link", "right_shoulder_pitch_link"),
+    ("right_shoulder_pitch_link", "right_elbow_link"),
+    ("right_elbow_link", "right_wrist_roll_rubber_hand"),
+)
+HUMAN_RETARGET_EDGES = (
+    ("pelvis", "spine3"),
+    ("pelvis", "left_hip"), ("left_hip", "left_knee"),
+    ("left_knee", "left_foot"),
+    ("pelvis", "right_hip"), ("right_hip", "right_knee"),
+    ("right_knee", "right_foot"),
+    ("spine3", "left_shoulder"),
+    ("left_shoulder", "left_elbow"), ("left_elbow", "left_wrist"),
+    ("spine3", "right_shoulder"),
+    ("right_shoulder", "right_elbow"), ("right_elbow", "right_wrist"),
+)
+
+
+def pelvis_left_right_swap_risk(frame: dict) -> bool:
+    """Check anatomical shoulder order in the operator pelvis frame.
+
+    Historical captures computed this flag in camera coordinates, which marks
+    a correctly labelled person facing the camera as swapped. Recompute it at
+    the control boundary so old recordings and new live packets behave alike.
+    """
+    names = [str(name) for name in frame.get("keypoint_names", [])]
+    points = (frame.get("pelvis_frame") or {}).get("keypoints_m")
+    if points is None:
+        return bool((frame.get("perception_metrics") or {}).get("left_right_swap_risk"))
+    try:
+        left = np.asarray(points[names.index("LEFT_SHOULDER")], dtype=float)
+        right = np.asarray(points[names.index("RIGHT_SHOULDER")], dtype=float)
+    except (ValueError, IndexError, TypeError):
+        return False
+    return bool(
+        left.shape == (3,)
+        and right.shape == (3,)
+        and np.isfinite(left).all()
+        and np.isfinite(right).all()
+        and left[1] < right[1]
+    )
 
 
 class AdaptiveJointFilter:
@@ -60,8 +140,8 @@ class AdaptiveJointFilter:
         velocity_beta: float,
         derivative_cutoff_hz: float,
     ) -> None:
-        self.min_cutoff_hz = float(min_cutoff_hz)
-        self.max_cutoff_hz = float(max_cutoff_hz)
+        self.min_cutoff_hz = np.asarray(min_cutoff_hz, dtype=np.float64)
+        self.max_cutoff_hz = np.asarray(max_cutoff_hz, dtype=np.float64)
         self.velocity_beta = float(velocity_beta)
         self.derivative_cutoff_hz = float(derivative_cutoff_hz)
         self.value: np.ndarray | None = None
@@ -87,7 +167,9 @@ class AdaptiveJointFilter:
             self.value = raw.copy()
             self.previous_raw = raw.copy()
             self.velocity = np.zeros_like(raw)
-            self.last_cutoff_hz = np.full_like(raw, self.min_cutoff_hz)
+            self.last_cutoff_hz = np.broadcast_to(
+                self.min_cutoff_hz, raw.shape
+            ).astype(np.float64).copy()
             return self.value.copy()
 
         raw_velocity = (raw - self.previous_raw) / dt
@@ -115,16 +197,41 @@ class RelativeHandRoll:
     around the observed forearm becomes the relative G1 wrist-roll target.
     """
 
-    def __init__(self, calibration_frames: int = 12) -> None:
+    def __init__(
+        self,
+        calibration_frames: int = 12,
+        max_speed_rad_s: float = 4.5,
+        nominal_fps: float = 60.0,
+    ) -> None:
         self.calibration_frames = calibration_frames
+        self.max_speed_rad_s = float(max_speed_rad_s)
+        self.nominal_dt = 1.0 / max(1.0, float(nominal_fps))
         self.samples: dict[str, list[float]] = {"left": [], "right": []}
         self.baseline: dict[str, float] = {}
         self.last: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self.unwrapped: dict[str, float] = {}
+        self.last_timestamp_ns: dict[str, int] = {}
+
+    def reset(self) -> None:
+        """Start wrist neutral calibration again for a new operator session."""
+        self.samples = {"left": [], "right": []}
+        self.baseline.clear()
+        self.last = {"left": 0.0, "right": 0.0}
+        self.unwrapped.clear()
+        self.last_timestamp_ns.clear()
 
     @staticmethod
     def _angle(frame: dict, side: str) -> float | None:
         names = frame.get("keypoint_names", [])
-        points = frame.get("keypoints_3d_m", [])
+        # Live packets use ``keypoints_3d_m`` while lossless recordings keep
+        # explicit raw/filtered arrays.  Accept all official project schemas;
+        # otherwise wrist roll silently remains at zero during replay.
+        points = (
+            frame.get("keypoints_3d_m")
+            or frame.get("keypoints_3d_filtered_m")
+            or frame.get("keypoints_3d_raw_m")
+            or []
+        )
         lookup = {str(name): index for index, name in enumerate(names)}
         prefix = side.upper()
         required = (
@@ -138,6 +245,19 @@ class RelativeHandRoll:
         )
         if any(name not in lookup for name in required):
             return None
+        confidence = frame.get("keypoint_confidence") or []
+        if confidence:
+            observed = (
+                f"{prefix}_ELBOW",
+                f"{prefix}_WRIST",
+                f"{prefix}_HAND_INDEX_1",
+                f"{prefix}_HAND_PINKY_1",
+            )
+            try:
+                if min(float(confidence[lookup[name]]) for name in observed) < 35.0:
+                    return None
+            except (TypeError, ValueError, IndexError):
+                return None
         try:
             xyz = {
                 name: np.asarray(points[lookup[name]], dtype=np.float64)
@@ -182,14 +302,49 @@ class RelativeHandRoll:
                     self.baseline[side] = float(
                         np.arctan2(np.mean(np.sin(values)), np.mean(np.cos(values)))
                     )
+                    # The first post-calibration sample must start from the
+                    # neutral relative orientation. Without initializing the
+                    # unwrap state here, that sample bypasses the rate limiter
+                    # and can command an immediate +/-1.75 rad hand flip.
+                    self.unwrapped[side] = 0.0
+                    self.last[side] = 0.0
+                    timestamp_ns = int(frame.get("timestamp_ns") or 0)
+                    if timestamp_ns > 0:
+                        self.last_timestamp_ns[side] = timestamp_ns
                 continue
-            delta = float(
+            wrapped = float(
                 np.arctan2(
                     np.sin(angle - self.baseline[side]),
                     np.cos(angle - self.baseline[side]),
                 )
             )
-            self.last[side] = float(np.clip(delta, -1.75, 1.75))
+            # Keep the closest 2*pi-equivalent angle to the preceding sample.
+            # Direct clipping of [-pi, pi] caused +1.75 -> -1.75 jumps when a
+            # hand crossed the wrap boundary, visually flipping the G1 hand.
+            previous_unwrapped = self.unwrapped.get(side, wrapped)
+            candidate = previous_unwrapped + float(
+                np.arctan2(
+                    np.sin(wrapped - previous_unwrapped),
+                    np.cos(wrapped - previous_unwrapped),
+                )
+            )
+
+            timestamp_ns = int(frame.get("timestamp_ns") or 0)
+            previous_timestamp_ns = self.last_timestamp_ns.get(side)
+            if timestamp_ns > 0 and previous_timestamp_ns is not None:
+                dt = float(
+                    np.clip((timestamp_ns - previous_timestamp_ns) * 1.0e-9, 1.0 / 120.0, 0.1)
+                )
+            else:
+                dt = self.nominal_dt
+            max_step = self.max_speed_rad_s * dt
+            candidate = previous_unwrapped + float(
+                np.clip(candidate - previous_unwrapped, -max_step, max_step)
+            )
+            self.unwrapped[side] = candidate
+            if timestamp_ns > 0:
+                self.last_timestamp_ns[side] = timestamp_ns
+            self.last[side] = float(np.clip(candidate, -1.75, 1.75))
         return self.last.copy(), len(self.baseline) == 2
 
 
@@ -204,6 +359,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--listen-port", type=int, default=15050)
     parser.add_argument("--output-host", default="127.0.0.1")
     parser.add_argument("--output-port", type=int, default=15051)
+    parser.add_argument("--telemetry-host", default=None)
+    parser.add_argument("--telemetry-port", type=int, default=15053)
     parser.add_argument(
         "--gmr-root",
         type=Path,
@@ -214,7 +371,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-cutoff-hz", type=float, default=2.0)
     parser.add_argument("--velocity-beta", type=float, default=1.2)
     parser.add_argument("--derivative-cutoff-hz", type=float, default=1.0)
-    parser.add_argument("--input-fps", type=float, default=15.0)
+    parser.add_argument("--input-fps", type=float, default=60.0)
+    parser.add_argument(
+        "--require-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--gmr-velocity-limit",
         action=argparse.BooleanOptionalAction,
@@ -226,6 +388,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-ik-iterations", type=int, default=20)
+    parser.add_argument(
+        "--elbow-posture-cost",
+        type=float,
+        default=0.05,
+        help="Low-priority anatomical elbow hinge regularization cost.",
+    )
     parser.add_argument(
         "--mode", choices=("upper_body", "whole_body"), default="upper_body"
     )
@@ -253,6 +421,140 @@ def qpos_for_joints(
     return np.asarray(values, dtype=np.float64)
 
 
+def close_kinematic_relatives(
+    model: mujoco.MjModel, first: int, second: int, max_hops: int = 3
+) -> bool:
+    """Return true for nearby links whose collision meshes overlap by design."""
+    for child, possible_ancestor in ((first, second), (second, first)):
+        current = int(child)
+        for _ in range(max_hops):
+            current = int(model.body_parentid[current])
+            if current == possible_ancestor:
+                return True
+            if current == 0:
+                break
+    return False
+
+
+def benign_upper_body_mimic_contact(model: mujoco.MjModel, first: int, second: int) -> bool:
+    """Allow a hand to rest on the torso/pelvis/hips without freezing mimicry.
+
+    These are common intentional human poses (hands on hips or abdomen). The
+    previous binary contact gate classified every such target as severe and
+    held the last reliable pose. Elbow/torso, hand/hand and all other contacts
+    remain safety events.
+    """
+    names = {
+        str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, first)),
+        str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, second)),
+    }
+    has_hand = any("wrist_roll_rubber_hand" in name for name in names)
+    has_rest_surface = any(
+        name == "pelvis" or name == "torso_link" or "hip_" in name
+        for name in names
+    )
+    return has_hand and has_rest_surface
+
+
+def forward_g1_skeleton(
+    model: mujoco.MjModel,
+    base_qpos: np.ndarray,
+    joint_values: np.ndarray,
+) -> tuple[dict[str, list[float]], int]:
+    data = mujoco.MjData(model)
+    data.qpos[:] = np.asarray(base_qpos, dtype=np.float64)
+    for name, value in zip(G1_23DOF_ORDER, joint_values):
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if joint_id >= 0:
+            data.qpos[int(model.jnt_qposadr[joint_id])] = float(value)
+    mujoco.mj_forward(model, data)
+    positions: dict[str, list[float]] = {}
+    for name in G1_SKELETON_BODIES:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id >= 0:
+            positions[name] = data.xpos[body_id].astype(float).tolist()
+    self_contacts = 0
+    for contact in data.contact:
+        first = int(model.geom_bodyid[int(contact.geom1)])
+        second = int(model.geom_bodyid[int(contact.geom2)])
+        if (
+            first > 0
+            and second > 0
+            and first != second
+            and not close_kinematic_relatives(model, first, second)
+            and not benign_upper_body_mimic_contact(model, first, second)
+        ):
+            self_contacts += 1
+    return positions, self_contacts
+
+
+def retarget_with_iterations(
+    gmr,
+    human_data: dict,
+    offset_to_ground: bool,
+    extra_tasks: tuple = (),
+) -> tuple[np.ndarray, int]:
+    """Run upstream GMR's table-1 loop while exposing its iteration count."""
+    import mink
+
+    gmr.update_targets(human_data, offset_to_ground)
+    current_error = gmr.error1()
+    dt = gmr.configuration.model.opt.timestep
+    tasks = [*gmr.tasks1, *extra_tasks]
+    velocity = mink.solve_ik(
+        gmr.configuration, tasks, dt, gmr.solver, gmr.damping, gmr.ik_limits
+    )
+    gmr.configuration.integrate_inplace(velocity, dt)
+    iterations = 1
+    next_error = gmr.error1()
+    while current_error - next_error > 0.001 and iterations <= gmr.max_iter:
+        current_error = next_error
+        velocity = mink.solve_ik(
+            gmr.configuration, tasks, dt, gmr.solver, gmr.damping,
+            gmr.ik_limits,
+        )
+        gmr.configuration.integrate_inplace(velocity, dt)
+        iterations += 1
+        next_error = gmr.error1()
+    return gmr.configuration.data.qpos.copy(), iterations
+
+
+def limb_direction_metrics(
+    human_data: dict[str, tuple[np.ndarray, np.ndarray]],
+    robot_positions: dict[str, list[float]],
+) -> tuple[dict[str, float], dict[str, float]]:
+    angle_errors: dict[str, float] = {}
+    endpoint_errors: dict[str, float] = {}
+    for side in ("left", "right"):
+        human_chain = (f"{side}_shoulder", f"{side}_elbow", f"{side}_wrist")
+        robot_chain = (
+            f"{side}_shoulder_pitch_link", f"{side}_elbow_link",
+            f"{side}_wrist_roll_rubber_hand",
+        )
+        if not all(name in human_data for name in human_chain) or not all(
+            name in robot_positions for name in robot_chain
+        ):
+            continue
+        human = [np.asarray(human_data[name][0]) for name in human_chain]
+        robot = [np.asarray(robot_positions[name]) for name in robot_chain]
+        for segment, first, second in (
+            ("upper", 0, 1), ("forearm", 1, 2)
+        ):
+            h = human[second] - human[first]
+            r = robot[second] - robot[first]
+            denominator = max(float(np.linalg.norm(h) * np.linalg.norm(r)), 1e-8)
+            cosine = float(np.clip(np.dot(h, r) / denominator, -1.0, 1.0))
+            angle_errors[f"{side}_{segment}_direction_error_deg"] = float(
+                np.degrees(np.arccos(cosine))
+            )
+        endpoint_errors[f"{side}_wrist_normalized_error"] = float(
+            np.linalg.norm(
+                (human[2] - human[0]) - (robot[2] - robot[0])
+            ) / 0.258
+        )
+    return angle_errors, endpoint_errors
+
+
 def main() -> int:
     args = parse_args()
     sys.path.insert(0, str(args.gmr_root.resolve()))
@@ -261,13 +563,15 @@ def main() -> int:
     # Keep the complete official G1 kinematic chain constrained inside GMR.
     # Isaac decides which output joints are applied; removing lower-body IK
     # constraints can leave free numerical DoFs and produce non-finite qpos.
-    config = Path(__file__).with_name("zed_body38_to_g1.json").resolve()
-    params.IK_CONFIG_DICT.setdefault("zed_body38", {})["unitree_g1"] = config
+    config = Path(__file__).with_name("zed_body38_to_g1_23dof.json").resolve()
+    robot_key = "unitree_g1_23dof"
+    params.ROBOT_XML_DICT[robot_key] = official_g1_23dof_xml()
+    params.IK_CONFIG_DICT.setdefault("zed_body38", {})[robot_key] = config
     from general_motion_retargeting.motion_retarget import GeneralMotionRetargeting
 
     gmr = GeneralMotionRetargeting(
         src_human="zed_body38",
-        tgt_robot="unitree_g1",
+        tgt_robot=robot_key,
         actual_human_height=args.human_height,
         solver="daqp",
         damping=0.5,
@@ -275,7 +579,17 @@ def main() -> int:
         use_velocity_limit=args.gmr_velocity_limit,
     )
     gmr.max_iter = max(1, int(args.max_ik_iterations))
-    constrain_gmr_to_23dof(gmr)
+    constrain_gmr_to_23dof(
+        gmr,
+        lock_waist_yaw=args.mode == "upper_body",
+        restrict_backward_arms=args.mode == "upper_body",
+    )
+    task_names = list(gmr.ik_match_table1.keys())
+    elbow_regularizer = AnatomicalElbowRegularizer(
+        gmr,
+        cost=max(0.0, args.elbow_posture_cost),
+        nominal_fps=args.input_fps,
+    )
     order_29 = actuator_joint_names(gmr.model)
     fixed_lower_targets = (
         "left_hip",
@@ -288,27 +602,53 @@ def main() -> int:
     adapter = Body38ToGMR(
         nominal_fps=args.input_fps,
         memory_seconds=0.25,
+        fixed_stance=args.mode == "upper_body",
         persistent_memory_targets=(
             fixed_lower_targets if args.mode == "upper_body" else ()
         ),
     )
-    hand_roll = RelativeHandRoll()
+    hand_roll = RelativeHandRoll(nominal_fps=args.input_fps)
     required = set(GMR_BODY38_MAP)
+    neutral_gmr_qpos = gmr.configuration.data.qpos.copy()
 
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     receiver.bind((args.listen_host, args.listen_port))
     receiver.settimeout(0.1)
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     destination = (args.output_host, args.output_port)
+    telemetry_destination = (
+        (args.telemetry_host, args.telemetry_port)
+        if args.telemetry_host
+        else None
+    )
 
-    max_cutoff_hz = min(float(args.cutoff_hz), 0.45 * float(args.input_fps))
-    min_cutoff_hz = min(float(args.min_cutoff_hz), max_cutoff_hz)
+    nyquist_safe_hz = 0.45 * float(args.input_fps)
+    max_cutoff_hz = np.minimum(MAX_CUTOFF_HZ_23, nyquist_safe_hz)
+    min_cutoff_hz = np.minimum(MIN_CUTOFF_HZ_23, max_cutoff_hz)
     joint_filter = AdaptiveJointFilter(
-        min_cutoff_hz=max(0.1, min_cutoff_hz),
-        max_cutoff_hz=max(0.1, max_cutoff_hz),
+        min_cutoff_hz=np.maximum(0.1, min_cutoff_hz),
+        max_cutoff_hz=np.maximum(0.1, max_cutoff_hz),
         velocity_beta=max(0.0, float(args.velocity_beta)),
         derivative_cutoff_hz=max(0.1, float(args.derivative_cutoff_hz)),
     )
+    # Simulation-only tuning: body-origin Cartesian tasks have a measurable
+    # residual even for a useful solution. The former 0.10 m warning reduced
+    # nearly every good frame to 55%, producing avoidable live lag. Joint,
+    # velocity, collision and watchdog protections remain unchanged.
+    feasibility = G1FeasibilityFilter(
+        residual_warn=0.24 if args.mode == "upper_body" else 0.10,
+        residual_severe=0.40 if args.mode == "upper_body" else 0.45,
+        yellow_blend=0.82 if args.mode == "upper_body" else 0.55,
+        # In upper-body simulation, do not leave the arms indefinitely at an
+        # occluded/self-colliding target. Brief events hold the last reliable
+        # pose; persistent ORANGE states return smoothly to neutral. Keep the
+        # behavior disabled for whole-body and physical-robot paths.
+        orange_return_after_s=0.35 if args.mode == "upper_body" else None,
+        orange_return_tau_s=0.80,
+    )
+    packet_metrics = PacketMetrics()
+    stale_watchdog_active = False
     last_update = time.monotonic()
     last_status = last_update
     accepted = 0
@@ -320,7 +660,39 @@ def main() -> int:
     last_ik_error = 0.0
     last_ik_position_mean_m = 0.0
     last_ik_position_max_m = 0.0
+    last_ik_upper_position_max_m = 0.0
+    last_solver_iterations = 0
     rejection_reasons: dict[str, int] = {}
+    control_session_active = False
+    control_session_id = 0
+
+    def reset_control_session(reason: str) -> None:
+        """Reset every causal state after operator/calibration invalidation."""
+        nonlocal control_session_active, control_session_id, last_update
+        control_session_id += 1
+        control_session_active = False
+        adapter.reset()
+        joint_filter.reset()
+        feasibility.reset()
+        hand_roll.reset()
+        gmr.configuration.update(neutral_gmr_qpos.copy())
+        elbow_regularizer.reset(neutral_gmr_qpos)
+        last_update = time.monotonic()
+        status_packet = {
+            "schema": "zed_gmr_g1_23dof_live/status/v1",
+            "status": "CONTROL_SESSION_RESET",
+            "reason": reason,
+            "control_session_id": control_session_id,
+            "timestamp_ns": time.time_ns(),
+        }
+        encoded = json.dumps(status_packet, separators=(",", ":")).encode()
+        sender.sendto(encoded, destination)
+        if telemetry_destination is not None:
+            sender.sendto(encoded, telemetry_destination)
+        print(
+            f"CONTROL_SESSION_RESET id={control_session_id} reason={reason}",
+            flush=True,
+        )
     print(
         f"GMR bridge input={args.listen_host}:{args.listen_port} "
         f"output={args.output_host}:{args.output_port}"
@@ -329,8 +701,12 @@ def main() -> int:
         while True:
             try:
                 payload, _ = receiver.recvfrom(65535)
+                receive_timestamp_ns = time.time_ns()
             except socket.timeout:
                 if time.monotonic() - last_update > args.stale_after:
+                    if not stale_watchdog_active:
+                        packet_metrics.watchdog_triggers += 1
+                        stale_watchdog_active = True
                     sender.sendto(
                         json.dumps(
                             {
@@ -351,6 +727,7 @@ def main() -> int:
             while True:
                 try:
                     payload, _ = receiver.recvfrom(65535)
+                    receive_timestamp_ns = time.time_ns()
                     superseded += 1
                 except BlockingIOError:
                     break
@@ -361,6 +738,62 @@ def main() -> int:
                 rejected += 1
                 reason = str(frame.get("status", "non_body_packet"))
                 rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+                continue
+            stale_watchdog_active = False
+            trace_in = frame.get("latency_trace_ns") or {}
+            windows_to_wsl_ms = None
+            if trace_in.get("t2_windows_udp_send_ns"):
+                windows_to_wsl_ms = max(
+                    0.0,
+                    (receive_timestamp_ns - int(trace_in["t2_windows_udp_send_ns"]))
+                    / 1e6,
+                )
+            packet_metrics.observe(
+                int(frame.get("sequence", accepted)),
+                receive_timestamp_ns,
+                windows_to_wsl_ms,
+            )
+            calibration_ready = (
+                (frame.get("calibration") or {}).get("state") == "READY"
+            )
+            operator_locked = (
+                (frame.get("operator_selection") or {}).get("state") == "LOCKED"
+            )
+            if args.require_calibration and not calibration_ready:
+                if control_session_active:
+                    reset_control_session("calibration_not_ready")
+                rejected += 1
+                rejection_reasons["calibration_not_ready"] = (
+                    rejection_reasons.get("calibration_not_ready", 0) + 1
+                )
+                now = time.monotonic()
+                if now - last_status >= 1.0:
+                    calibration_info = frame.get("calibration") or {}
+                    print(
+                        "CONTROL_BLOCKED "
+                        f"reason=calibration_not_ready "
+                        f"state={calibration_info.get('state', 'MISSING')} "
+                        f"progress={float(calibration_info.get('progress', 0.0)):.0%}"
+                    )
+                    last_status = now
+                continue
+            if not operator_locked:
+                if control_session_active:
+                    reset_control_session("operator_not_locked")
+                rejected += 1
+                rejection_reasons["operator_not_locked"] = (
+                    rejection_reasons.get("operator_not_locked", 0) + 1
+                )
+                now = time.monotonic()
+                if now - last_status >= 1.0:
+                    selection_info = frame.get("operator_selection") or {}
+                    print(
+                        "CONTROL_BLOCKED "
+                        f"reason=operator_not_locked "
+                        f"state={selection_info.get('state', 'MISSING')} "
+                        f"acquisition_frames={selection_info.get('acquisition_frames', 0)}"
+                    )
+                    last_status = now
                 continue
             adapted = adapter.adapt(frame)
             if adapted is None or not required.issubset(adapted.human_data):
@@ -373,8 +806,15 @@ def main() -> int:
                 rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
                 continue
 
+            solve_started_ns = time.time_ns()
             solve_started = time.perf_counter()
-            qpos = gmr.retarget(adapted.human_data, offset_to_ground=True)
+            elbow_regularizer.update(adapted.human_data)
+            qpos, last_solver_iterations = retarget_with_iterations(
+                gmr,
+                adapted.human_data,
+                offset_to_ground=True,
+                extra_tasks=(elbow_regularizer.task,),
+            )
             last_ik_error = float(gmr.error1())
             position_errors = [
                 float(np.linalg.norm(task.compute_error(gmr.configuration)[:3]))
@@ -382,8 +822,34 @@ def main() -> int:
             ]
             last_ik_position_mean_m = float(np.mean(position_errors))
             last_ik_position_max_m = float(np.max(position_errors))
+            upper_position_errors = [
+                error
+                for name, error in zip(task_names, position_errors)
+                if any(
+                    token in name
+                    for token in ("pelvis", "torso", "shoulder", "elbow", "wrist")
+                )
+            ]
+            last_ik_upper_position_max_m = (
+                float(np.max(upper_position_errors))
+                if upper_position_errors
+                else last_ik_position_max_m
+            )
             q29 = qpos_for_joints(gmr.model, qpos, order_29)
             raw = project_29_to_23(named_joint_values(order_29, q29))
+            if args.mode == "upper_body":
+                # Isaac deliberately ignores the first 12 lower-body targets
+                # and applies its official fixed double-support controller.
+                # Do not let harmless numerical IK motion in those unused DoFs
+                # raise a global YELLOW state and slow every upper-body joint.
+                raw[:12] = 0.0
+            pelvis_yaw = (frame.get("pelvis_frame") or {}).get(
+                "relative_neutral_yaw_rad"
+            )
+            if isinstance(pelvis_yaw, (int, float)) and np.isfinite(pelvis_yaw):
+                raw[G1_23DOF_ORDER.index("waist_yaw_joint")] = float(
+                    np.clip(pelvis_yaw, -1.2, 1.2)
+                )
             wrist_roll, wrist_calibrated = hand_roll.update(frame)
             raw[G1_23DOF_ORDER.index("left_wrist_roll_joint")] = wrist_roll["left"]
             raw[G1_23DOF_ORDER.index("right_wrist_roll_joint")] = wrist_roll["right"]
@@ -401,8 +867,58 @@ def main() -> int:
                 joint_filter.reset()
                 rejected += 1
                 continue
+            perception_reasons: list[str] = []
+            overlap = (frame.get("occlusion_analysis") or {}).get(
+                "arm_torso_overlap", {}
+            )
+            if overlap.get("right"):
+                perception_reasons.append("right_wrist_occluded")
+            if overlap.get("left"):
+                perception_reasons.append("left_wrist_occluded")
+            if pelvis_left_right_swap_risk(frame):
+                perception_reasons.append("left_right_swap_risk")
+            calibration_profile = (frame.get("calibration") or {}).get("profile") or {}
+            if float(calibration_profile.get("median_bone_length_cv", 0.0)) > 0.08:
+                perception_reasons.append("bone_length_violation")
+            raw_skeleton, raw_self_collisions = forward_g1_skeleton(
+                gmr.model, qpos, raw
+            )
+            limb_direction_error, end_effector_error = limb_direction_metrics(
+                adapted.human_data, raw_skeleton
+            )
+            upper_relative_residual_m = (
+                max(end_effector_error.values()) * 0.258
+                if end_effector_error
+                else last_ik_upper_position_max_m
+            )
+            feasibility_result = feasibility.update(
+                filtered,
+                dt,
+                reasons=perception_reasons,
+                gmr_residual=(
+                    upper_relative_residual_m
+                    if args.mode == "upper_body"
+                    else last_ik_position_max_m
+                ),
+                self_collision=raw_self_collisions > 0,
+                stale=False,
+            )
+            safe = feasibility_result.safe_q
+            saturation_low = G1_23_LIMITS_RAD[:, 0] + feasibility.margin
+            saturation_high = G1_23_LIMITS_RAD[:, 1] - feasibility.margin
+            saturation_names = [
+                name
+                for name, value, low, high in zip(
+                    G1_23DOF_ORDER, filtered, saturation_low, saturation_high
+                )
+                if float(value) < float(low) or float(value) > float(high)
+            ]
+            safe_skeleton, safe_self_collisions = forward_g1_skeleton(
+                gmr.model, qpos, safe
+            )
             last_update = now
             accepted += 1
+            control_session_active = True
             last_solve_ms = (time.perf_counter() - solve_started) * 1000.0
             source_timestamp_ns = int(frame.get("timestamp_ns", 0))
             last_source_age_ms = (
@@ -414,13 +930,26 @@ def main() -> int:
             while accepted_times and now - accepted_times[0] > 1.0:
                 accepted_times.popleft()
 
+            bridge_send_timestamp_ns = time.time_ns()
+            latency_trace = dict(frame.get("latency_trace_ns") or {})
+            latency_trace.update(
+                {
+                    "t3_wsl_receive_ns": receive_timestamp_ns,
+                    "t4_gmr_start_ns": solve_started_ns,
+                    "t5_gmr_finish_ns": bridge_send_timestamp_ns,
+                }
+            )
             packet = {
                 "schema": "zed_gmr_g1_23dof_live/v1",
                 "sequence": int(frame.get("sequence", accepted)),
+                "control_session_id": control_session_id,
                 "source_timestamp_ns": source_timestamp_ns,
                 "bridge_timestamp_ns": time.time_ns(),
                 "joint_names": G1_23DOF_ORDER,
-                "joint_position_rad": filtered.tolist(),
+                "joint_position_rad": safe.tolist(),
+                "raw_joint_position_rad": raw.tolist(),
+                "filtered_joint_position_rad": filtered.tolist(),
+                "safe_joint_position_rad": safe.tolist(),
                 "body_confidence": float(frame.get("body_confidence", 0.0)),
                 "valid_targets": adapted.valid_targets,
                 "memory_targets": adapted.used_memory_targets,
@@ -428,33 +957,81 @@ def main() -> int:
                 "occlusion_held_targets": adapted.occlusion_held_targets,
                 "pelvis_height_m": adapted.pelvis_height_m,
                 "physical_robot_output": False,
+                "safety": {
+                    "level": SafetyLevel(feasibility_result.level).name,
+                    "reasons": list(feasibility_result.reasons),
+                    "blend": feasibility_result.blend,
+                    "joint_limit_saturation": feasibility_result.joint_limit_saturation_count,
+                    "joint_limit_saturation_names": saturation_names,
+                    "velocity_limit_events": feasibility_result.velocity_limit_count,
+                    "acceleration_limit_events": feasibility_result.acceleration_limit_count,
+                    "workspace_projection_count": adapted.workspace_projection_count,
+                    "operator_calibrated": adapted.operator_calibrated,
+                    "raw_self_collision_count": raw_self_collisions,
+                    "safe_self_collision_count": safe_self_collisions,
+                },
+                "g1_skeleton": {
+                    "body_names": list(G1_SKELETON_BODIES),
+                    "edges": [list(edge) for edge in G1_SKELETON_EDGES],
+                    "raw_positions_m": raw_skeleton,
+                    "safe_positions_m": safe_skeleton,
+                },
+                "retarget_comparison": {
+                    "human_body_names": list(adapted.human_data),
+                    "human_edges": [list(edge) for edge in HUMAN_RETARGET_EDGES],
+                    "human_positions_m": {
+                        name: np.asarray(value[0], dtype=float).tolist()
+                        for name, value in adapted.human_data.items()
+                    },
+                },
+                "latency_trace_ns": latency_trace,
                 "bridge_metrics": {
                     "output_hz": len(accepted_times),
                     "solve_ms": last_solve_ms,
                     "source_age_ms": last_source_age_ms,
                     "superseded_frames": superseded,
                     "filter_mode": "adaptive_one_euro",
-                    "min_cutoff_hz": joint_filter.min_cutoff_hz,
-                    "max_cutoff_hz": joint_filter.max_cutoff_hz,
+                    "min_cutoff_hz_by_joint": joint_filter.min_cutoff_hz.tolist(),
+                    "max_cutoff_hz_by_joint": joint_filter.max_cutoff_hz.tolist(),
                     "mean_active_cutoff_hz": (
                         float(np.mean(joint_filter.last_cutoff_hz))
                         if joint_filter.last_cutoff_hz is not None
-                        else joint_filter.min_cutoff_hz
+                        else float(np.mean(joint_filter.min_cutoff_hz))
                     ),
                     "velocity_beta": joint_filter.velocity_beta,
                     "input_fps": args.input_fps,
                     "wrist_roll_calibrated": wrist_calibrated,
+                    "left_elbow_regularizer_target_rad": (
+                        elbow_regularizer.last_target_rad.get("left")
+                    ),
+                    "right_elbow_regularizer_target_rad": (
+                        elbow_regularizer.last_target_rad.get("right")
+                    ),
+                    "left_arm_pole_source": adapter.last_arm_pole_source["left"],
+                    "right_arm_pole_source": adapter.last_arm_pole_source["right"],
                     "left_wrist_roll_rad": wrist_roll["left"],
                     "right_wrist_roll_rad": wrist_roll["right"],
                     "ik_error_norm": last_ik_error,
                     "ik_position_mean_m": last_ik_position_mean_m,
                     "ik_position_max_m": last_ik_position_max_m,
+                    "ik_upper_position_max_m": last_ik_upper_position_max_m,
+                    "ik_upper_relative_residual_m": upper_relative_residual_m,
+                    "solver_iterations": last_solver_iterations,
+                    "solver_iteration_limit": gmr.max_iter + 1,
+                    "limb_direction_error_deg": limb_direction_error,
+                    "end_effector_normalized_error": end_effector_error,
                     "gmr_velocity_limit": args.gmr_velocity_limit,
+                    "system_transport": packet_metrics.snapshot(),
                 },
             }
             sender.sendto(
                 json.dumps(packet, separators=(",", ":")).encode(), destination
             )
+            if telemetry_destination is not None:
+                sender.sendto(
+                    json.dumps(packet, separators=(",", ":")).encode(),
+                    telemetry_destination,
+                )
             if now - last_status >= 1.0:
                 print(
                     f"accepted={accepted} rejected={rejected} "

@@ -1,0 +1,188 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.45
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Zemin
+      Plane: XY
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.25
+      Name: Tum TF Agaci
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: ""
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+      Name: G1 23-DOF Resmi Mesh
+      Update Interval: 0
+      Visual Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: ZED BODY38 Ham Iskelet
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /zed/body38/markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Insan GMR Referansi
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /g1/retarget/human_markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: G1 Raw Hedef
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /g1/retarget/raw_markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: G1 Safe Hedef
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /g1/retarget/safe_markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: G1 Isaac Gercek
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /g1/isaac/actual_markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Sensor Govdeleri
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /g1/sensors/mount_markers
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: Intensity
+      Decay Time: 0.2
+      Enabled: true
+      Name: Livox Mid-360 Nokta Bulutu
+      Position Transformer: XYZ
+      Size (Pixels): 2
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /livox/lidar
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Color: 50; 200; 255
+      Color Transformer: FlatColor
+      Decay Time: 0.2
+      Enabled: true
+      Name: D435i Depth Nokta Bulutu
+      Position Transformer: XYZ
+      Size (Pixels): 2
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /camera/camera/depth/color/points
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: RGB8
+      Decay Time: 0.2
+      Enabled: false
+      Name: ZED2i Kayitli Nokta Bulutu
+      Position Transformer: XYZ
+      Size (Pixels): 2
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /zed/zed_node/point_cloud/cloud_registered
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: D435i Depth Goruntusu
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /camera/camera/depth/image_rect_raw
+    - Class: rviz_default_plugins/Image
+      Enabled: false
+      Name: ZED2i Depth Goruntusu
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /zed/zed_node/depth/depth_registered
+  Enabled: true
+  Global Options:
+    Background Color: 28; 31; 36
+    Fixed Frame: odom
+    Frame Rate: 60
+  Name: root
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 4.5
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.8
+      Name: G1 Genel Gorunum
+      Pitch: 0.35
+      Target Frame: odom
+      Yaw: 5.4
+Window Geometry:
+  Height: 950
+  Width: 1600
+  X: 50
+  Y: 50

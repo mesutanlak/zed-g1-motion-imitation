@@ -97,3 +97,20 @@ powershell -ExecutionPolicy Bypass -File .\start_g1_rerun.ps1 `
 
 python .\rerun_analysis\test_rerun_analysis.py
 ```
+
+## Canlı retargeting karşılaştırması
+
+Isaac/GMR köprüsü açıkken Rerun ikinci UDP akışını `15053` portundan dinler.
+Üstteki iki 3B görünüm aynı zaman damgasında şu verileri gösterir:
+
+- `ZED BODY_38 — retarget öncesi`: kameradan gelen, pelvis koordinat sistemine
+  alınmış insan iskeleti.
+- `HUMAN PRE-GMR` (mavi): GMR'a gerçekten verilen, kalibrasyon ve G1 workspace
+  projeksiyonu uygulanmış hedefler.
+- `G1 RAW` (turuncu): GMR solver'ın 23-DOF çözümünden hesaplanan iskelet.
+- `G1 SAFE` (yeşil): joint/hız/ivme limitlerinden sonra Isaac'e gönderilen
+  iskelet.
+
+Bu ayrım hatanın algılama, workspace ölçekleme, IK veya feasibility katmanında
+olduğunu tek kayıtta ayırt etmeyi sağlar. RRD dosyası üç iskeleti ve `raw_q` /
+`safe_q` zaman serilerini birlikte saklar.

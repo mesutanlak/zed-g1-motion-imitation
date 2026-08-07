@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -32,6 +33,31 @@ ANGLE_FIELDS = (
     "analysis_frame", "timestamp_ns", "angle_name", "angle_deg",
     "angular_velocity_deg_s",
 )
+IMITATION_FIELDS = (
+    "sequence", "timestamp_ns", "safety_level", "safety_reasons",
+    "left_human_elbow_deg", "left_raw_elbow_deg", "left_safe_elbow_deg",
+    "left_actual_elbow_deg", "left_safe_error_deg", "left_actual_error_deg",
+    "right_human_elbow_deg", "right_raw_elbow_deg", "right_safe_elbow_deg",
+    "right_actual_elbow_deg", "right_safe_error_deg", "right_actual_error_deg",
+    "joint_tracking_rmse_rad", "body_tracking_mpjpe_m", "total_control_ms",
+)
+
+
+def _interior_deg(points: dict[str, Any], first: str, middle: str, last: str) -> float | None:
+    try:
+        a = [float(v) for v in points[first]]
+        b = [float(v) for v in points[middle]]
+        c = [float(v) for v in points[last]]
+        u = [a[i] - b[i] for i in range(3)]
+        v = [c[i] - b[i] for i in range(3)]
+        nu = math.sqrt(sum(item * item for item in u))
+        nv = math.sqrt(sum(item * item for item in v))
+        if nu < 1e-8 or nv < 1e-8:
+            return None
+        cosine = max(-1.0, min(1.0, sum(u[i] * v[i] for i in range(3)) / (nu * nv)))
+        return math.degrees(math.acos(cosine))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _json_safe(value: Any) -> Any:
@@ -62,9 +88,13 @@ class AnalysisSessionWriter:
         self.frames_csv_path = self.session_dir / "frames.csv"
         self.joints_csv_path = self.session_dir / "joints.csv"
         self.angles_csv_path = self.session_dir / "angles.csv"
+        self.imitation_jsonl_path = self.session_dir / "imitation_comparison.jsonl"
+        self.imitation_csv_path = self.session_dir / "imitation_comparison.csv"
         self.manifest_path = self.session_dir / "session_manifest.json"
         self.rrd_path = rrd_path
         self.frame_count = 0
+        self.imitation_count = 0
+        self._imitation_lock = threading.Lock()
 
         self._json = self.jsonl_path.open("w", encoding="utf-8", newline="\n")
         self._frames = self.frames_csv_path.open(
@@ -76,12 +106,22 @@ class AnalysisSessionWriter:
         self._angles = self.angles_csv_path.open(
             "w", encoding="utf-8-sig", newline=""
         )
+        self._imitation_json = self.imitation_jsonl_path.open(
+            "w", encoding="utf-8", newline="\n"
+        )
+        self._imitation_csv = self.imitation_csv_path.open(
+            "w", encoding="utf-8-sig", newline=""
+        )
         self._frame_writer = csv.DictWriter(self._frames, fieldnames=FRAME_FIELDS)
         self._joint_writer = csv.DictWriter(self._joints, fieldnames=JOINT_FIELDS)
         self._angle_writer = csv.DictWriter(self._angles, fieldnames=ANGLE_FIELDS)
+        self._imitation_writer = csv.DictWriter(
+            self._imitation_csv, fieldnames=IMITATION_FIELDS
+        )
         self._frame_writer.writeheader()
         self._joint_writer.writeheader()
         self._angle_writer.writeheader()
+        self._imitation_writer.writeheader()
 
         self.metadata = {
             "schema": "zed_body38_rerun_analysis/metadata/v1",
@@ -103,11 +143,70 @@ class AnalysisSessionWriter:
                 "frames": self.frames_csv_path.name,
                 "joints": self.joints_csv_path.name,
                 "angles": self.angles_csv_path.name,
+                "imitation_lossless": self.imitation_jsonl_path.name,
+                "imitation_summary": self.imitation_csv_path.name,
             },
             "safety": "Perception analysis only; no Unitree motor commands.",
         }
         self._json.write(json.dumps(self.metadata, ensure_ascii=False) + "\n")
         self._write_manifest()
+
+    def write_imitation(self, packet: dict[str, Any]) -> None:
+        """Persist synchronized human, GMR-safe and measured Isaac geometry."""
+        comparison = packet.get("retarget_comparison") or {}
+        skeleton = packet.get("g1_skeleton") or {}
+        human = comparison.get("human_positions_m") or {}
+        isaac = packet.get("isaac_metrics") or {}
+        latency = packet.get("latency_breakdown_ms") or {}
+        safety = packet.get("safety") or {}
+        chains = {
+            "human": {
+                side: (f"{side}_shoulder", f"{side}_elbow", f"{side}_wrist")
+                for side in ("left", "right")
+            },
+            "g1": {
+                side: (
+                    f"{side}_shoulder_pitch_link", f"{side}_elbow_link",
+                    f"{side}_wrist_roll_rubber_hand",
+                ) for side in ("left", "right")
+            },
+        }
+        row: dict[str, Any] = {
+            "sequence": packet.get("sequence"),
+            "timestamp_ns": packet.get("timestamp_ns"),
+            "safety_level": safety.get("level"),
+            "safety_reasons": json.dumps(safety.get("reasons", []), ensure_ascii=False),
+            "joint_tracking_rmse_rad": isaac.get("joint_tracking_rmse_rad"),
+            "body_tracking_mpjpe_m": isaac.get("body_tracking_mpjpe_m"),
+            "total_control_ms": latency.get("total_control_ms"),
+        }
+        for side in ("left", "right"):
+            h = _interior_deg(human, *chains["human"][side])
+            row[f"{side}_human_elbow_deg"] = h
+            for variant in ("raw", "safe", "actual"):
+                value = _interior_deg(
+                    skeleton.get(f"{variant}_positions_m") or {},
+                    *chains["g1"][side],
+                )
+                row[f"{side}_{variant}_elbow_deg"] = value
+                if variant in ("safe", "actual"):
+                    row[f"{side}_{variant}_error_deg"] = (
+                        abs(value - h) if value is not None and h is not None else None
+                    )
+        with self._imitation_lock:
+            self.imitation_count += 1
+            record = {
+                "schema": "zed_g1_imitation_comparison/frame/v1",
+                "summary": row,
+                "telemetry_packet": packet,
+            }
+            self._imitation_json.write(
+                json.dumps(_json_safe(record), ensure_ascii=False, allow_nan=False) + "\n"
+            )
+            self._imitation_writer.writerow(row)
+            if self.imitation_count % 15 == 0:
+                self._imitation_json.flush()
+                self._imitation_csv.flush()
 
     def _write_manifest(self) -> None:
         payload = dict(self.metadata)
@@ -264,12 +363,22 @@ class AnalysisSessionWriter:
             self.flush()
 
     def flush(self) -> None:
-        for stream in (self._json, self._frames, self._joints, self._angles):
+        for stream in (
+            self._json, self._frames, self._joints, self._angles,
+            self._imitation_json, self._imitation_csv,
+        ):
             stream.flush()
+        # Keep the manifest useful even if the viewer, WSLg, or the parent
+        # PowerShell is terminated without reaching ``close``. At 15/30 FPS
+        # this is updated every 1.0/0.5 second by ``write``.
+        self._write_manifest()
 
     def close(self) -> None:
         self.flush()
-        for stream in (self._json, self._frames, self._joints, self._angles):
+        for stream in (
+            self._json, self._frames, self._joints, self._angles,
+            self._imitation_json, self._imitation_csv,
+        ):
             stream.close()
         self.metadata["closed_unix_ns"] = time.time_ns()
         self._write_manifest()

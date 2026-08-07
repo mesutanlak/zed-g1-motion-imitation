@@ -5,6 +5,7 @@ param(
     [string]$Svo2Path = "",
     [string]$ListenHost = "0.0.0.0",
     [int]$ListenPort = 15052,
+    [int]$GmrListenPort = 15053,
     [switch]$NoViewer,
     [switch]$Headless,
     [switch]$NoRealtime
@@ -38,6 +39,7 @@ $arguments = @(
     "-m", "rerun_analysis.app",
     "--listen-host", $ListenHost,
     "--listen-port", "$ListenPort",
+    "--gmr-listen-port", "$GmrListenPort",
     "--output-dir", $output
 )
 
@@ -69,7 +71,7 @@ if ($NoRealtime) {
 }
 
 Write-Host "Bagimsiz Rerun BODY_38 analiz sistemi baslatiliyor..."
-Write-Host "Mod: $Mode | UDP: ${ListenHost}:$ListenPort"
+Write-Host "Mod: $Mode | BODY_38 UDP: ${ListenHost}:$ListenPort | GMR: $GmrListenPort"
 Write-Host "Mevcut analysis_panel dosyalari kullanilmiyor/degistirilmiyor."
 
 Push-Location $project

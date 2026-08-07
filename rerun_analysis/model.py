@@ -55,7 +55,9 @@ class AnalysisConfig:
     offset_y_m: float = 0.0
     offset_z_m: float = 0.0
     max_joint_speed_m_s: float = 6.0
-    occlusion_hold_frames: int = 8
+    # Short hold bridges one or two dropped detections without leaving a joint
+    # visibly suspended for half a second at the 15 FPS shared-GPU profile.
+    occlusion_hold_frames: int = 3
     playback_rate: float = 1.0
     paused: bool = False
     capture_enabled: bool = True
@@ -116,7 +118,8 @@ class SkeletonConditioner:
         packet = copy.deepcopy(source_packet)
         names = [str(name) for name in packet.get("keypoint_names", [])]
         candidates = (
-            packet.get("keypoints_3d_filtered_m")
+            (packet.get("pelvis_frame") or {}).get("keypoints_m")
+            or packet.get("keypoints_3d_filtered_m")
             or packet.get("keypoints_3d_m")
             or packet.get("keypoints_3d_raw_m")
             or []
@@ -156,6 +159,9 @@ class SkeletonConditioner:
                 else 0.0
             )
             accepted = point is not None and confidence >= config.confidence_threshold
+            rejection_reason = "missing"
+            if point is not None and confidence < config.confidence_threshold:
+                rejection_reason = "low_confidence"
             target = None
             if accepted:
                 anchor = pelvis or (0.0, 0.0, 0.0)
@@ -173,7 +179,7 @@ class SkeletonConditioner:
                     if speed > float(config.max_joint_speed_m_s):
                         accepted = False
                         target = None
-                        states[name] = "velocity_rejected"
+                        rejection_reason = "velocity_rejected"
 
             if accepted and target is not None:
                 previous = self.previous.get(name)
@@ -195,10 +201,17 @@ class SkeletonConditioner:
             self.missing_frames[name] = misses
             if name in self.previous and misses <= int(config.occlusion_hold_frames):
                 output.append(list(self.previous[name]))
-                states.setdefault(name, "held")
+                states[name] = (
+                    "held_outlier"
+                    if rejection_reason == "velocity_rejected"
+                    else "held"
+                )
             else:
                 output.append([None, None, None])
-                states.setdefault(name, "missing")
+                states[name] = rejection_reason
+                # Do not smooth or velocity-gate a newly reacquired joint
+                # against a stale point from before a longer occlusion.
+                self.previous.pop(name, None)
 
         packet["keypoints_3d_m"] = output
         packet["analysis_conditioning"] = {

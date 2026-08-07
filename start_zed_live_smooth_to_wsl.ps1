@@ -6,8 +6,8 @@ param(
     [switch]$NoRosStream,
     [switch]$AllowSvoWithIsaac,
     [string]$AnalysisHost = "127.0.0.1",
-    [ValidateSet("shared_gpu_safe", "quality")]
-    [string]$Profile = "shared_gpu_safe"
+    [ValidateSet("shared_gpu_safe", "balanced_30", "realtime_60", "quality")]
+    [string]$Profile = "realtime_60"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +23,10 @@ if (-not $wslAddress) {
     throw "WSL IP adresi alinamadi."
 }
 
-if (-not $SkipGmrCheck) {
+# SVO2 dataset capture is intentionally allowed as a standalone camera job.
+# Live imitation still requires the GMR listener unless -SkipGmrCheck is explicit.
+$standaloneSvoCapture = $RecordSvo2 -and -not $AllowSvoWithIsaac
+if (-not $SkipGmrCheck -and -not $standaloneSvoCapture) {
     & wsl.exe -d Ubuntu-22.04 -- bash -lc "ss -lun | grep -q ':15050'"
     if ($LASTEXITCODE -ne 0) {
         throw @"
@@ -31,6 +34,9 @@ WSL Ubuntu-22.04 icinde UDP 15050 dinleyicisi bulunamadi.
 Once ayri bir PowerShell'de start_g1_isaaclab_live.ps1 dosyasini baslatin.
 "@
     }
+}
+elseif ($standaloneSvoCapture) {
+    Write-Host "Bagimsiz SVO2 veri seti kaydi: GMR/Isaac UDP 15050 dinleyicisi zorunlu degil."
 }
 
 $isaacRunning = Get-CimInstance Win32_Process |
@@ -44,6 +50,8 @@ Kamera veri setini Isaac kapaliyken ayri oturumda SVO2 olarak kaydedin.
 "@
 }
 
+$bodyModel = "medium"
+$predictionTimeout = "0.25"
 if ($Profile -eq "shared_gpu_safe") {
     $captureFps = "15"
     $depthMode = "performance"
@@ -52,10 +60,33 @@ if ($Profile -eq "shared_gpu_safe") {
     $skeletonSmoothing = "0.10"
     Write-Host "ZED Isaac-uyumlu profil: BODY_38 MEDIUM, HD720@15, PERFORMANCE, low-latency"
 }
+elseif ($Profile -eq "balanced_30") {
+    $captureFps = "30"
+    $depthMode = "neural-light"
+    $filterTau = "0.0"
+    $streamHz = "30"
+    $skeletonSmoothing = "0.10"
+    Write-Host "ZED canli profil: BODY_38 MEDIUM, HD720@30, NEURAL_LIGHT, pelvis-local"
+}
+elseif ($Profile -eq "realtime_60") {
+    # ZED 2i officially exposes HD720@60. FAST + NEURAL_LIGHT keeps the
+    # BODY_38 inference path light enough to share the GPU with Isaac. The
+    # effective body rate must still be measured; camera FPS alone is not a
+    # guarantee that body inference sustained 60 Hz.
+    $captureFps = "60"
+    $depthMode = "neural-light"
+    $filterTau = "0.0"
+    $streamHz = "60"
+    $skeletonSmoothing = "0.05"
+    $bodyModel = "fast"
+    $predictionTimeout = "0.12"
+    Write-Host "ZED dusuk gecikme profili: BODY_38 FAST, HD720@60, NEURAL_LIGHT, pelvis-local"
+    Write-Host "Not: Bu profil kamera 60 FPS ister; etkili BODY FPS ve p95 gecikme olculerek dogrulanmalidir."
+}
 else {
     $captureFps = "30"
     $depthMode = "neural-light"
-    $filterTau = "0.055"
+    $filterTau = "0.0"
     $streamHz = "30"
     $skeletonSmoothing = "0.15"
     Write-Host "ZED kalite profili: BODY_38 MEDIUM, HD720@30, NEURAL_LIGHT"
@@ -80,19 +111,23 @@ else {
 Set-Location -LiteralPath $projectDir
 $zedArguments = @(
     ".\zed_g1_skeleton.py",
-    "--model", "medium",
+    "--model", $bodyModel,
     "--fps", $captureFps,
     "--depth-mode", $depthMode,
     "--confidence", "40",
     "--filter-tau", $filterTau,
-    "--prediction-timeout", "0.25",
+    "--prediction-timeout", $predictionTimeout,
     "--skeleton-smoothing", $skeletonSmoothing,
+    "--operator-acquire-frames", "10",
+    "--calibration-seconds", "4.0",
     "--reduced-precision",
     "--camera-timeout", "5.0",
     "--stream-host", $wslAddress,
     "--stream-port", "15050",
     "--stream-max-hz", $streamHz,
-    "--max-corrupt-consecutive", "6"
+    # Isolated USB/UVC corruption is dropped while the last valid frame and
+    # safe robot command are held. Restart only after roughly one full second.
+    "--max-corrupt-consecutive", "30"
 )
 if (-not $NoAnalysisStream) {
     $zedArguments += @(

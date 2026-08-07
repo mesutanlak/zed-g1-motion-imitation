@@ -22,6 +22,11 @@ import sys
 import time
 from typing import Any
 
+from motion_pipeline.arm_chain import ArmChainOptimizer
+from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
+from motion_pipeline.metrics import PerceptionMetrics
+from motion_pipeline.operator_selector import OperatorSelector, OperatorState
+
 
 def _configure_windows_dll_search() -> list[Any]:
     """Keep os.add_dll_directory handles alive for the complete process."""
@@ -865,6 +870,8 @@ def parse_args() -> argparse.Namespace:
         help="ZED body tracking modeli (varsayılan: medium)",
     )
     parser.add_argument("--fps", type=int, choices=(15, 30, 60), default=30)
+    parser.add_argument("--operator-acquire-frames", type=int, default=10)
+    parser.add_argument("--calibration-seconds", type=float, default=4.0)
     parser.add_argument(
         "--depth-mode",
         choices=("neural-light", "neural", "performance"),
@@ -991,10 +998,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-corrupt-consecutive",
         type=int,
-        default=6,
+        default=30,
         help=(
             "Bu sayida ardisik yirtilmis USB karesinden sonra kamerayi yeniden "
-            "baslatmak icin uygulamadan hata koduyla cik"
+            "baslatmak icin uygulamadan hata koduyla cik (varsayilan: 30)"
         ),
     )
     parser.add_argument("--headless", action="store_true")
@@ -1022,7 +1029,15 @@ def run_self_test() -> int:
     assert zed_value(resolution) == {"width": 1280, "height": 720}
     json.dumps(
         sanitize_for_json(
-            {"camera": {"resolution": resolution}, "path": Path("test.svo2")}
+            {
+                "camera": {"resolution": resolution},
+                "path": Path("test.svo2"),
+                "pelvis_frame": {
+                    "origin_camera_m": np.asarray([1.0, 2.0, 3.0]),
+                    "rotation_camera_from_pelvis": np.eye(3),
+                    "relative_neutral_yaw_rad": np.float64(0.25),
+                },
+            }
         )
     )
     test_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -1095,6 +1110,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.operator_acquire_frames < 1:
+        print("--operator-acquire-frames en az 1 olmalı.", file=sys.stderr)
+        return 2
+    if not 3.0 <= args.calibration_seconds <= 5.0:
+        print("--calibration-seconds 3 ile 5 arasında olmalı.", file=sys.stderr)
+        return 2
     if args.camera_timeout <= 0:
         print("--camera-timeout sıfırdan büyük olmalı.", file=sys.stderr)
         return 2
@@ -1128,6 +1149,11 @@ def main() -> int:
     init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
     init.depth_maximum_distance = 8.0
     init.sdk_verbose = 1
+    # Let the SDK recover a temporarily interrupted USB/UVC stream in the
+    # background.  ZED SDK 4+ exposes this option; keep compatibility with
+    # older Python bindings used on secondary machines.
+    if hasattr(init, "async_grab_camera_recovery"):
+        init.async_grab_camera_recovery = True
 
     open_result = zed.open(init)
     if open_result != sl.ERROR_CODE.SUCCESS:
@@ -1177,6 +1203,12 @@ def main() -> int:
     left_image = sl.Mat()
     sensors = sl.SensorsData()
     low_pass = ConfidenceAwareLowPass(args.filter_tau)
+    operator_selector = OperatorSelector(args.operator_acquire_frames)
+    calibration_manager = CalibrationManager(args.calibration_seconds)
+    arm_optimizer = ArmChainOptimizer(
+        hold_s=max(0.15, args.prediction_timeout + 0.10)
+    )
+    perception_metrics = PerceptionMetrics()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     record_stem = time.strftime("zed_body38_%Y%m%d_%H%M%S")
@@ -1313,6 +1345,7 @@ def main() -> int:
     last_body_warning = 0.0
     corrupt_consecutive = 0
     corrupt_total = 0
+    last_good_frame: np.ndarray | None = None
     try:
         while True:
             grab_result = zed.grab()
@@ -1369,10 +1402,24 @@ def main() -> int:
                             stream_socket.sendto(status_payload, stream_target)
                         except OSError:
                             pass
+                # Never display a torn UVC image and never use its BODY_38
+                # result.  Holding the last complete frame gives the operator
+                # a short, explicit freeze instead of visually mixing several
+                # points in time.  The downstream watchdog receives the status
+                # packet above and safely holds its last feasible command.
+                display_frame = (
+                    last_good_frame.copy()
+                    if last_good_frame is not None
+                    else frame.copy()
+                )
+                if display_frame.ndim == 3 and display_frame.shape[2] == 4:
+                    display_frame = cv2.cvtColor(
+                        display_frame, cv2.COLOR_BGRA2BGR
+                    )
                 cv2.putText(
-                    frame,
+                    display_frame,
                     (
-                        "USB KARE BOZUK - komut gonderilmiyor "
+                        "USB KARE ATLANDI - son saglam goruntu tutuluyor "
                         f"({corrupt_consecutive}/{args.max_corrupt_consecutive})"
                     ),
                     (20, 45),
@@ -1383,7 +1430,10 @@ def main() -> int:
                     cv2.LINE_AA,
                 )
                 if not args.headless:
-                    cv2.imshow("ZED 2i BODY_38 - G1 Skeleton Extractor", frame)
+                    cv2.imshow(
+                        "ZED 2i BODY_38 - G1 Skeleton Extractor",
+                        display_frame,
+                    )
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord("q"), 27):
                         break
@@ -1431,11 +1481,23 @@ def main() -> int:
 
             if frame.ndim == 3 and frame.shape[2] == 4:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            last_good_frame = frame.copy()
 
             body_list = list(bodies.body_list) if bodies.is_new else []
-            selected, locked_id = select_body(
-                body_list, locked_id, args.confidence
+            selection = operator_selector.update(
+                body_list,
+                valid=lambda body: (
+                    body.tracking_state == sl.OBJECT_TRACKING_STATE.OK
+                    and float(body.confidence) >= args.confidence
+                ),
+                distance=lambda body: (
+                    float(np.linalg.norm(position))
+                    if (position := finite_vector(body.position, 3)) is not None
+                    else math.inf
+                ),
             )
+            selected = selection.body
+            locked_id = selection.body_id
 
             for body in body_list:
                 draw_skeleton(
@@ -1459,6 +1521,24 @@ def main() -> int:
                     args.confidence,
                     timestamp_s,
                 )
+                arm_result = arm_optimizer.update(
+                    timestamp_s=timestamp_s,
+                    points_3d=filtered,
+                    points_2d=np.asarray(selected.keypoint_2d, dtype=np.float64),
+                    confidence=confidence,
+                    index=IDX,
+                    threshold=args.confidence,
+                    calibration=calibration_manager.profile,
+                )
+                filtered = arm_result.points
+                calibration = calibration_manager.update(
+                    operator_id=int(selected.id),
+                    timestamp_s=timestamp_s,
+                    points=filtered,
+                    confidence=confidence,
+                    index=IDX,
+                    confidence_threshold=args.confidence,
+                )
                 record = build_record(
                     selected,
                     filtered,
@@ -1466,6 +1546,71 @@ def main() -> int:
                     frame_index,
                     args.confidence,
                     read_imu(zed, sensors),
+                )
+                try:
+                    pelvis_local, pelvis_origin, pelvis_rotation = to_pelvis_local(
+                        filtered, IDX
+                    )
+                except ValueError:
+                    pelvis_local = np.full_like(filtered, np.nan)
+                    pelvis_origin = np.full(3, np.nan)
+                    pelvis_rotation = np.full((3, 3), np.nan)
+                relative_neutral_yaw_rad = None
+                if calibration.profile is not None and np.isfinite(pelvis_rotation).all():
+                    neutral_rotation = np.asarray(
+                        calibration.profile.get("neutral_pelvis_rotation_matrix"),
+                        dtype=np.float64,
+                    )
+                    if neutral_rotation.shape == (3, 3) and np.isfinite(neutral_rotation).all():
+                        relative_rotation = neutral_rotation.T @ pelvis_rotation
+                        relative_neutral_yaw_rad = float(
+                            np.arctan2(relative_rotation[1, 0], relative_rotation[0, 0])
+                        )
+                record["operator_selection"] = {
+                    "state": selection.state.value,
+                    "locked_body_id": operator_selector.locked_id,
+                    "locked_unique_object_id": operator_selector.locked_unique_id,
+                    "missing_frames": selection.missing_frames,
+                    "acquisition_frames": selection.acquisition_frames,
+                    "reason": selection.reason,
+                    "automatic_handover": False,
+                }
+                record["calibration"] = {
+                    "state": calibration.state,
+                    "progress": calibration.progress,
+                    "elapsed_s": calibration.elapsed_s,
+                    "sample_count": calibration.sample_count,
+                    "reason": calibration.reason,
+                    "profile": calibration.profile,
+                }
+                record["pelvis_frame"] = {
+                    "coordinate_system": "PELVIS_LOCAL_X_FWD_Y_LEFT_Z_UP",
+                    "origin_camera_m": pelvis_origin,
+                    "rotation_camera_from_pelvis": pelvis_rotation,
+                    "relative_neutral_yaw_rad": relative_neutral_yaw_rad,
+                    "keypoints_m": pelvis_local,
+                }
+                record["occlusion_analysis"] = {
+                    "torso_polygon_names": [
+                        "LEFT_SHOULDER", "RIGHT_SHOULDER",
+                        "RIGHT_HIP", "LEFT_HIP",
+                    ],
+                    "arm_torso_overlap": arm_result.overlap,
+                    "arm_chain_recovered": arm_result.recovered,
+                    "reasons": list(arm_result.reasons),
+                }
+                record["perception_metrics"] = perception_metrics.update(
+                    timestamp_s=timestamp_s,
+                    # Left/right ordering is anatomical, not camera-image
+                    # ordering. A person facing the camera naturally has the
+                    # opposite camera-Y shoulder order. Evaluate swaps in the
+                    # pelvis-local frame where +Y always means operator-left.
+                    points=pelvis_local,
+                    confidence=confidence,
+                    index=IDX,
+                    threshold=args.confidence,
+                    overlap=arm_result.overlap,
+                    calibration_profile=calibration.profile,
                 )
                 current_record = record
                 distance_m = number_or_none(record.get("euclidean_distance_m"))
@@ -1513,6 +1658,7 @@ def main() -> int:
                     capture_to_send_ms = max(
                         0.0, (time.time_ns() - timestamp_ns) / 1e6
                     )
+                    processing_complete_ns = time.time_ns()
                     packet = sanitize_for_json(
                         {
                             "schema": "zed_body38_live/v1",
@@ -1546,6 +1692,11 @@ def main() -> int:
                             "root_relative_keypoints_m": record[
                                 "root_relative_keypoints_m"
                             ],
+                            "pelvis_frame": record["pelvis_frame"],
+                            "operator_selection": record["operator_selection"],
+                            "calibration": record["calibration"],
+                            "occlusion_analysis": record["occlusion_analysis"],
+                            "perception_metrics": record["perception_metrics"],
                             "shoulder_width_normalized_keypoints": record[
                                 "shoulder_width_normalized_keypoints"
                             ],
@@ -1565,9 +1716,18 @@ def main() -> int:
                                 "euclidean_distance_m"
                             ],
                             "imu": record["imu"],
+                            "latency_trace_ns": {
+                                "t0_capture_ns": timestamp_ns,
+                                "t1_zed_processing_done_ns": processing_complete_ns,
+                                "t2_windows_udp_send_ns": processing_complete_ns,
+                            },
                             "transport_metrics": {
                                 "source_interval_ms": source_interval_ms,
                                 "capture_to_send_ms": capture_to_send_ms,
+                                "zed_processing_ms": max(
+                                    0.0,
+                                    (processing_complete_ns - timestamp_ns) / 1e6,
+                                ),
                                 "raw_filtered_rms_m": raw_filtered_rms_m,
                                 "stream_limit_hz": args.stream_max_hz,
                             },
@@ -1604,13 +1764,32 @@ def main() -> int:
                 features = record["g1_reference_features"]
                 upper_ready = features["upper_body_reference_ready"]
                 whole_ready = features["whole_body_reference_ready"]
+                acquisition_text = (
+                    f" {selection.acquisition_frames}/{operator_selector.acquire_frames}"
+                    if selection.state == OperatorState.ACQUIRING
+                    else ""
+                )
+                control_text = (
+                    "AKTIF"
+                    if selection.state == OperatorState.LOCKED
+                    and calibration.state == "READY"
+                    else "BEKLEME"
+                )
                 ready_text = (
-                    f"ID {locked_id} | üst gövde={'HAZIR' if upper_ready else 'EKSİK'} "
+                    f"ID {locked_id} {selection.state.value}{acquisition_text} "
+                    f"CAL={calibration.state} {calibration.progress * 100:.0f}% | "
+                    f"kontrol={control_text} | "
+                    f"üst gövde={'HAZIR' if upper_ready else 'EKSİK'} "
                     f"| tüm vücut={'HAZIR' if whole_ready else 'EKSİK'}"
                 )
                 if recording and record_file is not None:
                     record_file.write(
-                        json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                        json.dumps(
+                            sanitize_for_json(record),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        )
+                        + "\n"
                     )
                     recorded_frames += 1
             elif stream_socket is not None and stream_targets:
@@ -1623,8 +1802,18 @@ def main() -> int:
                         "schema": "zed_body38_live/status/v1",
                         "sequence": frame_index,
                         "timestamp_ns": timestamp_ns,
-                        "status": "NO_BODY",
+                        "status": (
+                            "OPERATOR_LOST"
+                            if selection.state == OperatorState.LOST
+                            else "NO_BODY"
+                        ),
                         "detected_body_count": len(body_list),
+                        "operator_selection": {
+                            "state": selection.state.value,
+                            "locked_body_id": operator_selector.locked_id,
+                            "automatic_handover": False,
+                            "reason": selection.reason,
+                        },
                     }
                     status_payload = json.dumps(
                         status_packet,
@@ -1688,8 +1877,8 @@ def main() -> int:
                     args.distance_min,
                     args.distance_max,
                     (
-                        f"{stream_target[0]}:{stream_target[1]}"
-                        if stream_target
+                        f"{stream_targets[0][0]}:{stream_targets[0][1]}"
+                        if stream_targets
                         else None
                     ),
                     streamed_frames,
@@ -1702,6 +1891,9 @@ def main() -> int:
             if key in (ord("q"), 27):
                 break
             if key == ord("r"):
+                operator_selector.reset()
+                calibration_manager.reset()
+                arm_optimizer.reset()
                 locked_id = None
                 low_pass.reset()
                 print("Kişi kilidi sıfırlandı.")

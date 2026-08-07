@@ -37,6 +37,9 @@ def set_landmark(
     index = landmark_index(frame, name)
     frame["keypoints_3d_filtered_m"][index] = filtered
     frame["keypoints_3d_raw_m"][index] = raw
+    pelvis_points = (frame.get("pelvis_frame") or {}).get("keypoints_m")
+    if pelvis_points is not None and index < len(pelvis_points):
+        pelvis_points[index] = filtered
     frame["keypoint_confidence"][index] = confidence
 
 

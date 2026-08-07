@@ -186,7 +186,20 @@ class KinematicAnalyzer:
 
     def analyze(self, packet: dict) -> dict:
         points = _point_lookup(packet, "keypoints_3d_m")
-        raw_points = _point_lookup(packet, "keypoints_3d_raw_m")
+        # ``SkeletonConditioner`` works in the pelvis-local coordinate frame.
+        # Camera-space ``keypoints_3d_raw_m`` are about 4 m away and comparing
+        # them directly produced a fictitious ~4 m filter error.  The pelvis
+        # frame stores the unconditioned input in the same coordinates.
+        pelvis_frame = packet.get("pelvis_frame") or {}
+        raw_values = pelvis_frame.get("keypoints_m")
+        raw_packet = (
+            {**packet, "analysis_raw_keypoints_m": raw_values}
+            if isinstance(raw_values, list)
+            else packet
+        )
+        raw_points = _point_lookup(raw_packet, "analysis_raw_keypoints_m")
+        if not raw_points:
+            raw_points = _point_lookup(packet, "keypoints_3d_m")
         names = [str(name) for name in packet.get("keypoint_names", [])]
         confidence_values = packet.get("keypoint_confidence", [])
         confidence = {
@@ -246,9 +259,17 @@ class KinematicAnalyzer:
         angle_velocity = {}
         for name, angle in geometric_angles.items():
             previous = self.previous_angles.get(name)
+            delta = None
+            if angle is not None and previous is not None:
+                delta = angle - previous
+                # Signed anatomical angles wrap at +/-180 degrees. Use the
+                # shortest circular delta so crossing that display boundary
+                # does not create a fictitious multi-thousand deg/s spike.
+                if "interior" not in name:
+                    delta = (delta + 180.0) % 360.0 - 180.0
             angle_velocity[name] = (
-                (angle - previous) / dt_s
-                if angle is not None and previous is not None and dt_s is not None
+                delta / dt_s
+                if delta is not None and dt_s is not None
                 else None
             )
 

@@ -10,7 +10,7 @@ param(
     [ValidateSet("fixed_double_support", "balance_policy")]
     [string]$StanceMode = "fixed_double_support",
     [ValidateRange(1.0, 60.0)]
-    [double]$InputFps = 15.0,
+    [double]$InputFps = 60.0,
     [ValidateRange(0.5, 20.0)]
     [double]$UpperCutoffHz = 10.0,
     [ValidateRange(0.1, 10.0)]
@@ -146,6 +146,8 @@ $bridgeArguments = @(
     "--listen-port", "15050",
     "--output-host", $windowsHost,
     "--output-port", "15051",
+    "--telemetry-host", $windowsHost,
+    "--telemetry-port", "15053",
     "--mode", $Mode,
     "--input-fps", "$InputFps",
     "--cutoff-hz", "$UpperCutoffHz",
@@ -204,6 +206,8 @@ try {
         "--mode", $Mode,
         "--listen-host", "0.0.0.0",
         "--listen-port", "15051",
+        "--telemetry-host", "127.0.0.1",
+        "--telemetry-port", "15053",
         "--urdf", $nativeUrdf,
         "--usd", $nativeUsd,
         "--balance-policy", $nativePolicy,

@@ -7,6 +7,11 @@ içeren araştırma projesidir.
 Yeni bilgisayar kurulumu için önce [INSTALL_TR.md](INSTALL_TR.md) belgesini
 izleyin. Otomatik kurulum ve doğrulama betikleri `install/` klasöründedir.
 
+Operatör kilidi, 4 saniyelik antropometrik kalibrasyon, pelvis-yerel
+koordinatlar, G1 `raw_q/safe_q`, Rerun telemetrisi ve safety durumları için
+[güvenli canlı taklit hattı](docs/ZED_G1_SAFE_MIMIC_PIPELINE_TR.md) belgesini
+izleyin.
+
 > Fiziksel robot güvenliği: Bu depo doğrudan gerçek G1 motor kontrolü için
 > hazır değildir. Varsayılan akış simülasyon ve üst gövde takibidir. Sim2real
 > öncesinde tork/hız limitleri, watchdog, self-collision, düşme engelleme,
@@ -167,3 +172,19 @@ Program `RIGHT_HANDED_Z_UP_X_FWD` ve metre kullanır:
 - `Z`: yukarı
 
 Bu seçim ROS REP-103 ve sonraki G1 retargeting işlemleriyle uyumludur.
+
+## Geliştirici doğrulaması
+
+Kamera veya retargeting ayarlarını değiştirmeden önce ve sonra aynı kayıtla tam
+regresyon paketini çalıştırın:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\validate_motion_pipeline.ps1 `
+  -Recording .\recordings\zed_body38_YYYYMMDD_HHMMSS.jsonl `
+  -TargetFps 30
+```
+
+Komut; ZED şema testi, operatör/kalibrasyon/oklüzyon/safety testleri, Rerun kayıt
+testi, capture benchmark'ı ve WSL içindeki gerçek GMR replay testini çalıştırır.
+JSON/CSV sonuçları `reports` klasörüne yazılır. Ayrıntılı yöntem ve test kapıları
+`docs/DEVELOPER_VALIDATION_PLAN_TR.md` içindedir.

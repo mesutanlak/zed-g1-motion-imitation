@@ -17,9 +17,11 @@ import numpy as np
 
 from body38_to_gmr import Body38ToGMR, GMR_BODY38_MAP
 from g1_dof_projection import (
+    AnatomicalElbowRegularizer,
     G1_23DOF_ORDER,
     constrain_gmr_to_23dof,
     named_joint_values,
+    official_g1_23dof_xml,
     project_29_to_23,
 )
 
@@ -31,6 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmr-root", type=Path, required=True)
     parser.add_argument("--human-height", type=float, default=1.80)
     parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--elbow-posture-cost", type=float, default=0.05)
+    parser.add_argument(
+        "--mode", choices=("upper_body", "whole_body"), default="upper_body"
+    )
     return parser.parse_args()
 
 
@@ -59,6 +65,32 @@ def qpos_for_joints(
     return np.asarray(values, dtype=np.float64)
 
 
+def solve_with_regularizer(retargeter, human_data: dict, regularizer) -> np.ndarray:
+    """Match the live bridge's deterministic Mink solve."""
+    import mink
+
+    retargeter.update_targets(human_data, offset_to_ground=True)
+    regularizer.update(human_data)
+    tasks = [*retargeter.tasks1, regularizer.task]
+    current_error = retargeter.error1()
+    dt = retargeter.configuration.model.opt.timestep
+    for _ in range(retargeter.max_iter + 1):
+        velocity = mink.solve_ik(
+            retargeter.configuration,
+            tasks,
+            dt,
+            retargeter.solver,
+            retargeter.damping,
+            retargeter.ik_limits,
+        )
+        retargeter.configuration.integrate_inplace(velocity, dt)
+        next_error = retargeter.error1()
+        if current_error - next_error <= 0.001:
+            break
+        current_error = next_error
+    return retargeter.configuration.data.qpos.copy()
+
+
 def main() -> int:
     args = parse_args()
     gmr_root = args.gmr_root.resolve()
@@ -67,13 +99,16 @@ def main() -> int:
 
     from general_motion_retargeting import params
 
-    config_path = Path(__file__).with_name("zed_body38_to_g1.json").resolve()
-    params.IK_CONFIG_DICT.setdefault("zed_body38", {})["unitree_g1"] = config_path
+    # Keep offline conversion bit-for-bit aligned with the live 23-DOF bridge.
+    config_path = Path(__file__).with_name("zed_body38_to_g1_23dof.json").resolve()
+    robot_key = "unitree_g1_23dof"
+    params.ROBOT_XML_DICT[robot_key] = official_g1_23dof_xml()
+    params.IK_CONFIG_DICT.setdefault("zed_body38", {})[robot_key] = config_path
     from general_motion_retargeting.motion_retarget import GeneralMotionRetargeting
 
     retargeter = GeneralMotionRetargeting(
         src_human="zed_body38",
-        tgt_robot="unitree_g1",
+        tgt_robot=robot_key,
         actual_human_height=args.human_height,
         solver="daqp",
         damping=0.5,
@@ -81,14 +116,22 @@ def main() -> int:
         use_velocity_limit=False,
     )
     retargeter.max_iter = 20
-    constrain_gmr_to_23dof(retargeter)
+    constrain_gmr_to_23dof(
+        retargeter,
+        lock_waist_yaw=args.mode == "upper_body",
+        restrict_backward_arms=args.mode == "upper_body",
+    )
     joint_order_29 = actuated_joint_names(retargeter.model)
-    adapter = Body38ToGMR()
+    elbow_regularizer = AnatomicalElbowRegularizer(
+        retargeter, cost=max(0.0, args.elbow_posture_cost)
+    )
+    adapter = Body38ToGMR(fixed_stance=args.mode == "upper_body")
     required = set(GMR_BODY38_MAP)
 
     timestamps: list[int] = []
     q29_rows: list[np.ndarray] = []
     q23_rows: list[np.ndarray] = []
+    full_qpos_rows: list[np.ndarray] = []
     source_indices: list[int] = []
     skipped = 0
 
@@ -99,6 +142,8 @@ def main() -> int:
                 continue
             if record.get("schema") == "zed_body38_3d_analysis/frame/v1":
                 record = record.get("source", {})
+            elif record.get("schema") == "zed_body38_rerun_analysis/frame/v1":
+                record = record.get("source_packet", {})
             if record.get("schema") not in (
                 "zed_body38_g1_reference/v1",
                 "zed_body38_live/v1",
@@ -109,12 +154,15 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            qpos = retargeter.retarget(adapted.human_data, offset_to_ground=True)
+            qpos = solve_with_regularizer(
+                retargeter, adapted.human_data, elbow_regularizer
+            )
             q29 = qpos_for_joints(retargeter.model, qpos, joint_order_29)
             q23 = project_29_to_23(named_joint_values(joint_order_29, q29))
             timestamps.append(int(record["timestamp_ns"]))
             q29_rows.append(q29)
             q23_rows.append(q23)
+            full_qpos_rows.append(np.asarray(qpos, dtype=np.float64).copy())
             source_indices.append(
                 int(record.get("frame_index", record.get("sequence", line_no)))
             )
@@ -132,6 +180,7 @@ def main() -> int:
         source_frame_index=np.asarray(source_indices, dtype=np.int64),
         joint_names_29=np.asarray(joint_order_29),
         q_g1_29dof=np.stack(q29_rows),
+        q_g1_full_qpos=np.stack(full_qpos_rows),
         joint_names_23=np.asarray(G1_23DOF_ORDER),
         q_g1_23dof=np.stack(q23_rows),
     )

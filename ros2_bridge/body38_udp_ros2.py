@@ -14,7 +14,7 @@ import time
 
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-from geometry_msgs.msg import Point, Pose, PoseArray
+from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import (
@@ -23,7 +23,7 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -92,6 +92,15 @@ def valid_point(value) -> bool:
     )
 
 
+def finite_quaternion(value) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 4
+        and all(isinstance(component, (int, float)) and math.isfinite(component)
+                for component in value)
+    )
+
+
 def rgba(red: float, green: float, blue: float, alpha: float = 1.0) -> ColorRGBA:
     return ColorRGBA(r=red, g=green, b=blue, a=alpha)
 
@@ -122,6 +131,15 @@ class Body38RosBridge(Node):
         )
         self.pose_publisher = self.create_publisher(
             PoseArray, "/zed/body38/keypoints", sensor_qos
+        )
+        self.orientation_publisher = self.create_publisher(
+            PoseArray, "/zed/body38/local_orientations", sensor_qos
+        )
+        self.root_publisher = self.create_publisher(
+            PoseStamped, "/zed/body38/root_pose", sensor_qos
+        )
+        self.confidence_publisher = self.create_publisher(
+            Float32MultiArray, "/zed/body38/keypoint_confidence", sensor_qos
         )
         self.diagnostic_publisher = self.create_publisher(
             DiagnosticArray, "/zed/body38/diagnostics", reliable
@@ -294,6 +312,29 @@ class Body38RosBridge(Node):
 
         self.marker_publisher.publish(marker_array)
         self.pose_publisher.publish(pose_array)
+        local_q = packet.get("local_orientation_per_joint_xyzw", [])
+        orientation_array = PoseArray()
+        orientation_array.header = pose_array.header
+        for index, name in enumerate(names):
+            if name not in points or index >= len(local_q) or not finite_quaternion(local_q[index]):
+                continue
+            pose = Pose()
+            pose.position = Point(x=points[name][0], y=points[name][1], z=points[name][2])
+            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = map(float, local_q[index])
+            orientation_array.poses.append(pose)
+        self.orientation_publisher.publish(orientation_array)
+        root = PoseStamped()
+        root.header = pose_array.header
+        root_position = packet.get("root_position_m", points.get("PELVIS", (0.0, 0.0, 0.0)))
+        if valid_point(root_position):
+            root.pose.position = Point(x=float(root_position[0]), y=float(root_position[1]), z=float(root_position[2]))
+        root_q = packet.get("global_root_orientation_xyzw", [0.0, 0.0, 0.0, 1.0])
+        if finite_quaternion(root_q):
+            root.pose.orientation.x, root.pose.orientation.y, root.pose.orientation.z, root.pose.orientation.w = map(float, root_q)
+        else:
+            root.pose.orientation.w = 1.0
+        self.root_publisher.publish(root)
+        self.confidence_publisher.publish(Float32MultiArray(data=[float(confidence.get(name, 0.0)) for name in names]))
         self.publish_diagnostics(
             level=DiagnosticStatus.OK,
             message="LIVE",

@@ -15,11 +15,17 @@ import time
 import traceback
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 # Load CPU ONNX Runtime before Isaac Sim modifies the process DLL search path.
 # Loading it after SimulationApp on Windows can bind against Isaac's CUDA DLLs.
 import numpy as np
 import onnxruntime as ort
 import yaml
+
+from motion_pipeline.metrics import PacketMetrics, latency_breakdown_ms
 
 from isaaclab.app import AppLauncher
 
@@ -27,6 +33,8 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser()
 parser.add_argument("--listen-host", default="0.0.0.0")
 parser.add_argument("--listen-port", type=int, default=15051)
+parser.add_argument("--telemetry-host", default="127.0.0.1")
+parser.add_argument("--telemetry-port", type=int, default=15053)
 parser.add_argument(
     "--urdf",
     type=Path,
@@ -470,6 +478,31 @@ def main() -> None:
         raise RuntimeError("Expected one left and one right ankle-roll body")
     left_foot_id = left_foot_ids[0]
     right_foot_id = right_foot_ids[0]
+    # GMR and Isaac both use the exact official Unitree 23-DOF body names.
+    tracking_body_aliases = {
+        "pelvis": "pelvis",
+        "torso_link": "torso_link",
+        "left_shoulder_pitch_link": "left_shoulder_pitch_link",
+        "left_elbow_link": "left_elbow_link",
+        "left_wrist_roll_rubber_hand": "left_wrist_roll_rubber_hand",
+        "right_shoulder_pitch_link": "right_shoulder_pitch_link",
+        "right_elbow_link": "right_elbow_link",
+        "right_wrist_roll_rubber_hand": "right_wrist_roll_rubber_hand",
+    }
+    tracking_body_ids: dict[str, int] = {}
+    for reference_name, asset_name in tracking_body_aliases.items():
+        try:
+            body_ids, _ = robot.find_bodies(asset_name)
+        except ValueError:
+            # Metrics must never abort the simulator if an upstream USD asset
+            # changes an optional task-frame name.
+            print(
+                f"Warning: telemetry body '{asset_name}' not present; "
+                f"'{reference_name}' tracking metric disabled."
+            )
+            continue
+        if len(body_ids) == 1:
+            tracking_body_ids[reference_name] = body_ids[0]
     policy_interval = max(1, int(round(balance.step_dt / sim.get_physics_dt())))
     gmr_desired = desired.clone()
     gmr_valid_targets = 0
@@ -478,6 +511,8 @@ def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args_cli.listen_host, args_cli.listen_port))
     sock.setblocking(False)
+    telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    telemetry_destination = (args_cli.telemetry_host, args_cli.telemetry_port)
     last_packet = time.monotonic()
     last_print = last_packet
     packet_count = 0
@@ -491,6 +526,11 @@ def main() -> None:
     max_command_delta = 0.0
     max_actual_delta = 0.0
     command_delta = 0.0
+    pending_telemetry: dict | None = None
+    isaac_receive_timestamp_ns = 0
+    system_packet_metrics = PacketMetrics()
+    stale_watchdog_active = False
+    last_control_session_id: int | None = None
 
     print(
         f"Isaac G1-23DOF mode={args_cli.mode} "
@@ -506,7 +546,47 @@ def main() -> None:
                 except BlockingIOError:
                     break
             now = time.monotonic()
+            if newest and newest.get("schema") == "zed_gmr_g1_23dof_live/status/v1":
+                if newest.get("status") == "CONTROL_SESSION_RESET":
+                    # R in the ZED UI invalidates the complete causal chain,
+                    # not only person selection.  Drop the old arm command
+                    # and enter the existing smooth stale-return path.
+                    gmr_desired[0, upper_indices] = nominal[0, upper_indices]
+                    gmr_valid_targets = 0
+                    pending_telemetry = None
+                    last_control_session_id = int(
+                        newest.get("control_session_id", 0)
+                    )
+                    last_packet = (
+                        now
+                        - args_cli.stale_after
+                        - max(0.0, args_cli.stale_return_delay)
+                        - sim.get_physics_dt()
+                    )
+                    print(
+                        "CONTROL_SESSION_RESET "
+                        f"id={last_control_session_id} "
+                        f"reason={newest.get('reason', 'unknown')}",
+                        flush=True,
+                    )
             if newest and newest.get("schema") == "zed_gmr_g1_23dof_live/v1":
+                isaac_receive_timestamp_ns = time.time_ns()
+                packet_session_id = int(newest.get("control_session_id", 0))
+                if (
+                    last_control_session_id is not None
+                    and packet_session_id != last_control_session_id
+                ):
+                    # This also covers the rare case where UDP queue draining
+                    # superseded the explicit reset-status packet.
+                    gmr_desired[0, upper_indices] = nominal[0, upper_indices]
+                    gmr_valid_targets = 0
+                    pending_telemetry = None
+                    print(
+                        "CONTROL_SESSION_CHANGED "
+                        f"old={last_control_session_id} new={packet_session_id}",
+                        flush=True,
+                    )
+                last_control_session_id = packet_session_id
                 packet_names = newest["joint_names"]
                 packet_values = newest["joint_position_rad"]
                 packet_array = np.asarray(packet_values, dtype=np.float64)
@@ -534,6 +614,7 @@ def main() -> None:
                         )
                     )
                     max_command_delta = max(max_command_delta, command_delta)
+                    pending_telemetry = newest
 
             if (
                 step_count % policy_interval == 0
@@ -554,6 +635,11 @@ def main() -> None:
 
             stale_age = now - last_packet
             input_fresh = stale_age <= args_cli.stale_after
+            if input_fresh:
+                stale_watchdog_active = False
+            elif not stale_watchdog_active:
+                system_packet_metrics.watchdog_triggers += 1
+                stale_watchdog_active = True
             upper_state = "LIVE" if input_fresh else "HOLD"
             if input_fresh and gmr_valid_targets >= args_cli.min_upper_targets:
                 for name in UPPER_BODY:
@@ -613,9 +699,107 @@ def main() -> None:
                 apply_fall_arrest(robot, pelvis_body_id)
             robot.set_joint_position_target(desired)
             robot.write_data_to_sim()
+            command_applied_timestamp_ns = time.time_ns()
             sim.step()
             robot.update(sim.get_physics_dt())
+            control_observed_timestamp_ns = time.time_ns()
             step_count += 1
+            if pending_telemetry is not None:
+                actual = robot.data.joint_pos[0]
+                joint_rmse = float(
+                    torch.sqrt(torch.mean((actual - desired[0]) ** 2))
+                )
+                root_quat = robot.data.root_quat_w[0].detach().cpu().numpy()
+                w, x, y, z = [float(item) for item in root_quat]
+                roll = float(np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
+                pitch = float(np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0)))
+                applied_torque = getattr(robot.data, "applied_torque", None)
+                torque_rms = None
+                energy = None
+                if applied_torque is not None:
+                    torque = applied_torque[0]
+                    torque_rms = float(torch.sqrt(torch.mean(torque ** 2)))
+                    energy = float(
+                        torch.sum(torch.abs(torque * robot.data.joint_vel[0]))
+                        * sim.get_physics_dt()
+                    )
+                left_velocity = robot.data.body_lin_vel_w[0, left_foot_id, :2]
+                right_velocity = robot.data.body_lin_vel_w[0, right_foot_id, :2]
+                foot_slip = float(
+                    0.5 * (torch.linalg.norm(left_velocity) + torch.linalg.norm(right_velocity))
+                )
+                body_mpjpe = None
+                actual_positions_m = {}
+                safe_reference = (
+                    (pending_telemetry.get("g1_skeleton") or {}).get(
+                        "safe_positions_m", {}
+                    )
+                )
+                if "pelvis" in safe_reference and "pelvis" in tracking_body_ids:
+                    reference_pelvis = np.asarray(safe_reference["pelvis"], dtype=float)
+                    actual_pelvis = robot.data.body_pos_w[
+                        0, tracking_body_ids["pelvis"]
+                    ].detach().cpu().numpy()
+                    body_errors = []
+                    for body_name, body_id in tracking_body_ids.items():
+                        if body_name not in safe_reference:
+                            continue
+                        reference_local = (
+                            np.asarray(safe_reference[body_name], dtype=float)
+                            - reference_pelvis
+                        )
+                        actual_local = (
+                            robot.data.body_pos_w[0, body_id].detach().cpu().numpy()
+                            - actual_pelvis
+                        )
+                        actual_positions_m[body_name] = (
+                            reference_pelvis + actual_local
+                        ).astype(float).tolist()
+                        body_errors.append(float(np.linalg.norm(actual_local - reference_local)))
+                    if body_errors:
+                        body_mpjpe = float(np.mean(body_errors))
+                telemetry = dict(pending_telemetry)
+                trace = dict(telemetry.get("latency_trace_ns") or {})
+                trace.update(
+                    {
+                        "t6_isaac_receive_ns": isaac_receive_timestamp_ns,
+                        "t7_isaac_command_applied_ns": command_applied_timestamp_ns,
+                        "t8_control_observed_ns": control_observed_timestamp_ns,
+                    }
+                )
+                telemetry["latency_trace_ns"] = trace
+                latency = latency_breakdown_ms(trace)
+                system_packet_metrics.observe(
+                    int(telemetry.get("sequence", packet_count)),
+                    isaac_receive_timestamp_ns,
+                    latency.get("total_control_ms"),
+                )
+                telemetry["isaac_metrics"] = {
+                    "joint_tracking_rmse_rad": joint_rmse,
+                    "body_tracking_mpjpe_m": body_mpjpe,
+                    "base_roll_rad": roll,
+                    "base_pitch_rad": pitch,
+                    "foot_slip_m_s": foot_slip,
+                    "torque_rms_nm": torque_rms,
+                    "step_energy_j": energy,
+                    "fall_count": resets,
+                    "fall_rate_per_step": resets / max(1, step_count),
+                    "episode_success": bool(resets == 0 and pelvis_z >= args_cli.reset_height),
+                    "joint_names": list(robot.joint_names),
+                    "actual_joint_position_rad": actual.detach().cpu().numpy().astype(float).tolist(),
+                    "desired_joint_position_rad": desired[0].detach().cpu().numpy().astype(float).tolist(),
+                }
+                telemetry.setdefault("g1_skeleton", {})[
+                    "actual_positions_m"
+                ] = actual_positions_m
+                telemetry["latency_breakdown_ms"] = latency
+                telemetry["system_metrics"] = system_packet_metrics.snapshot()
+                telemetry["schema"] = "zed_gmr_g1_23dof_isaac_telemetry/v1"
+                telemetry_sock.sendto(
+                    json.dumps(telemetry, separators=(",", ":")).encode(),
+                    telemetry_destination,
+                )
+                pending_telemetry = None
             if now - last_print >= 1.0:
                 left_foot_z = float(robot.data.body_pos_w[0, left_foot_id, 2])
                 right_foot_z = float(robot.data.body_pos_w[0, right_foot_id, 2])
@@ -656,6 +840,7 @@ def main() -> None:
                 break
     finally:
         sock.close()
+        telemetry_sock.close()
 
 
 if __name__ == "__main__":
