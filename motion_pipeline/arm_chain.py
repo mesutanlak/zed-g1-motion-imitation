@@ -64,6 +64,31 @@ def _unit(vector: np.ndarray) -> np.ndarray | None:
     return np.asarray(vector, dtype=np.float64) / norm
 
 
+def _stable_perpendicular(axis: np.ndarray, preferred: np.ndarray) -> np.ndarray:
+    """Return a deterministic unit vector perpendicular to a valid axis.
+
+    Frontal arm poses make the observed elbow pole parallel to the
+    shoulder-wrist axis.  A two-bone IK branch still exists in that case; the
+    missing quantity is only its plane.  Use the trusted pole first and then
+    the least-aligned world basis, rather than asserting and terminating the
+    capture process.
+    """
+    projected = preferred - axis * float(np.dot(preferred, axis))
+    result = _unit(projected)
+    if result is not None:
+        return result
+    bases = np.eye(3, dtype=np.float64)
+    for basis_index in np.argsort(np.abs(axis)):
+        projected = bases[basis_index] - axis * float(np.dot(bases[basis_index], axis))
+        result = _unit(projected)
+        if result is not None:
+            return result
+    # Reached only for corrupt/non-finite input.  A finite fallback prevents a
+    # camera frame from killing the process; the feasibility layer will hold
+    # the last safe robot command until a valid frame arrives.
+    return np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+
 def _two_bone_candidates(
     shoulder: np.ndarray,
     target: np.ndarray,
@@ -72,6 +97,19 @@ def _two_bone_candidates(
     fore: float,
 ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray], float]:
     """Return the two exact elbow branches for one shoulder candidate."""
+    shoulder = np.asarray(shoulder, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    pole = np.asarray(pole, dtype=np.float64)
+    if not np.isfinite(shoulder).all():
+        shoulder = np.zeros(3, dtype=np.float64)
+    if not np.isfinite(target).all():
+        target = shoulder + np.array([max(float(upper), 0.10), 0.0, 0.0])
+    if not np.isfinite(pole).all():
+        pole = np.array([0.0, 1.0, -0.25], dtype=np.float64)
+    upper_value = float(upper)
+    fore_value = float(fore)
+    upper = upper_value if np.isfinite(upper_value) and upper_value > 1e-4 else 0.25
+    fore = fore_value if np.isfinite(fore_value) and fore_value > 1e-4 else 0.25
     direction = target - shoulder
     distance = float(np.linalg.norm(direction))
     if distance < 1e-6:
@@ -82,13 +120,7 @@ def _two_bone_candidates(
     wrist = shoulder + axis * reach
     along = (upper * upper - fore * fore + reach * reach) / (2.0 * reach)
     height = float(np.sqrt(max(upper * upper - along * along, 0.0)))
-    bend = pole - axis * float(np.dot(pole, axis))
-    bend_unit = _unit(bend)
-    if bend_unit is None:
-        bend_unit = _unit(np.cross(axis, np.array([0.0, 0.0, 1.0])))
-    if bend_unit is None:
-        bend_unit = _unit(np.cross(axis, np.array([0.0, 1.0, 0.0])))
-    assert bend_unit is not None
+    bend_unit = _stable_perpendicular(axis, pole)
     center = shoulder + axis * along
     return (
         (center + bend_unit * height, wrist.copy()),
@@ -248,6 +280,8 @@ class ArmChainOptimizer:
     ) -> tuple[np.ndarray, np.ndarray, float, int]:
         """Score four AKC candidates without altering reliable BODY_38 frames."""
         torso_delta = torso_center - state.torso_center
+        if not np.isfinite(torso_delta).all():
+            torso_delta = np.zeros(3, dtype=np.float64)
         propagated_shoulder = state.shoulder + torso_delta
         shoulder_candidates = (shoulder, propagated_shoulder)
 
@@ -260,6 +294,20 @@ class ArmChainOptimizer:
             target = shoulder + measured_direction * previous_reach
         else:
             target = wrist
+        if not np.isfinite(target).all():
+            target = state.wrist + torso_delta
+        upper_value = float(upper)
+        fore_value = float(fore)
+        upper = (
+            upper_value
+            if np.isfinite(upper_value) and upper_value > 0.05
+            else float(np.linalg.norm(state.elbow - state.shoulder))
+        )
+        fore = (
+            fore_value
+            if np.isfinite(fore_value) and fore_value > 0.05
+            else float(np.linalg.norm(state.wrist - state.elbow))
+        )
 
         observed_pole = elbow - shoulder
         axis = _unit(target - shoulder)
@@ -501,22 +549,36 @@ class ArmChainOptimizer:
                 fore = float((calibration or {}).get(f"{side.lower()}_forearm_m", np.linalg.norm(previous.wrist - previous.elbow)))
                 if np.isfinite(shoulder).all() and upper > 0.05 and fore > 0.05:
                     if self.recovery_mode == "akc":
-                        output[elbow_i], output[wrist_i], score, selected_branch = self._recover_akc(
-                            side=side,
-                            timestamp_s=timestamp_s,
-                            shoulder=shoulder,
-                            elbow=recovery_elbow,
-                            wrist=target,
-                            torso_center=torso_center,
-                            confidence_elbow=float(conf[elbow_i]),
-                            confidence_wrist=float(conf[wrist_i]),
-                            overlap=overlap_active or front_depth_ambiguity,
-                            upper=upper,
-                            fore=fore,
-                            state=previous,
-                        )
-                        reasons.append(f"{side.lower()}_akc_4candidate_recovery")
-                        branch_sign[side.lower()] = selected_branch
+                        try:
+                            output[elbow_i], output[wrist_i], score, selected_branch = self._recover_akc(
+                                side=side,
+                                timestamp_s=timestamp_s,
+                                shoulder=shoulder,
+                                elbow=recovery_elbow,
+                                wrist=target,
+                                torso_center=torso_center,
+                                confidence_elbow=float(conf[elbow_i]),
+                                confidence_wrist=float(conf[wrist_i]),
+                                overlap=overlap_active or front_depth_ambiguity,
+                                upper=upper,
+                                fore=fore,
+                                state=previous,
+                            )
+                            reasons.append(f"{side.lower()}_akc_4candidate_recovery")
+                            branch_sign[side.lower()] = selected_branch
+                        except (ArithmeticError, AssertionError, ValueError, np.linalg.LinAlgError):
+                            # A malformed camera frame must never terminate
+                            # the BODY_38 process.  Keep the complete trusted
+                            # arm chain translated with the pelvis and wait
+                            # for a coherent observation.
+                            torso_delta = torso_center - previous.torso_center
+                            if not np.isfinite(torso_delta).all():
+                                torso_delta = np.zeros(3, dtype=np.float64)
+                            output[elbow_i] = previous.elbow + torso_delta
+                            output[wrist_i] = previous.wrist + torso_delta
+                            score = 0.0
+                            branch_sign[side.lower()] = previous.branch_sign
+                            reasons.append(f"{side.lower()}_akc_numerical_hold")
                     else:
                         positive, negative, _ = _two_bone_candidates(
                             shoulder, target, prev_elbow, upper, fore

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from motion_pipeline.arm_chain import ArmChainOptimizer
+from motion_pipeline.arm_chain import ArmChainOptimizer, _two_bone_candidates
 from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
 from motion_pipeline.metrics import PerceptionMetrics
 from motion_pipeline.operator_selector import OperatorSelector, OperatorState
@@ -204,6 +204,22 @@ def test_arm_chain_recovers_front_depth_foreshortening() -> None:
     assert result.recovered["left"]
     assert "left_front_depth_ambiguity" in result.reasons
     assert np.isfinite(result.candidate_confidence["left"])
+
+
+def test_two_bone_recovery_never_asserts_on_corrupt_front_frame() -> None:
+    """A bad frontal frame must yield finite candidates, never kill ZED."""
+    positive, negative, height = _two_bone_candidates(
+        np.array([0.0, 0.0, 0.0]),
+        np.array([np.nan, 0.0, 0.0]),
+        np.array([np.nan, np.nan, np.nan]),
+        0.29,
+        0.25,
+    )
+    assert np.isfinite(positive[0]).all()
+    assert np.isfinite(positive[1]).all()
+    assert np.isfinite(negative[0]).all()
+    assert np.isfinite(negative[1]).all()
+    assert np.isfinite(height)
 
 
 def test_swap_metric_uses_anatomical_pelvis_frame() -> None:
