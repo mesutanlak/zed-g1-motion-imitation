@@ -178,6 +178,58 @@ class ArmChainOptimizer:
             or abs(observed[1] / expected_fore - 1.0) > self.bone_tolerance
         )
 
+    @staticmethod
+    def _front_depth_ambiguity(
+        points_3d: np.ndarray,
+        points_2d: np.ndarray,
+        index: Mapping[str, int],
+        side: str,
+    ) -> bool:
+        """Detect a foreshortened arm aimed along the camera depth axis.
+
+        In this pose BODY_38 can report high confidence although shoulder and
+        elbow nearly coincide in the image and the inferred elbow plane is
+        under-constrained.  This is only a recovery gate: normal lateral arm
+        poses continue to pass through unchanged.
+        """
+        required = (
+            "LEFT_SHOULDER", "RIGHT_SHOULDER",
+            f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST",
+        )
+        if any(name not in index for name in required):
+            return False
+        shoulder_i = index[f"{side}_SHOULDER"]
+        elbow_i = index[f"{side}_ELBOW"]
+        wrist_i = index[f"{side}_WRIST"]
+        chain_3d = points_3d[[shoulder_i, elbow_i, wrist_i]]
+        chain_2d = points_2d[[shoulder_i, elbow_i, wrist_i]]
+        if not np.isfinite(chain_3d).all() or not np.isfinite(chain_2d).all():
+            return True
+        shoulder_span_px = float(
+            np.linalg.norm(
+                points_2d[index["LEFT_SHOULDER"]]
+                - points_2d[index["RIGHT_SHOULDER"]]
+            )
+        )
+        if shoulder_span_px < 20.0:
+            return False
+        upper_3d = chain_3d[1] - chain_3d[0]
+        fore_3d = chain_3d[2] - chain_3d[1]
+        upper_length = float(np.linalg.norm(upper_3d))
+        fore_length = float(np.linalg.norm(fore_3d))
+        if upper_length < 1e-5 or fore_length < 1e-5:
+            return True
+        upper_px = float(np.linalg.norm(chain_2d[1] - chain_2d[0]))
+        fore_px = float(np.linalg.norm(chain_2d[2] - chain_2d[1]))
+        upper_depth_ratio = abs(float(upper_3d[0])) / upper_length
+        fore_depth_ratio = abs(float(fore_3d[0])) / fore_length
+        projected_collapse = (
+            upper_px < 0.24 * shoulder_span_px
+            or fore_px < 0.20 * shoulder_span_px
+        )
+        depth_dominant = max(upper_depth_ratio, fore_depth_ratio) > 0.72
+        return bool(projected_collapse and depth_dominant)
+
     def _recover_akc(
         self,
         *,
@@ -385,14 +437,20 @@ class ArmChainOptimizer:
                 output[wrist_i],
                 calibration,
             )
+            front_depth_ambiguity = self._front_depth_ambiguity(
+                output, pixel, index, side
+            )
             low_quality = (
                 overlap_active
                 or conf[elbow_i] < threshold
                 or conf[wrist_i] < threshold
                 or bone_violation
+                or front_depth_ambiguity
             )
             if bone_violation:
                 reasons.append(f"{side.lower()}_bone_length_violation")
+            if front_depth_ambiguity:
+                reasons.append(f"{side.lower()}_front_depth_ambiguity")
             previous = self.previous.get(side)
             did_recover = False
             score = 1.0
@@ -405,6 +463,14 @@ class ArmChainOptimizer:
                 shoulder = output[shoulder_i]
                 measured_wrist = output[wrist_i]
                 target = measured_wrist if np.isfinite(measured_wrist).all() and conf[wrist_i] >= threshold else prev_wrist
+                # A partially occluded BODY_38 chain can contain a missing
+                # elbow while the wrist remains usable.  Never feed that NaN
+                # into the candidate cost: continue from the last trusted
+                # elbow, translated with the torso, until a valid measurement
+                # is available again.
+                recovery_elbow = output[elbow_i]
+                if not np.isfinite(recovery_elbow).all():
+                    recovery_elbow = prev_elbow + (torso_center - previous.torso_center)
                 if overlap_active and np.isfinite(target).all() and np.isfinite(shoulder).all():
                     # During torso overlap ZED often keeps a high confidence
                     # score although wrist depth is ambiguous.  Preserve the
@@ -439,12 +505,12 @@ class ArmChainOptimizer:
                             side=side,
                             timestamp_s=timestamp_s,
                             shoulder=shoulder,
-                            elbow=output[elbow_i],
+                            elbow=recovery_elbow,
                             wrist=target,
                             torso_center=torso_center,
                             confidence_elbow=float(conf[elbow_i]),
                             confidence_wrist=float(conf[wrist_i]),
-                            overlap=overlap_active,
+                            overlap=overlap_active or front_depth_ambiguity,
                             upper=upper,
                             fore=fore,
                             state=previous,
@@ -463,6 +529,7 @@ class ArmChainOptimizer:
                     did_recover = True
                     reasons.append(f"{side.lower()}_arm_chain_occlusion_recovery")
             recovered[side.lower()] = did_recover
+            score = float(score) if np.isfinite(score) else 0.0
             candidate_confidence[side.lower()] = score
             candidate_cost[side.lower()] = float(-np.log(max(score, 1e-9)))
             if (not low_quality or did_recover) and np.isfinite(output[[shoulder_i, elbow_i, wrist_i]]).all():

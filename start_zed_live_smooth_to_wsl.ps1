@@ -6,6 +6,10 @@ param(
     [switch]$NoRosStream,
     [switch]$AllowSvoWithIsaac,
     [string]$AnalysisHost = "127.0.0.1",
+    [ValidateRange(1, 60)]
+    [int]$AnalysisHz = 15,
+    [ValidateRange(1, 60)]
+    [int]$RosHz = 30,
     [ValidateSet("akc", "legacy")]
     [string]$ArmRecoveryMode = "akc",
     [ValidateSet("shared_gpu_safe", "balanced_30", "realtime_60", "quality")]
@@ -95,10 +99,10 @@ else {
 }
 Write-Host "GMR UDP hedefi: ${wslAddress}:15050"
 if (-not $NoAnalysisStream) {
-    Write-Host "3B analiz UDP hedefi: ${AnalysisHost}:15052 (Windows native panel)"
+    Write-Host "3B analiz UDP hedefi: ${AnalysisHost}:15052 (${AnalysisHz} Hz, kontrol yolundan ayrik)"
 }
 if (-not $NoRosStream) {
-    Write-Host "BODY_38 ROS 2 UDP hedefi: ${wslAddress}:15054"
+    Write-Host "BODY_38 ROS 2 UDP hedefi: ${wslAddress}:15054 (${RosHz} Hz)"
 }
 if (-not $Record -and -not $RecordSvo2) {
     Write-Host "Baslangicta kayit kapali (en dusuk gecikme)."
@@ -128,6 +132,8 @@ $zedArguments = @(
     "--stream-host", $wslAddress,
     "--stream-port", "15050",
     "--stream-max-hz", $streamHz,
+    "--monitor-max-hz", "$AnalysisHz",
+    "--ros-max-hz", "$RosHz",
     # Isolated USB/UVC corruption is dropped while the last valid frame and
     # safe robot command are held. Restart only after roughly one full second.
     "--max-corrupt-consecutive", "30"

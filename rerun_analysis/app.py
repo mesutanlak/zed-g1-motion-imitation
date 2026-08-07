@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmr-listen-host", default="0.0.0.0")
     parser.add_argument("--gmr-listen-port", type=int, default=15053)
     parser.add_argument(
+        "--live-max-hz", type=float, default=15.0,
+        help="Canli BODY_38 analiz/render hizi; kontrol akisini etkilemez",
+    )
+    parser.add_argument(
+        "--gmr-log-max-hz", type=float, default=15.0,
+        help="Her GMR telemetri semasi icin azami kayit hizi",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "rerun_recordings"
     )
     parser.add_argument("--svo2", type=Path, default=None, help="İlişkili özgün ZED SVO2")
@@ -202,6 +210,7 @@ class RerunSkeletonApp:
         self.analyzer = KinematicAnalyzer()
         self._logged_joint_names: set[str] = set()
         self.latest_gmr: dict[str, Any] = {}
+        self._last_gmr_log_s: dict[str, float] = {}
         self.stop_event = threading.Event()
         self.status_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=3)
         source = (
@@ -394,6 +403,15 @@ class RerunSkeletonApp:
                     "zed_gmr_g1_23dof_live/v1",
                     "zed_gmr_g1_23dof_isaac_telemetry/v1",
                 }:
+                    schema = str(packet.get("schema"))
+                    now = time.monotonic()
+                    last = self._last_gmr_log_s.get(schema, -np.inf)
+                    if (
+                        self.args.gmr_log_max_hz > 0
+                        and now - last < 0.98 / self.args.gmr_log_max_hz
+                    ):
+                        continue
+                    self._last_gmr_log_s[schema] = now
                     self._log_gmr_packet(packet)
         finally:
             sock.close()
@@ -593,11 +611,21 @@ class RerunSkeletonApp:
             else self._receive_udp()
         )
         previous_timestamp = None
+        last_live_process_s = -np.inf
         started = time.monotonic()
         try:
             for source in packets:
                 if self.stop_event.is_set():
                     break
+                if not self.args.input and not self.args.demo:
+                    now = time.monotonic()
+                    if (
+                        self.args.live_max_hz > 0
+                        and now - last_live_process_s
+                        < 0.98 / self.args.live_max_hz
+                    ):
+                        continue
+                    last_live_process_s = now
                 while self.config.snapshot().paused and not self.stop_event.is_set():
                     time.sleep(0.03)
                 config = self.config.snapshot()

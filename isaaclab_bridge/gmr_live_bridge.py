@@ -998,7 +998,13 @@ def main() -> int:
                 if not overlap.get(side):
                     arm_quality_blend[side] = 1.0
                     continue
-                confidence = float(akc_confidence.get(side, 0.0))
+                confidence_value = akc_confidence.get(side, 0.0)
+                confidence = (
+                    float(confidence_value)
+                    if isinstance(confidence_value, (int, float))
+                    and np.isfinite(confidence_value)
+                    else 0.0
+                )
                 # A coherent AKC reconstruction is almost fully trusted.  A
                 # low-confidence overlap is softened only on the affected arm.
                 arm_quality_blend[side] = (

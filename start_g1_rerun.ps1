@@ -6,6 +6,10 @@ param(
     [string]$ListenHost = "0.0.0.0",
     [int]$ListenPort = 15052,
     [int]$GmrListenPort = 15053,
+    [ValidateRange(1, 60)]
+    [int]$LiveMaxHz = 15,
+    [ValidateRange(1, 60)]
+    [int]$GmrLogMaxHz = 15,
     [switch]$NoViewer,
     [switch]$Headless,
     [switch]$NoRealtime
@@ -40,6 +44,8 @@ $arguments = @(
     "--listen-host", $ListenHost,
     "--listen-port", "$ListenPort",
     "--gmr-listen-port", "$GmrListenPort",
+    "--live-max-hz", "$LiveMaxHz",
+    "--gmr-log-max-hz", "$GmrLogMaxHz",
     "--output-dir", $output
 )
 
@@ -72,6 +78,7 @@ if ($NoRealtime) {
 
 Write-Host "Bagimsiz Rerun BODY_38 analiz sistemi baslatiliyor..."
 Write-Host "Mod: $Mode | BODY_38 UDP: ${ListenHost}:$ListenPort | GMR: $GmrListenPort"
+Write-Host "Analiz hizi: ${LiveMaxHz} Hz | GMR telemetri kaydi: ${GmrLogMaxHz} Hz/sema"
 Write-Host "Mevcut analysis_panel dosyalari kullanilmiyor/degistirilmiyor."
 
 Push-Location $project

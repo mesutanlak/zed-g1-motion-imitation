@@ -22,6 +22,11 @@ import sys
 import time
 from typing import Any
 
+try:
+    import msvcrt
+except ImportError:  # Windows console hotkeys are optional on other platforms.
+    msvcrt = None
+
 from motion_pipeline.arm_chain import ArmChainOptimizer
 from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
 from motion_pipeline.metrics import PerceptionMetrics
@@ -996,6 +1001,18 @@ def parse_args() -> argparse.Namespace:
         help="Maksimum UDP yayın hızı (varsayılan: 30 Hz)",
     )
     parser.add_argument(
+        "--monitor-max-hz",
+        type=float,
+        default=15.0,
+        help="Rerun/analiz UDP kopyasi azami hizi (varsayilan: 15 Hz)",
+    )
+    parser.add_argument(
+        "--ros-max-hz",
+        type=float,
+        default=30.0,
+        help="ROS 2 UDP kopyasi azami hizi (varsayilan: 30 Hz)",
+    )
+    parser.add_argument(
         "--camera-timeout",
         type=float,
         default=3.0,
@@ -1113,6 +1130,8 @@ def main() -> int:
         not 1 <= args.stream_port <= 65535
         or not 1 <= args.monitor_port <= 65535
         or args.stream_max_hz <= 0
+        or args.monitor_max_hz <= 0
+        or args.ros_max_hz <= 0
     ):
         print(
             "--stream-port, --monitor-port veya --stream-max-hz geçersiz.",
@@ -1238,26 +1257,38 @@ def main() -> int:
     measured_fps = 0.0
     diagnostics_visible = True
     stream_targets = []
+    stream_target_rates: dict[tuple[str, int], float] = {}
+    stream_target_roles: dict[tuple[str, int], str] = {}
     if args.stream_host:
-        stream_targets.append((args.stream_host, args.stream_port))
+        target = (args.stream_host, args.stream_port)
+        stream_targets.append(target)
+        stream_target_rates[target] = args.stream_max_hz
+        stream_target_roles[target] = "GMR"
     if args.monitor_host:
-        stream_targets.append((args.monitor_host, args.monitor_port))
+        target = (args.monitor_host, args.monitor_port)
+        stream_targets.append(target)
+        stream_target_rates[target] = args.monitor_max_hz
+        stream_target_roles[target] = "analysis"
     if args.ros_host:
-        stream_targets.append((args.ros_host, args.ros_port))
+        target = (args.ros_host, args.ros_port)
+        stream_targets.append(target)
+        stream_target_rates[target] = args.ros_max_hz
+        stream_target_roles[target] = "ROS2"
     stream_targets = list(dict.fromkeys(stream_targets))
     stream_socket = (
         socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if stream_targets
         else None
     )
-    last_stream_time = 0.0
+    last_target_stream_time = {target: 0.0 for target in stream_targets}
     last_stream_source_timestamp_ns: int | None = None
     # When the requested UDP rate equals the camera rate, an elapsed-time
     # comparison at exactly 1/fps can reject every other frame because normal
     # scheduler jitter makes a 66.67 ms interval microscopically shorter than
     # the threshold. In that common live mode every captured BODY_38 frame
     # should be published; lower requested rates still use the limiter.
-    stream_every_capture = args.stream_max_hz >= 0.95 * float(args.fps)
+    maximum_stream_hz = max(stream_target_rates.values(), default=0.0)
+    stream_every_capture = maximum_stream_hz >= 0.95 * float(args.fps)
     streamed_frames = 0
     target_roles = ("GMR", "analiz", "ROS2")
     for target_index, stream_target in enumerate(stream_targets):
@@ -1341,6 +1372,35 @@ def main() -> int:
                 else f"Kayıt KAPALI ({recorded_frames} BODY_38 karesi)"
             )
         )
+
+    def poll_control_key() -> int:
+        """Read controls from the OpenCV window or the PowerShell console."""
+        key = -1
+        if not args.headless:
+            key = cv2.waitKey(1) & 0xFF
+        if msvcrt is not None and msvcrt.kbhit():
+            character = msvcrt.getwch().lower()
+            if character:
+                key = ord(character[0])
+        return key
+
+    def handle_control_key(key: int) -> bool:
+        nonlocal locked_id, diagnostics_visible
+        if key in (ord("q"), 27):
+            return True
+        if key == ord("r"):
+            operator_selector.reset()
+            calibration_manager.reset()
+            arm_optimizer.reset()
+            locked_id = None
+            low_pass.reset()
+            print("R: Kisi kilidi, kalibrasyon ve kol hafizasi sifirlandi.")
+        elif key == ord("s"):
+            set_recording(not recording)
+        elif key == ord("d"):
+            diagnostics_visible = not diagnostics_visible
+            print(f"D: Tani paneli {'ACIK' if diagnostics_visible else 'KAPALI'}.")
+        return False
 
     if recording:
         set_recording(True)
@@ -1445,9 +1505,8 @@ def main() -> int:
                         "ZED 2i BODY_38 - G1 Skeleton Extractor",
                         display_frame,
                     )
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), 27):
-                        break
+                if handle_control_key(poll_control_key()):
+                    break
                 if corrupt_consecutive >= args.max_corrupt_consecutive:
                     camera_failed = True
                     print(
@@ -1643,8 +1702,11 @@ def main() -> int:
                     and stream_targets
                     and (
                         stream_every_capture
-                        or now - last_stream_time
-                        >= 0.98 / args.stream_max_hz
+                        or any(
+                            now - last_target_stream_time[target]
+                            >= 0.98 / stream_target_rates[target]
+                            for target in stream_targets
+                        )
                     )
                 ):
                     raw_valid = np.isfinite(raw).all(axis=1)
@@ -1757,9 +1819,20 @@ def main() -> int:
                     if len(payload) <= 60000:
                         sent = False
                         for stream_target in stream_targets:
+                            target_hz = stream_target_rates[stream_target]
+                            if (
+                                now - last_target_stream_time[stream_target]
+                                < 0.98 / target_hz
+                                and not (
+                                    stream_target_roles.get(stream_target) == "GMR"
+                                    and stream_every_capture
+                                )
+                            ):
+                                continue
                             try:
                                 stream_socket.sendto(payload, stream_target)
                                 sent = True
+                                last_target_stream_time[stream_target] = now
                             except OSError as exc:
                                 print(
                                     "UDP yayın uyarısı "
@@ -1769,7 +1842,6 @@ def main() -> int:
                                 )
                         if sent:
                             streamed_frames += 1
-                            last_stream_time = now
                             last_stream_source_timestamp_ns = timestamp_ns
                     else:
                         print(
@@ -1811,7 +1883,11 @@ def main() -> int:
                 now = time.monotonic()
                 if (
                     stream_every_capture
-                    or now - last_stream_time >= 0.98 / args.stream_max_hz
+                    or any(
+                        now - last_target_stream_time[target]
+                        >= 0.98 / stream_target_rates[target]
+                        for target in stream_targets
+                    )
                 ):
                     status_packet = {
                         "schema": "zed_body38_live/status/v1",
@@ -1836,9 +1912,20 @@ def main() -> int:
                     ).encode("utf-8")
                     sent = False
                     for stream_target in stream_targets:
+                        target_hz = stream_target_rates[stream_target]
+                        if (
+                            now - last_target_stream_time[stream_target]
+                            < 0.98 / target_hz
+                            and not (
+                                stream_target_roles.get(stream_target) == "GMR"
+                                and stream_every_capture
+                            )
+                        ):
+                            continue
                         try:
                             stream_socket.sendto(status_payload, stream_target)
                             sent = True
+                            last_target_stream_time[stream_target] = now
                         except OSError as exc:
                             print(
                                 "UDP yayın uyarısı "
@@ -1848,7 +1935,6 @@ def main() -> int:
                             )
                     if sent:
                         streamed_frames += 1
-                        last_stream_time = now
 
             fps_frames += 1
             fps_elapsed = time.monotonic() - fps_started_at
@@ -1899,24 +1985,11 @@ def main() -> int:
                     streamed_frames,
                 )
 
-            key = -1
             if not args.headless:
                 cv2.imshow("ZED 2i BODY_38 - G1 Skeleton Extractor", frame)
-                key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            key = poll_control_key()
+            if handle_control_key(key):
                 break
-            if key == ord("r"):
-                operator_selector.reset()
-                calibration_manager.reset()
-                arm_optimizer.reset()
-                locked_id = None
-                low_pass.reset()
-                print("Kişi kilidi sıfırlandı.")
-            if key == ord("s"):
-                set_recording(not recording)
-            if key == ord("d"):
-                diagnostics_visible = not diagnostics_visible
-
             frame_index += 1
             if args.seconds > 0 and time.monotonic() - started_at >= args.seconds:
                 break

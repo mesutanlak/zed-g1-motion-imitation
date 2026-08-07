@@ -176,6 +176,36 @@ def test_arm_chain_recovers_depth_overlap_missed_by_2d_and_holds_branch() -> Non
     assert np.allclose(released.points, points)
 
 
+def test_arm_chain_recovers_front_depth_foreshortening() -> None:
+    """A depth-directed upper arm must reuse the stable elbow pole."""
+    optimizer = ArmChainOptimizer(hold_s=0.3)
+    points = neutral_points()
+    pixel = np.asarray([
+        [320, 350], [320, 240], [250, 220], [390, 220],
+        [180, 270], [460, 270], [120, 320], [520, 320],
+        [270, 400], [370, 400], [270, 520], [370, 520],
+        [270, 650], [370, 650], [260, 660], [380, 660],
+    ], dtype=float)
+    confidence = np.full(len(NAMES), 100.0)
+    optimizer.update(
+        timestamp_s=0.0, points_3d=points, points_2d=pixel,
+        confidence=confidence, index=INDEX, threshold=40.0, calibration=None,
+    )
+    frontal = points.copy()
+    frontal[INDEX["LEFT_ELBOW"]] = [3.27, 0.21, 1.44]
+    frontal[INDEX["LEFT_WRIST"]] = [3.45, 0.18, 1.34]
+    frontal_pixel = pixel.copy()
+    frontal_pixel[INDEX["LEFT_ELBOW"]] = [255, 224]
+    frontal_pixel[INDEX["LEFT_WRIST"]] = [267, 252]
+    result = optimizer.update(
+        timestamp_s=0.05, points_3d=frontal, points_2d=frontal_pixel,
+        confidence=confidence, index=INDEX, threshold=40.0, calibration=None,
+    )
+    assert result.recovered["left"]
+    assert "left_front_depth_ambiguity" in result.reasons
+    assert np.isfinite(result.candidate_confidence["left"])
+
+
 def test_swap_metric_uses_anatomical_pelvis_frame() -> None:
     metrics = PerceptionMetrics()
     confidence = np.full(len(NAMES), 100.0)

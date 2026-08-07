@@ -6,6 +6,10 @@ param(
     [string]$ListenHost = "0.0.0.0",
     [int]$ListenPort = 15052,
     [int]$GmrListenPort = 15053,
+    [ValidateRange(1, 60)]
+    [int]$LiveMaxHz = 15,
+    [ValidateRange(1, 60)]
+    [int]$GmrLogMaxHz = 15,
     [switch]$NoViewer,
     [switch]$Headless,
     [switch]$NoRealtime
@@ -20,6 +24,8 @@ $launcher = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "start_g
     -ListenHost $ListenHost `
     -ListenPort $ListenPort `
     -GmrListenPort $GmrListenPort `
+    -LiveMaxHz $LiveMaxHz `
+    -GmrLogMaxHz $GmrLogMaxHz `
     -NoViewer:$NoViewer `
     -Headless:$Headless `
     -NoRealtime:$NoRealtime
