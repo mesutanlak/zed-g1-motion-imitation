@@ -9,6 +9,15 @@ from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
 from motion_pipeline.metrics import PerceptionMetrics
 from motion_pipeline.operator_selector import OperatorSelector, OperatorState
 from motion_pipeline.safety import G1FeasibilityFilter, G1_23_LIMITS_RAD
+from motion_pipeline.collision_geometry import (
+    CollisionDistanceReport,
+    segment_segment_distance,
+    upper_body_capsule_report,
+)
+from motion_pipeline.mirror_rescue import (
+    KinematicEvaluation,
+    MirrorContinuationRescue,
+)
 
 
 NAMES = [
@@ -253,3 +262,110 @@ def test_persistent_orange_returns_smoothly_to_neutral() -> None:
     assert np.max(np.abs(np.diff(values))) < 0.10
     assert values[-1] < held_value * 0.25
     assert "orange_safe_return" in reasons
+
+
+def test_capsule_segment_distance_is_continuous() -> None:
+    crossing = segment_segment_distance(
+        [0, 0, 0], [1, 0, 0], [0.5, -1, 0], [0.5, 1, 0]
+    )
+    separated = segment_segment_distance(
+        [0, 0, 0], [1, 0, 0], [0, 0.2, 0], [1, 0.2, 0]
+    )
+    assert crossing == 0.0
+    assert abs(separated - 0.2) < 1.0e-9
+
+
+def test_forearm_across_torso_is_measured_as_soft_contact() -> None:
+    positions = {
+        "pelvis": [0.0, 0.0, 0.0],
+        "torso_link": [0.0, 0.0, 0.4],
+        "left_shoulder_pitch_link": [0.0, 0.25, 0.4],
+        "left_elbow_link": [0.0, 0.30, 0.30],
+        "left_wrist_roll_rubber_hand": [0.0, 0.0, 0.25],
+        "right_shoulder_pitch_link": [0.0, -0.25, 0.4],
+        "right_elbow_link": [0.0, -0.50, 0.30],
+        "right_wrist_roll_rubber_hand": [0.0, -0.70, 0.20],
+    }
+    report = upper_body_capsule_report(positions)
+    assert "left_fore__torso" in report.soft_risk_pairs
+    assert "left_hand__torso" in report.soft_risk_pairs
+    assert report.minimum_margin_m > 0.0
+    assert not report.risk_pairs
+
+
+def test_collision_governor_degrades_only_unsafe_arm() -> None:
+    filter_ = G1FeasibilityFilter(yellow_blend=0.82)
+    command = np.zeros(23)
+    command[13:18] = [0.4, 0.2, 0.1, 0.8, 0.0]
+    command[18:23] = [0.4, -0.2, -0.1, 0.8, 0.0]
+    result = filter_.update(
+        command,
+        1.0 / 60.0,
+        self_collision=True,
+        collision_margin_m=-0.03,
+        arm_collision_margins={"left": -0.03, "right": 0.10},
+    )
+    assert result.arm_blend["left"] == 0.0
+    assert result.arm_blend["right"] == 1.0
+    assert result.level.name == "ORANGE"
+    assert np.linalg.norm(result.safe_q[18:23]) > np.linalg.norm(result.safe_q[13:18])
+
+
+def test_occlusion_quality_governor_degrades_only_affected_arm() -> None:
+    filter_ = G1FeasibilityFilter(yellow_blend=0.55)
+    command = np.zeros(23)
+    # Keep the step below the velocity/acceleration governor so this test
+    # isolates the arm-local quality blend.
+    command[13:18] = [0.02, 0.0, 0.0, 0.04, 0.0]
+    command[18:23] = [0.02, 0.0, 0.0, 0.04, 0.0]
+    result = filter_.update(
+        command,
+        0.10,
+        arm_reasons={"left": ["left_wrist_occluded"]},
+        arm_quality_blend={"left": 0.72, "right": 1.0},
+    )
+    assert result.level.name == "YELLOW"
+    assert result.blend == 1.0
+    assert result.arm_blend == {"left": 0.72, "right": 1.0}
+    assert np.linalg.norm(result.safe_q[18:23]) > np.linalg.norm(result.safe_q[13:18])
+
+
+def test_continuation_rescue_reduces_arm_task_error() -> None:
+    rescue = MirrorContinuationRescue(
+        residual_trigger_m=0.01,
+        collision_trigger_m=-1.0,
+        workers=2,
+    )
+    limits = np.tile(np.array([-2.0, 2.0]), (23, 1))
+    limits[[16, 21], 0] = 0.0
+
+    def evaluate(q: np.ndarray) -> KinematicEvaluation:
+        positions = {
+            "left_elbow_link": [q[13], 0.0, 0.0],
+            "left_wrist_roll_rubber_hand": [q[13] + q[16], 0.0, 0.0],
+            "right_elbow_link": [0.0, 0.0, 0.0],
+            "right_wrist_roll_rubber_hand": [0.0, 0.0, 0.0],
+        }
+        collision = CollisionDistanceReport(
+            1.0, {}, {"left": 1.0, "right": 1.0}, ()
+        )
+        return KinematicEvaluation(positions, collision)
+
+    nominal = np.zeros(23)
+    nominal[13] = 0.10
+    result = rescue.update(
+        nominal_q=nominal,
+        previous_safe_q=np.zeros(23),
+        targets={
+            "left_elbow": [0.40, 0.0, 0.0],
+            "left_wrist": [0.80, 0.0, 0.0],
+            "right_elbow": [0.0, 0.0, 0.0],
+            "right_wrist": [0.0, 0.0, 0.0],
+        },
+        evaluate=evaluate,
+        joint_limits=limits,
+        residual_m=0.20,
+    )
+    assert result.triggered and result.applied
+    assert result.selected_task_error_m < result.nominal_task_error_m
+    assert np.allclose(result.q[:13], nominal[:13])

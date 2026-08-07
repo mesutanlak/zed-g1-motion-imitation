@@ -5,6 +5,10 @@ param(
     [switch]$Headless,
     [switch]$AllowUnvalidatedDriver,
     [switch]$NoFallArrest,
+    [switch]$NoMirrorRescue,
+    [switch]$NoAnatomicalBranchContinuity,
+    [ValidateRange(1, 16)]
+    [int]$MirrorWorkers = 4,
     [ValidateSet("shared_gpu_safe", "gpu_max")]
     [string]$RuntimeProfile = "shared_gpu_safe",
     [ValidateSet("fixed_double_support", "balance_policy")]
@@ -133,6 +137,8 @@ Write-Host "  Alt beden: $StanceMode"
 Write-Host "  Canli takip: ${InputFps} Hz, adaptive cutoff=${UpperMinCutoffHz}-${UpperCutoffHz} Hz, beta=$UpperVelocityBeta, blend=$MimicBlend"
 Write-Host "  Insan boyu / GMR olcegi: ${HumanHeightM} m"
 Write-Host "  Ust govde PD olcegi: Kp=$UpperStiffnessScale Kd=$UpperDampingScale"
+Write-Host "  AKC/GMR dirsek dal surekliligi: $(-not $NoAnatomicalBranchContinuity)"
+Write-Host "  Olay tetiklemeli continuation rescue: $(-not $NoMirrorRescue) (workers=$MirrorWorkers)"
 if (-not $Headless) {
     Write-Host "  GUI notu: ilk D3D12/RTX onbellek acilisi 3-4 dakika surebilir."
     Write-Host "  'G1 scene initialization complete' gorulene kadar pencereyi kapatmayin."
@@ -156,6 +162,18 @@ $bridgeArguments = @(
     "--human-height", "$HumanHeightM",
     "--no-gmr-velocity-limit"
 )
+if ($NoMirrorRescue) {
+    $bridgeArguments += "--no-mirror-rescue"
+}
+else {
+    $bridgeArguments += @("--mirror-rescue", "--mirror-workers", "$MirrorWorkers")
+}
+if ($NoAnatomicalBranchContinuity) {
+    $bridgeArguments += "--no-anatomical-branch-continuity"
+}
+else {
+    $bridgeArguments += "--anatomical-branch-continuity"
+}
 
 $bridgeProcess = $null
 try {

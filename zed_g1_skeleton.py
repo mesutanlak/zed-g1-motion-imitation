@@ -897,6 +897,15 @@ def parse_args() -> argparse.Namespace:
         help="ZED kayıp insan tahmin süresi, saniye (varsayılan: 0.10)",
     )
     parser.add_argument(
+        "--arm-recovery-mode",
+        choices=("legacy", "akc"),
+        default="akc",
+        help=(
+            "BODY_38 sonrasinda yalnizca ortulu/dusuk guvenli kol zincirlerinde "
+            "kullanilan kurtarma yontemi. 'legacy' guvenli geri donus secenegidir."
+        ),
+    )
+    parser.add_argument(
         "--skeleton-smoothing",
         type=float,
         default=0.15,
@@ -1206,7 +1215,9 @@ def main() -> int:
     operator_selector = OperatorSelector(args.operator_acquire_frames)
     calibration_manager = CalibrationManager(args.calibration_seconds)
     arm_optimizer = ArmChainOptimizer(
-        hold_s=max(0.15, args.prediction_timeout + 0.10)
+        hold_s=max(0.15, args.prediction_timeout + 0.10),
+        recovery_mode=args.arm_recovery_mode,
+        branch_confirm_frames=4,
     )
     perception_metrics = PerceptionMetrics()
 
@@ -1597,6 +1608,10 @@ def main() -> int:
                     ],
                     "arm_torso_overlap": arm_result.overlap,
                     "arm_chain_recovered": arm_result.recovered,
+                    "arm_recovery_mode": args.arm_recovery_mode,
+                    "akc_candidate_confidence": arm_result.candidate_confidence,
+                    "akc_candidate_cost": arm_result.candidate_cost,
+                    "elbow_branch_sign": arm_result.branch_sign,
                     "reasons": list(arm_result.reasons),
                 }
                 record["perception_metrics"] = perception_metrics.update(

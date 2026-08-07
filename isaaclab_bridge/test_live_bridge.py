@@ -59,25 +59,39 @@ def main() -> int:
     parser.add_argument("recording", type=Path)
     parser.add_argument("--start-sequence", type=int, default=0)
     parser.add_argument("--packet-count", type=int, default=20)
+    parser.add_argument("--disable-mirror", action="store_true")
     args = parser.parse_args()
     recording = args.recording
     bridge = Path(__file__).with_name("gmr_live_bridge.py")
-    process = subprocess.Popen(
-        [
+    # Regression replay must coexist with a real Isaac/ZED session.  Fixed
+    # 15050/15051 ports could silently feed the live bridge or block forever.
+    def available_udp_port() -> int:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+        finally:
+            probe.close()
+
+    input_port = available_udp_port()
+    output_port = available_udp_port()
+    bridge_command = [
             sys.executable,
             str(bridge),
             "--listen-host",
             "127.0.0.1",
             "--listen-port",
-            "15050",
+            str(input_port),
             "--output-host",
             "127.0.0.1",
             "--output-port",
-            "15051",
+            str(output_port),
         ]
-    )
+    if args.disable_mirror:
+        bridge_command.append("--no-mirror-rescue")
+    process = subprocess.Popen(bridge_command)
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    receiver.bind(("127.0.0.1", 15051))
+    receiver.bind(("127.0.0.1", output_port))
     receiver.settimeout(10.0)
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     received_packets = 0
@@ -85,6 +99,12 @@ def main() -> int:
     absolute_residuals: list[float] = []
     safety_levels: Counter[str] = Counter()
     safety_reasons: Counter[str] = Counter()
+    mirror_solve_ms: list[float] = []
+    mirror_triggered = 0
+    mirror_applied = 0
+    mirror_reasons: Counter[str] = Counter()
+    mirror_task_improvement_m: list[float] = []
+    mirror_margin_improvement_m: list[float] = []
     try:
         time.sleep(2.0)
         with recording.open("r", encoding="utf-8") as stream:
@@ -100,7 +120,7 @@ def main() -> int:
                     continue
                 sender.sendto(
                     json.dumps(to_live(record), separators=(",", ":")).encode(),
-                    ("127.0.0.1", 15050),
+                    ("127.0.0.1", input_port),
                 )
                 try:
                     packet = json.loads(receiver.recv(65535))
@@ -142,6 +162,25 @@ def main() -> int:
                     safety = packet.get("safety") or {}
                     safety_levels[str(safety.get("level", "UNKNOWN"))] += 1
                     safety_reasons.update(str(reason) for reason in safety.get("reasons", []))
+                    if bool(metrics.get("mirror_rescue_triggered")):
+                        mirror_triggered += 1
+                        mirror_reasons.update(
+                            str(reason)
+                            for reason in metrics.get("mirror_rescue_reasons", [])
+                        )
+                    if bool(metrics.get("mirror_rescue_applied")):
+                        mirror_applied += 1
+                        mirror_task_improvement_m.append(
+                            float(metrics.get("mirror_nominal_task_error_m", 0.0))
+                            - float(metrics.get("mirror_selected_task_error_m", 0.0))
+                        )
+                        mirror_margin_improvement_m.append(
+                            float(metrics.get("mirror_selected_collision_margin_m", 0.0))
+                            - float(metrics.get("mirror_nominal_collision_margin_m", 0.0))
+                        )
+                    mirror_ms = metrics.get("mirror_rescue_solve_ms")
+                    if mirror_ms is not None and math.isfinite(float(mirror_ms)):
+                        mirror_solve_ms.append(float(mirror_ms))
                     max_abs_q = max(
                         abs(float(value))
                         for value in packet["joint_position_rad"]
@@ -154,6 +193,16 @@ def main() -> int:
                             f"targets={packet['valid_targets']} "
                             f"safety={packet.get('safety', {}).get('level')} "
                             f"reasons={packet.get('safety', {}).get('reasons')} "
+                            f"collision_pairs={packet.get('safety', {}).get('collision_risk_pairs')} "
+                            f"collision_margin={packet.get('safety', {}).get('minimum_collision_margin_m')} "
+                            f"mirror_triggered={packet.get('bridge_metrics', {}).get('mirror_rescue_triggered')} "
+                            f"mirror_applied={packet.get('bridge_metrics', {}).get('mirror_rescue_applied')} "
+                            f"mirror_ms={packet.get('bridge_metrics', {}).get('mirror_rescue_solve_ms')} "
+                            f"mirror_counts={mirror_applied}/{mirror_triggered} "
+                            f"mirror_reasons={dict(mirror_reasons)} "
+                            f"mirror_p95_ms={np.percentile(mirror_solve_ms, 95):.2f} "
+                            f"mirror_task_gain_mm={1000*np.mean(mirror_task_improvement_m) if mirror_task_improvement_m else 0:.2f} "
+                            f"mirror_margin_gain_mm={1000*np.mean(mirror_margin_improvement_m) if mirror_margin_improvement_m else 0:.2f} "
                             f"saturation={packet.get('safety', {}).get('joint_limit_saturation_names')} "
                             f"ik_upper_max={packet.get('bridge_metrics', {}).get('ik_upper_position_max_m')} "
                             f"ik_upper_relative={packet.get('bridge_metrics', {}).get('ik_upper_relative_residual_m')} "

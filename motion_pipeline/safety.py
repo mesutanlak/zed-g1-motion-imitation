@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Iterable
 
@@ -46,6 +46,8 @@ class FeasibilityResult:
     joint_limit_saturation_count: int
     velocity_limit_count: int
     acceleration_limit_count: int
+    arm_blend: dict[str, float] = field(default_factory=dict)
+    minimum_collision_margin_m: float = float("inf")
 
 
 class G1FeasibilityFilter:
@@ -77,20 +79,51 @@ class G1FeasibilityFilter:
         self.velocity = np.zeros(23, dtype=np.float64)
         self.last_reliable: np.ndarray | None = None
         self.orange_elapsed_s = 0.0
+        self.arm_collision_elapsed_s = {"left": 0.0, "right": 0.0}
 
     def reset(self) -> None:
         self.safe_q = None
         self.velocity.fill(0.0)
         self.last_reliable = None
         self.orange_elapsed_s = 0.0
+        self.arm_collision_elapsed_s = {"left": 0.0, "right": 0.0}
 
-    def update(self, raw_q: Iterable[float], dt: float, *, reasons: Iterable[str] = (), gmr_residual: float = 0.0, self_collision: bool = False, stale: bool = False) -> FeasibilityResult:
+    @staticmethod
+    def _collision_blend(margin_m: float) -> float:
+        """Continuous reference-governor blend from signed capsule margin."""
+        if not np.isfinite(margin_m) or margin_m >= 0.030:
+            return 1.0
+        if margin_m >= 0.0:
+            return float(0.35 + 0.65 * margin_m / 0.030)
+        if margin_m >= -0.020:
+            return float(0.05 + 0.30 * (margin_m + 0.020) / 0.020)
+        return 0.0
+
+    def update(
+        self,
+        raw_q: Iterable[float],
+        dt: float,
+        *,
+        reasons: Iterable[str] = (),
+        gmr_residual: float = 0.0,
+        self_collision: bool = False,
+        stale: bool = False,
+        collision_margin_m: float = float("inf"),
+        arm_collision_margins: dict[str, float] | None = None,
+        arm_reasons: dict[str, Iterable[str]] | None = None,
+        arm_quality_blend: dict[str, float] | None = None,
+    ) -> FeasibilityResult:
         raw = np.asarray(list(raw_q), dtype=np.float64)
         external = list(dict.fromkeys(str(reason) for reason in reasons))
+        per_arm_reasons = {
+            side: list(dict.fromkeys(str(reason) for reason in values))
+            for side, values in (arm_reasons or {}).items()
+            if side in {"left", "right"}
+        }
         if raw.shape != (23,) or not np.isfinite(raw).all():
             target = self.last_reliable if self.last_reliable is not None else self.nominal
             self.safe_q = target.copy()
-            return FeasibilityResult(raw, target.copy(), SafetyLevel.RED, tuple(external + ["non_finite_target"]), 0.0, 0, 0, 0)
+            return FeasibilityResult(raw, target.copy(), SafetyLevel.RED, tuple(external + ["non_finite_target"]), 0.0, 0, 0, 0, {"left": 0.0, "right": 0.0}, float(collision_margin_m))
 
         low = G1_23_ANATOMICAL_LIMITS_RAD[:, 0] + self.margin
         high = G1_23_ANATOMICAL_LIMITS_RAD[:, 1] - self.margin
@@ -100,22 +133,59 @@ class G1FeasibilityFilter:
             external.append("joint_limit_saturation")
         if gmr_residual > self.residual_warn:
             external.append("gmr_high_residual")
-        if self_collision:
+        arm_margins = dict(arm_collision_margins or {})
+        continuous_collision_available = bool(arm_margins)
+        if continuous_collision_available:
+            for side in ("left", "right"):
+                side_margin = float(arm_margins.get(side, float("inf")))
+                if side_margin < 0.005:
+                    per_arm_reasons.setdefault(side, []).append(
+                        "self_collision_proximity"
+                    )
+                if side_margin < 0.0:
+                    per_arm_reasons.setdefault(side, []).append(
+                        "self_collision_risk"
+                    )
+        elif collision_margin_m < 0.005:
+            external.append("self_collision_proximity")
+            if collision_margin_m < 0.0:
+                external.append("self_collision_risk")
+        if self_collision and not continuous_collision_available:
             external.append("self_collision_risk")
         if stale:
             external.append("stale_packet")
 
-        severe = self_collision or stale or gmr_residual > self.residual_severe or joint_count >= 4
+        bilateral_penetration = all(
+            float(arm_margins.get(side, float("inf"))) < -0.020
+            for side in ("left", "right")
+        )
+        severe = (
+            stale
+            or gmr_residual > self.residual_severe
+            or joint_count >= 4
+            or bilateral_penetration
+            or (self_collision and not continuous_collision_available)
+        )
+        arm_severe = any(
+            float(arm_margins.get(side, float("inf"))) < -0.020
+            for side in ("left", "right")
+        )
         degraded = bool(external) or gmr_residual > self.residual_warn
-        level = SafetyLevel.ORANGE if severe else (SafetyLevel.YELLOW if degraded else SafetyLevel.GREEN)
+        arm_degraded = any(per_arm_reasons.values())
+        level = SafetyLevel.ORANGE if (severe or arm_severe) else (
+            SafetyLevel.YELLOW if (degraded or arm_degraded) else SafetyLevel.GREEN
+        )
         dt = float(np.clip(dt, 1.0 / 240.0, 0.1))
+        motion_level = SafetyLevel.ORANGE if severe else (
+            SafetyLevel.YELLOW if degraded else SafetyLevel.GREEN
+        )
         blend = {
             SafetyLevel.GREEN: 1.0,
             SafetyLevel.YELLOW: self.yellow_blend,
             SafetyLevel.ORANGE: 0.0,
-        }[level]
+        }[motion_level]
         base = self.safe_q.copy() if self.safe_q is not None else self.nominal.copy()
-        if level == SafetyLevel.ORANGE:
+        if motion_level == SafetyLevel.ORANGE:
             self.orange_elapsed_s += dt
             target = (
                 self.last_reliable.copy()
@@ -138,6 +208,38 @@ class G1FeasibilityFilter:
             self.orange_elapsed_s = 0.0
             target = base + blend * (projected - base)
 
+        arm_blend: dict[str, float] = {}
+        for side, indices in (
+            ("left", slice(13, 18)),
+            ("right", slice(18, 23)),
+        ):
+            side_margin = float(arm_margins.get(side, float("inf")))
+            collision_blend = self._collision_blend(side_margin)
+            quality_blend = float(np.clip(
+                (arm_quality_blend or {}).get(side, 1.0), 0.0, 1.0
+            ))
+            side_blend = min(collision_blend, quality_blend)
+            arm_blend[side] = side_blend
+            if side_blend < 1.0 and motion_level != SafetyLevel.ORANGE:
+                target[indices] = base[indices] + side_blend * (
+                    projected[indices] - base[indices]
+                )
+                self.arm_collision_elapsed_s[side] += dt
+                # Never hold one arm forever. A persistent unsafe target
+                # returns only that arm toward neutral while the other arm and
+                # torso remain live.
+                if (
+                    side_blend <= 0.05
+                    and self.arm_collision_elapsed_s[side] > 0.35
+                ):
+                    alpha = 1.0 - np.exp(-dt / self.orange_return_tau_s)
+                    target[indices] = base[indices] + alpha * (
+                        self.nominal[indices] - base[indices]
+                    )
+                    external.append(f"{side}_arm_safe_return")
+            else:
+                self.arm_collision_elapsed_s[side] = 0.0
+
         desired_velocity = (target - base) / dt
         limited_velocity = np.clip(desired_velocity, -G1_23_VELOCITY_RAD_S, G1_23_VELOCITY_RAD_S)
         velocity_count = int(np.count_nonzero(np.abs(limited_velocity - desired_velocity) > 1e-9))
@@ -156,6 +258,22 @@ class G1FeasibilityFilter:
         accel_velocity[outward] = 0.0
         self.safe_q = safe
         self.velocity = accel_velocity
-        if level <= SafetyLevel.YELLOW:
+        # A local arm governor must not prevent the remaining valid command
+        # from becoming the next reliable state.
+        if motion_level <= SafetyLevel.YELLOW:
             self.last_reliable = safe.copy()
-        return FeasibilityResult(raw, safe.copy(), level, tuple(dict.fromkeys(external)), blend, joint_count, velocity_count, acceleration_count)
+        combined_reasons = external[:]
+        for side in ("left", "right"):
+            combined_reasons.extend(per_arm_reasons.get(side, ()))
+        return FeasibilityResult(
+            raw,
+            safe.copy(),
+            level,
+            tuple(dict.fromkeys(combined_reasons)),
+            blend,
+            joint_count,
+            velocity_count,
+            acceleration_count,
+            arm_blend,
+            float(collision_margin_m),
+        )

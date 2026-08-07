@@ -6,6 +6,8 @@ param(
     [switch]$NoRosStream,
     [switch]$AllowSvoWithIsaac,
     [string]$AnalysisHost = "127.0.0.1",
+    [ValidateSet("akc", "legacy")]
+    [string]$ArmRecoveryMode = "akc",
     [ValidateSet("shared_gpu_safe", "balanced_30", "realtime_60", "quality")]
     [string]$Profile = "realtime_60"
 )
@@ -117,6 +119,7 @@ $zedArguments = @(
     "--confidence", "40",
     "--filter-tau", $filterTau,
     "--prediction-timeout", $predictionTimeout,
+    "--arm-recovery-mode", $ArmRecoveryMode,
     "--skeleton-smoothing", $skeletonSmoothing,
     "--operator-acquire-frames", "10",
     "--calibration-seconds", "4.0",

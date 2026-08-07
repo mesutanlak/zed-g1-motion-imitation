@@ -33,11 +33,17 @@ from g1_dof_projection import (
     project_29_to_23,
 )
 from motion_pipeline.safety import (
+    G1_23_ANATOMICAL_LIMITS_RAD,
     G1_23_LIMITS_RAD,
     G1FeasibilityFilter,
     SafetyLevel,
 )
 from motion_pipeline.metrics import PacketMetrics
+from motion_pipeline.collision_geometry import upper_body_capsule_report
+from motion_pipeline.mirror_rescue import (
+    KinematicEvaluation,
+    MirrorContinuationRescue,
+)
 
 
 MAX_VELOCITY_RAD_S = np.asarray(
@@ -202,6 +208,8 @@ class RelativeHandRoll:
         calibration_frames: int = 12,
         max_speed_rad_s: float = 4.5,
         nominal_fps: float = 60.0,
+        invalid_hold_s: float = 0.25,
+        neutral_return_tau_s: float = 0.80,
     ) -> None:
         self.calibration_frames = calibration_frames
         self.max_speed_rad_s = float(max_speed_rad_s)
@@ -211,6 +219,10 @@ class RelativeHandRoll:
         self.last: dict[str, float] = {"left": 0.0, "right": 0.0}
         self.unwrapped: dict[str, float] = {}
         self.last_timestamp_ns: dict[str, int] = {}
+        self.invalid_elapsed_s: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self.invalid_hold_s = float(max(0.0, invalid_hold_s))
+        self.neutral_return_tau_s = float(max(0.05, neutral_return_tau_s))
+        self.quality: dict[str, str] = {"left": "CALIBRATING", "right": "CALIBRATING"}
 
     def reset(self) -> None:
         """Start wrist neutral calibration again for a new operator session."""
@@ -219,6 +231,32 @@ class RelativeHandRoll:
         self.last = {"left": 0.0, "right": 0.0}
         self.unwrapped.clear()
         self.last_timestamp_ns.clear()
+        self.invalid_elapsed_s = {"left": 0.0, "right": 0.0}
+        self.quality = {"left": "CALIBRATING", "right": "CALIBRATING"}
+
+    @staticmethod
+    def _occluded(frame: dict, side: str) -> bool:
+        overlap = (frame.get("occlusion_analysis") or {}).get(
+            "arm_torso_overlap", {}
+        )
+        return bool(overlap.get(side))
+
+    def _dt(self, frame: dict, side: str) -> float:
+        timestamp_ns = int(frame.get("timestamp_ns") or 0)
+        previous_timestamp_ns = self.last_timestamp_ns.get(side)
+        if timestamp_ns > 0 and previous_timestamp_ns is not None:
+            dt = float(
+                np.clip(
+                    (timestamp_ns - previous_timestamp_ns) * 1.0e-9,
+                    1.0 / 120.0,
+                    0.1,
+                )
+            )
+        else:
+            dt = self.nominal_dt
+        if timestamp_ns > 0:
+            self.last_timestamp_ns[side] = timestamp_ns
+        return dt
 
     @staticmethod
     def _angle(frame: dict, side: str) -> float | None:
@@ -292,9 +330,31 @@ class RelativeHandRoll:
 
     def update(self, frame: dict) -> tuple[dict[str, float], bool]:
         for side in ("left", "right"):
-            angle = self._angle(frame, side)
+            dt = self._dt(frame, side)
+            angle = None if self._occluded(frame, side) else self._angle(frame, side)
             if angle is None:
+                self.invalid_elapsed_s[side] += dt
+                self.quality[side] = (
+                    "HOLD"
+                    if self.invalid_elapsed_s[side] <= self.invalid_hold_s
+                    else "NEUTRAL_RETURN"
+                )
+                if self.invalid_elapsed_s[side] > self.invalid_hold_s:
+                    # Orientation is a soft task on the 5-DOF G1 arm.  A
+                    # missing/occluded hand must not preserve a stale roll
+                    # forever; return gradually without disturbing position IK.
+                    alpha = 1.0 - np.exp(-dt / self.neutral_return_tau_s)
+                    previous = self.unwrapped.get(side, self.last[side])
+                    candidate = previous + alpha * (0.0 - previous)
+                    max_step = self.max_speed_rad_s * dt
+                    candidate = previous + float(
+                        np.clip(candidate - previous, -max_step, max_step)
+                    )
+                    self.unwrapped[side] = candidate
+                    self.last[side] = float(np.clip(candidate, -1.75, 1.75))
                 continue
+            self.invalid_elapsed_s[side] = 0.0
+            self.quality[side] = "TRACKING" if side in self.baseline else "CALIBRATING"
             if side not in self.baseline:
                 self.samples[side].append(angle)
                 if len(self.samples[side]) >= self.calibration_frames:
@@ -308,9 +368,6 @@ class RelativeHandRoll:
                     # and can command an immediate +/-1.75 rad hand flip.
                     self.unwrapped[side] = 0.0
                     self.last[side] = 0.0
-                    timestamp_ns = int(frame.get("timestamp_ns") or 0)
-                    if timestamp_ns > 0:
-                        self.last_timestamp_ns[side] = timestamp_ns
                 continue
             wrapped = float(
                 np.arctan2(
@@ -329,21 +386,11 @@ class RelativeHandRoll:
                 )
             )
 
-            timestamp_ns = int(frame.get("timestamp_ns") or 0)
-            previous_timestamp_ns = self.last_timestamp_ns.get(side)
-            if timestamp_ns > 0 and previous_timestamp_ns is not None:
-                dt = float(
-                    np.clip((timestamp_ns - previous_timestamp_ns) * 1.0e-9, 1.0 / 120.0, 0.1)
-                )
-            else:
-                dt = self.nominal_dt
             max_step = self.max_speed_rad_s * dt
             candidate = previous_unwrapped + float(
                 np.clip(candidate - previous_unwrapped, -max_step, max_step)
             )
             self.unwrapped[side] = candidate
-            if timestamp_ns > 0:
-                self.last_timestamp_ns[side] = timestamp_ns
             self.last[side] = float(np.clip(candidate, -1.75, 1.75))
         return self.last.copy(), len(self.baseline) == 2
 
@@ -394,6 +441,26 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Low-priority anatomical elbow hinge regularization cost.",
     )
+    parser.add_argument(
+        "--anatomical-branch-continuity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require four coherent frames before changing the directed elbow "
+            "plane. Disable only to reproduce the protected baseline."
+        ),
+    )
+    parser.add_argument(
+        "--mirror-rescue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable event-triggered arm-only continuation recovery after the "
+            "nominal deterministic GMR solve. Use --no-mirror-rescue for the "
+            "protected baseline behavior."
+        ),
+    )
+    parser.add_argument("--mirror-workers", type=int, default=4)
     parser.add_argument(
         "--mode", choices=("upper_body", "whole_body"), default="upper_body"
     )
@@ -606,6 +673,8 @@ def main() -> int:
         persistent_memory_targets=(
             fixed_lower_targets if args.mode == "upper_body" else ()
         ),
+        anatomical_branch_continuity=args.anatomical_branch_continuity,
+        branch_confirm_frames=4,
     )
     hand_roll = RelativeHandRoll(nominal_fps=args.input_fps)
     required = set(GMR_BODY38_MAP)
@@ -647,6 +716,15 @@ def main() -> int:
         orange_return_after_s=0.35 if args.mode == "upper_body" else None,
         orange_return_tau_s=0.80,
     )
+    mirror_rescue = MirrorContinuationRescue(
+        enabled=args.mirror_rescue,
+        workers=max(1, args.mirror_workers),
+        # The measured project baseline has useful upper-body solutions below
+        # roughly 12 cm. Rescue is therefore reserved for the tail, not every
+        # nominal GMR frame.
+        residual_trigger_m=0.12,
+        collision_trigger_m=0.005,
+    )
     packet_metrics = PacketMetrics()
     stale_watchdog_active = False
     last_update = time.monotonic()
@@ -674,6 +752,7 @@ def main() -> int:
         adapter.reset()
         joint_filter.reset()
         feasibility.reset()
+        mirror_rescue.reset()
         hand_roll.reset()
         gmr.configuration.update(neutral_gmr_qpos.copy())
         elbow_regularizer.reset(neutral_gmr_qpos)
@@ -857,6 +936,34 @@ def main() -> int:
                 rejected += 1
                 continue
 
+            human_targets = {
+                name: np.asarray(value[0], dtype=np.float64)
+                for name, value in adapted.human_data.items()
+            }
+
+            def evaluate_arm_candidate(candidate_q: np.ndarray) -> KinematicEvaluation:
+                candidate_skeleton, _ = forward_g1_skeleton(
+                    gmr.model, qpos, candidate_q
+                )
+                return KinematicEvaluation(
+                    candidate_skeleton,
+                    upper_body_capsule_report(candidate_skeleton),
+                )
+
+            mirror_result = mirror_rescue.update(
+                nominal_q=raw,
+                previous_safe_q=feasibility.safe_q,
+                targets=human_targets,
+                evaluate=evaluate_arm_candidate,
+                joint_limits=np.column_stack((
+                    G1_23_ANATOMICAL_LIMITS_RAD[:, 0] + feasibility.margin,
+                    G1_23_ANATOMICAL_LIMITS_RAD[:, 1] - feasibility.margin,
+                )),
+                residual_m=last_ik_upper_position_max_m,
+                branch_change_pending=adapter.branch_change_pending,
+            )
+            raw = mirror_result.q
+
             now = time.monotonic()
             dt = min(max(now - last_update, 1.0 / 120.0), 0.10)
             filtered = joint_filter.update(raw, dt, MAX_VELOCITY_RAD_S)
@@ -868,21 +975,40 @@ def main() -> int:
                 rejected += 1
                 continue
             perception_reasons: list[str] = []
-            overlap = (frame.get("occlusion_analysis") or {}).get(
+            arm_perception_reasons: dict[str, list[str]] = {
+                "left": [], "right": [],
+            }
+            occlusion_analysis = frame.get("occlusion_analysis") or {}
+            overlap = occlusion_analysis.get(
                 "arm_torso_overlap", {}
             )
             if overlap.get("right"):
-                perception_reasons.append("right_wrist_occluded")
+                arm_perception_reasons["right"].append("right_wrist_occluded")
             if overlap.get("left"):
-                perception_reasons.append("left_wrist_occluded")
+                arm_perception_reasons["left"].append("left_wrist_occluded")
             if pelvis_left_right_swap_risk(frame):
                 perception_reasons.append("left_right_swap_risk")
             calibration_profile = (frame.get("calibration") or {}).get("profile") or {}
             if float(calibration_profile.get("median_bone_length_cv", 0.0)) > 0.08:
                 perception_reasons.append("bone_length_violation")
+            akc_confidence = occlusion_analysis.get("akc_candidate_confidence") or {}
+            akc_recovered = occlusion_analysis.get("arm_chain_recovered") or {}
+            arm_quality_blend: dict[str, float] = {}
+            for side in ("left", "right"):
+                if not overlap.get(side):
+                    arm_quality_blend[side] = 1.0
+                    continue
+                confidence = float(akc_confidence.get(side, 0.0))
+                # A coherent AKC reconstruction is almost fully trusted.  A
+                # low-confidence overlap is softened only on the affected arm.
+                arm_quality_blend[side] = (
+                    0.92 if akc_recovered.get(side) and confidence >= 0.50
+                    else 0.72
+                )
             raw_skeleton, raw_self_collisions = forward_g1_skeleton(
                 gmr.model, qpos, raw
             )
+            raw_collision_report = upper_body_capsule_report(raw_skeleton)
             limb_direction_error, end_effector_error = limb_direction_metrics(
                 adapted.human_data, raw_skeleton
             )
@@ -902,6 +1028,10 @@ def main() -> int:
                 ),
                 self_collision=raw_self_collisions > 0,
                 stale=False,
+                collision_margin_m=raw_collision_report.minimum_margin_m,
+                arm_collision_margins=raw_collision_report.arm_minimum_margin_m,
+                arm_reasons=arm_perception_reasons,
+                arm_quality_blend=arm_quality_blend,
             )
             safe = feasibility_result.safe_q
             saturation_low = G1_23_LIMITS_RAD[:, 0] + feasibility.margin
@@ -969,6 +1099,13 @@ def main() -> int:
                     "operator_calibrated": adapted.operator_calibrated,
                     "raw_self_collision_count": raw_self_collisions,
                     "safe_self_collision_count": safe_self_collisions,
+                    "minimum_collision_margin_m": raw_collision_report.minimum_margin_m,
+                    "arm_collision_margin_m": raw_collision_report.arm_minimum_margin_m,
+                    "collision_risk_pairs": list(raw_collision_report.risk_pairs),
+                    "hard_collision_margin_by_pair_m": raw_collision_report.hard_pair_margins_m,
+                    "soft_contact_pairs": list(raw_collision_report.soft_risk_pairs),
+                    "soft_contact_margin_m": raw_collision_report.soft_pair_margins_m,
+                    "arm_reference_blend": feasibility_result.arm_blend,
                 },
                 "g1_skeleton": {
                     "body_names": list(G1_SKELETON_BODIES),
@@ -1009,6 +1146,20 @@ def main() -> int:
                     ),
                     "left_arm_pole_source": adapter.last_arm_pole_source["left"],
                     "right_arm_pole_source": adapter.last_arm_pole_source["right"],
+                    "left_elbow_branch_sign": adapter.last_arm_branch_sign["left"],
+                    "right_elbow_branch_sign": adapter.last_arm_branch_sign["right"],
+                    "left_wrist_orientation_quality": hand_roll.quality["left"],
+                    "right_wrist_orientation_quality": hand_roll.quality["right"],
+                    "mirror_rescue_enabled": mirror_rescue.enabled,
+                    "mirror_rescue_triggered": mirror_result.triggered,
+                    "mirror_rescue_applied": mirror_result.applied,
+                    "mirror_rescue_reasons": list(mirror_result.trigger_reasons),
+                    "mirror_rescue_candidates": mirror_result.candidate_count,
+                    "mirror_rescue_solve_ms": mirror_result.solve_ms,
+                    "mirror_nominal_task_error_m": mirror_result.nominal_task_error_m,
+                    "mirror_selected_task_error_m": mirror_result.selected_task_error_m,
+                    "mirror_nominal_collision_margin_m": mirror_result.nominal_collision_margin_m,
+                    "mirror_selected_collision_margin_m": mirror_result.selected_collision_margin_m,
                     "left_wrist_roll_rad": wrist_roll["left"],
                     "right_wrist_roll_rad": wrist_roll["right"],
                     "ik_error_norm": last_ik_error,

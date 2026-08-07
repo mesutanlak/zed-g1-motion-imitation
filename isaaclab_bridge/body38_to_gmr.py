@@ -161,6 +161,8 @@ class Body38ToGMR:
         max_segment_turn_deg: float = 45.0,
         occluded_segment_turn_deg: float = 30.0,
         fixed_stance: bool = False,
+        anatomical_branch_continuity: bool = True,
+        branch_confirm_frames: int = 4,
     ) -> None:
         self.confidence_threshold = float(confidence_threshold)
         self.max_memory_frames = max(0, int(round(memory_seconds * nominal_fps)))
@@ -173,6 +175,8 @@ class Body38ToGMR:
         self.max_segment_turn_deg = float(max_segment_turn_deg)
         self.occluded_segment_turn_deg = float(occluded_segment_turn_deg)
         self.fixed_stance = bool(fixed_stance)
+        self.anatomical_branch_continuity = bool(anatomical_branch_continuity)
+        self.branch_confirm_frames = int(np.clip(branch_confirm_frames, 3, 5))
         self._memory: dict[str, tuple[np.ndarray, int]] = {}
         self._velocity_memory: dict[str, np.ndarray] = {}
         self._raw_fallback_streak: dict[str, int] = {}
@@ -182,6 +186,9 @@ class Body38ToGMR:
         # removes the mirrored two-bone IK branch that appears when a nearly
         # straight elbow or torso overlap makes the measured pole ill-defined.
         self._arm_pole_memory: dict[str, np.ndarray] = {}
+        self._arm_plane_normal_memory: dict[str, np.ndarray] = {}
+        self._arm_pending_branch: dict[str, tuple[int, int]] = {}
+        self.last_arm_branch_sign: dict[str, int] = {"left": 1, "right": 1}
         self.last_arm_pole_source: dict[str, str] = {
             "left": "uninitialized", "right": "uninitialized"
         }
@@ -202,12 +209,19 @@ class Body38ToGMR:
         self._reacquire.clear()
         self._just_reacquired.clear()
         self._arm_pole_memory.clear()
+        self._arm_plane_normal_memory.clear()
+        self._arm_pending_branch.clear()
+        self.last_arm_branch_sign = {"left": 1, "right": 1}
         self.last_arm_pole_source = {
             "left": "uninitialized", "right": "uninitialized"
         }
         self._frame_no = 0
         self.rejected_outliers = 0
         self.last_rejection_reason = "control_session_reset"
+
+    @property
+    def branch_change_pending(self) -> bool:
+        return any(count > 0 for _, count in self._arm_pending_branch.values())
 
     @staticmethod
     def _is_finite_xyz(value: Any) -> bool:
@@ -591,6 +605,62 @@ class Body38ToGMR:
             ambiguous = bool(overlap.get(side)) or height < 0.025
             if observed_norm > 1.0e-8:
                 observed_pole /= observed_norm
+                # The directed shoulder-elbow-wrist plane distinguishes the
+                # two mirrored elbow branches. A genuine branch transition
+                # must remain coherent for several frames; a single ZED depth
+                # swap is never allowed to reverse the robot elbow.
+                plane_normal = np.cross(upper_vec, fore_vec)
+                plane_norm = float(np.linalg.norm(plane_normal))
+                if plane_norm > 1.0e-8:
+                    plane_normal /= plane_norm
+                else:
+                    plane_normal = self._arm_plane_normal_memory.get(side)
+                previous_normal = self._arm_plane_normal_memory.get(side)
+                if (
+                    self.anatomical_branch_continuity
+                    and plane_normal is not None
+                    and previous_normal is not None
+                ):
+                    candidate_sign = (
+                        1
+                        if float(np.dot(plane_normal, previous_normal)) >= 0.0
+                        else -1
+                    )
+                    if ambiguous:
+                        # Torso overlap and near-full extension are not
+                        # reliable evidence of a genuine elbow branch change.
+                        # Hold the last trustworthy bend plane, but do not
+                        # leave a perpetual pending event that would invoke
+                        # MIRROR on every frame.
+                        self._arm_pending_branch.pop(side, None)
+                        plane_normal = previous_normal.copy()
+                        if previous_pole is not None:
+                            observed_pole = previous_pole.copy()
+                        self.last_arm_pole_source[side] = "ambiguous_plane_hold"
+                    elif candidate_sign < 0:
+                        pending_sign, pending_count = self._arm_pending_branch.get(
+                            side, (0, 0)
+                        )
+                        pending_count = pending_count + 1 if pending_sign == candidate_sign else 1
+                        self._arm_pending_branch[side] = (
+                            candidate_sign, pending_count
+                        )
+                        if pending_count < self.branch_confirm_frames:
+                            observed_pole *= -1.0
+                            plane_normal *= -1.0
+                            self.last_arm_pole_source[side] = "branch_guard"
+                        else:
+                            self.last_arm_branch_sign[side] *= -1
+                            self._arm_pending_branch.pop(side, None)
+                    else:
+                        self._arm_pending_branch.pop(side, None)
+                    # Close to full extension, the elbow plane is singular;
+                    # keep the last reliable normal regardless of the current
+                    # noisy cross-product.
+                    if height < 0.025:
+                        plane_normal = previous_normal.copy()
+                if plane_normal is not None and height >= 0.025:
+                    self._arm_plane_normal_memory[side] = plane_normal.copy()
                 if previous_pole is None:
                     alpha = 0.20 if ambiguous else 0.95
                     pole = alpha * observed_pole + (1.0 - alpha) * neutral_pole
