@@ -287,12 +287,13 @@ class ArmChainOptimizer:
 
         measured_vector = wrist - shoulder
         measured_direction = _unit(measured_vector)
-        previous_reach = float(np.linalg.norm(state.wrist - state.shoulder))
         if measured_direction is None:
             target = state.wrist + torso_delta
-        elif overlap:
-            target = shoulder + measured_direction * previous_reach
         else:
+            # ``update`` has already applied the overlap-specific reach
+            # governor.  Replacing that governed target with the previous
+            # reach here made bilateral frontal arms remain artificially
+            # straight forever.
             target = wrist
         if not np.isfinite(target).all():
             target = state.wrist + torso_delta
@@ -461,19 +462,44 @@ class ArmChainOptimizer:
         torso_center = 0.5 * (
             output[index["LEFT_SHOULDER"]] + output[index["RIGHT_SHOULDER"]]
         )
+        # Decide whether both arms are simultaneously under-constrained before
+        # solving either chain.  Treating this as two unrelated one-arm
+        # problems was the cause of the unstable "both hands on chest" pose:
+        # each solver could select a locally valid but mutually incompatible
+        # reach/plane.
+        detected_overlap_by_side: dict[str, bool] = {}
+        front_depth_by_side: dict[str, bool] = {}
         for side in ("LEFT", "RIGHT"):
-            shoulder_i, elbow_i, wrist_i = (index[f"{side}_SHOULDER"], index[f"{side}_ELBOW"], index[f"{side}_WRIST"])
+            elbow_i = index[f"{side}_ELBOW"]
+            wrist_i = index[f"{side}_WRIST"]
             elbow_overlap = _inside_convex(pixel[elbow_i], torso)
             wrist_overlap = _inside_convex(pixel[wrist_i], torso)
-            # The 3D projection is only a confirmation for a keypoint close
-            # to the image-space torso boundary.  Using it alone would mark
-            # valid side poses as occluded and would change normal IK.
             depth_overlap = self._inside_torso_projection_3d(output, index, side)
             boundary_overlap = depth_overlap and (
                 _inside_expanded_convex(pixel[elbow_i], torso)
                 or _inside_expanded_convex(pixel[wrist_i], torso)
             )
-            detected_overlap = elbow_overlap or wrist_overlap or boundary_overlap
+            detected_overlap_by_side[side] = bool(
+                elbow_overlap or wrist_overlap or boundary_overlap
+            )
+            front_depth_by_side[side] = self._front_depth_ambiguity(
+                output, pixel, index, side
+            )
+        bilateral_front = all(
+            detected_overlap_by_side[side] or front_depth_by_side[side]
+            for side in ("LEFT", "RIGHT")
+        )
+        if bilateral_front:
+            reasons.append("bilateral_front_arm_occlusion")
+        shoulder_axis = _unit(
+            output[index["LEFT_SHOULDER"]] - output[index["RIGHT_SHOULDER"]]
+        )
+        shoulder_width = float(np.linalg.norm(
+            output[index["LEFT_SHOULDER"]] - output[index["RIGHT_SHOULDER"]]
+        ))
+        for side in ("LEFT", "RIGHT"):
+            shoulder_i, elbow_i, wrist_i = (index[f"{side}_SHOULDER"], index[f"{side}_ELBOW"], index[f"{side}_WRIST"])
+            detected_overlap = detected_overlap_by_side[side]
             if detected_overlap:
                 self.overlap_until[side] = timestamp_s + self.hold_s
             overlap_active = detected_overlap or timestamp_s <= self.overlap_until.get(side, -np.inf)
@@ -485,9 +511,7 @@ class ArmChainOptimizer:
                 output[wrist_i],
                 calibration,
             )
-            front_depth_ambiguity = self._front_depth_ambiguity(
-                output, pixel, index, side
-            )
+            front_depth_ambiguity = front_depth_by_side[side]
             low_quality = (
                 overlap_active
                 or conf[elbow_i] < threshold
@@ -511,6 +535,14 @@ class ArmChainOptimizer:
                 shoulder = output[shoulder_i]
                 measured_wrist = output[wrist_i]
                 target = measured_wrist if np.isfinite(measured_wrist).all() and conf[wrist_i] >= threshold else prev_wrist
+                upper = float((calibration or {}).get(
+                    f"{side.lower()}_upper_arm_m",
+                    np.linalg.norm(previous.elbow - previous.shoulder),
+                ))
+                fore = float((calibration or {}).get(
+                    f"{side.lower()}_forearm_m",
+                    np.linalg.norm(previous.wrist - previous.elbow),
+                ))
                 # A partially occluded BODY_38 chain can contain a missing
                 # elbow while the wrist remains usable.  Never feed that NaN
                 # into the candidate cost: continue from the last trusted
@@ -519,18 +551,36 @@ class ArmChainOptimizer:
                 recovery_elbow = output[elbow_i]
                 if not np.isfinite(recovery_elbow).all():
                     recovery_elbow = prev_elbow + (torso_center - previous.torso_center)
-                if overlap_active and np.isfinite(target).all() and np.isfinite(shoulder).all():
+                if (overlap_active or bilateral_front) and np.isfinite(target).all() and np.isfinite(shoulder).all():
                     # During torso overlap ZED often keeps a high confidence
-                    # score although wrist depth is ambiguous.  Preserve the
-                    # last reliable shoulder-wrist reach (therefore elbow
-                    # flexion) and follow only the measured arm direction.
-                    # Once the wrist leaves the torso, blend the measured
-                    # reach back over the hysteresis window.
+                    # score although wrist depth is ambiguous. Preserve a
+                    # trusted reach, but do not freeze a genuine bilateral
+                    # chest-level flexion: a feasible depth measurement is
+                    # admitted gradually and rate-limited.
                     measured_vector = target - shoulder
                     measured_reach = float(np.linalg.norm(measured_vector))
                     previous_reach = float(np.linalg.norm(prev_wrist - shoulder))
                     if measured_reach > 1e-6 and previous_reach > 1e-6:
-                        if detected_overlap:
+                        reach_min = abs(upper - fore) + 0.015
+                        reach_max = upper + fore - 0.015
+                        reachable_measurement = reach_min <= measured_reach <= reach_max
+                        elapsed = float(np.clip(
+                            timestamp_s - previous.timestamp_s, 1.0 / 120.0, 0.10
+                        ))
+                        reach_step = 1.20 * elapsed
+                        rate_limited_reach = previous_reach + float(np.clip(
+                            measured_reach - previous_reach, -reach_step, reach_step
+                        ))
+                        if not reachable_measurement:
+                            measured_weight = 0.0
+                        elif bilateral_front:
+                            # Both wrist depths are uncertain, but their
+                            # common shortening is meaningful for a bent arm.
+                            measured_weight = 0.35
+                        elif detected_overlap:
+                            # Preserve the established single-arm behavior:
+                            # one-arm torso overlap is usually more ambiguous
+                            # than the coupled bilateral chest posture.
                             measured_weight = 0.0
                         else:
                             remaining = max(
@@ -542,11 +592,22 @@ class ArmChainOptimizer:
                             )
                         reach = (
                             (1.0 - measured_weight) * previous_reach
-                            + measured_weight * measured_reach
+                            + measured_weight * rate_limited_reach
                         )
                         target = shoulder + measured_vector / measured_reach * reach
-                upper = float((calibration or {}).get(f"{side.lower()}_upper_arm_m", np.linalg.norm(previous.elbow - previous.shoulder)))
-                fore = float((calibration or {}).get(f"{side.lower()}_forearm_m", np.linalg.norm(previous.wrist - previous.elbow)))
+                if bilateral_front and shoulder_axis is not None and shoulder_width > 0.10:
+                    # G1's two 5-DOF arms should not swap sides while both
+                    # wrists are visually merged with the torso.  Keep a small
+                    # anatomical lateral separation; exact crossed-arm poses
+                    # are deliberately softened rather than commanding a
+                    # self-collision-prone robot configuration.
+                    side_sign = 1.0 if side == "LEFT" else -1.0
+                    lateral_offset = float(np.dot(target - torso_center, shoulder_axis))
+                    minimum_offset = 0.10 * shoulder_width
+                    if side_sign * lateral_offset < minimum_offset:
+                        target = target + shoulder_axis * (
+                            side_sign * minimum_offset - lateral_offset
+                        )
                 if np.isfinite(shoulder).all() and upper > 0.05 and fore > 0.05:
                     if self.recovery_mode == "akc":
                         try:

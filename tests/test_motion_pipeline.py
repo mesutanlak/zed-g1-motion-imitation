@@ -206,6 +206,54 @@ def test_arm_chain_recovers_front_depth_foreshortening() -> None:
     assert np.isfinite(result.candidate_confidence["left"])
 
 
+def test_bilateral_front_overlap_keeps_both_arms_bent_and_separated() -> None:
+    """Two chest-level wrists use coupled reach continuity, not two holds."""
+    optimizer = ArmChainOptimizer(hold_s=0.3)
+    points = neutral_points()
+    pixel = np.asarray([
+        [320, 350], [320, 240], [250, 220], [390, 220],
+        [180, 270], [460, 270], [120, 320], [520, 320],
+        [270, 400], [370, 400], [270, 520], [370, 520],
+        [270, 650], [370, 650], [260, 660], [380, 660],
+    ], dtype=float)
+    confidence = np.full(len(NAMES), 100.0)
+    optimizer.update(
+        timestamp_s=0.0, points_3d=points, points_2d=pixel,
+        confidence=confidence, index=INDEX, threshold=40.0, calibration=None,
+    )
+    frontal = points.copy()
+    frontal[INDEX["LEFT_ELBOW"]] = [3.16, 0.12, 1.42]
+    frontal[INDEX["LEFT_WRIST"]] = [3.27, 0.04, 1.34]
+    frontal[INDEX["RIGHT_ELBOW"]] = [3.16, -0.12, 1.42]
+    frontal[INDEX["RIGHT_WRIST"]] = [3.27, -0.04, 1.34]
+    frontal_pixel = pixel.copy()
+    frontal_pixel[INDEX["LEFT_ELBOW"]] = [305, 265]
+    frontal_pixel[INDEX["LEFT_WRIST"]] = [318, 300]
+    frontal_pixel[INDEX["RIGHT_ELBOW"]] = [335, 265]
+    frontal_pixel[INDEX["RIGHT_WRIST"]] = [322, 300]
+    result = None
+    for frame in range(1, 61):
+        result = optimizer.update(
+            timestamp_s=frame / 60.0, points_3d=frontal,
+            points_2d=frontal_pixel, confidence=confidence, index=INDEX,
+            threshold=40.0, calibration=None,
+        )
+    assert result is not None
+    assert "bilateral_front_arm_occlusion" in result.reasons
+    assert result.recovered == {"left": True, "right": True}
+    for side, sign in (("LEFT", 1.0), ("RIGHT", -1.0)):
+        shoulder = result.points[INDEX[f"{side}_SHOULDER"]]
+        elbow = result.points[INDEX[f"{side}_ELBOW"]]
+        wrist = result.points[INDEX[f"{side}_WRIST"]]
+        elbow_angle = np.degrees(np.arccos(np.clip(
+            np.dot(shoulder - elbow, wrist - elbow)
+            / (np.linalg.norm(shoulder - elbow) * np.linalg.norm(wrist - elbow)),
+            -1.0, 1.0,
+        )))
+        assert 20.0 < elbow_angle < 170.0
+        assert sign * wrist[1] > 0.0
+
+
 def test_two_bone_recovery_never_asserts_on_corrupt_front_frame() -> None:
     """A bad frontal frame must yield finite candidates, never kill ZED."""
     positive, negative, height = _two_bone_candidates(

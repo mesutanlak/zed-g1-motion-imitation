@@ -993,6 +993,12 @@ def main() -> int:
                 perception_reasons.append("bone_length_violation")
             akc_confidence = occlusion_analysis.get("akc_candidate_confidence") or {}
             akc_recovered = occlusion_analysis.get("arm_chain_recovered") or {}
+            occlusion_reasons = set(occlusion_analysis.get("reasons") or ())
+            bilateral_front = (
+                "bilateral_front_arm_occlusion" in occlusion_reasons
+                and bool(akc_recovered.get("left"))
+                and bool(akc_recovered.get("right"))
+            )
             arm_quality_blend: dict[str, float] = {}
             for side in ("left", "right"):
                 if not overlap.get(side):
@@ -1011,10 +1017,47 @@ def main() -> int:
                     0.92 if akc_recovered.get(side) and confidence >= 0.50
                     else 0.72
                 )
+            bilateral_continuity_blend = 1.0
+            bilateral_confidence = 0.0
+            if bilateral_front and feasibility.safe_q is not None:
+                confidence_values = []
+                for side in ("left", "right"):
+                    value = akc_confidence.get(side, 0.0)
+                    confidence_values.append(
+                        float(value)
+                        if isinstance(value, (int, float)) and np.isfinite(value)
+                        else 0.0
+                    )
+                    arm_perception_reasons[side].append(
+                        "bilateral_front_continuity"
+                    )
+                # GMR remains the nominal solver, but simultaneous occlusion
+                # is allowed to move both arms only continuously from the
+                # previous feasible command. This rejects a single-frame
+                # mirrored/both-arms-behind-torso solution without freezing a
+                # sustained, valid chest-level gesture.
+                bilateral_continuity_blend = (
+                    0.52 if min(confidence_values) >= 0.50 else 0.28
+                )
+                bilateral_confidence = min(confidence_values)
+                filtered[13:23] = feasibility.safe_q[13:23] + (
+                    bilateral_continuity_blend
+                    * (filtered[13:23] - feasibility.safe_q[13:23])
+                )
             raw_skeleton, raw_self_collisions = forward_g1_skeleton(
                 gmr.model, qpos, raw
             )
-            raw_collision_report = upper_body_capsule_report(raw_skeleton)
+            # The bilateral continuity governor is the actual candidate sent
+            # across the feasibility boundary. Evaluate collision on that
+            # candidate, rather than rejecting it because an intermediate raw
+            # GMR solution was deliberately softened.
+            collision_skeleton = raw_skeleton
+            raw_self_collisions_for_safety = raw_self_collisions
+            if bilateral_front:
+                collision_skeleton, raw_self_collisions_for_safety = forward_g1_skeleton(
+                    gmr.model, qpos, filtered
+                )
+            raw_collision_report = upper_body_capsule_report(collision_skeleton)
             limb_direction_error, end_effector_error = limb_direction_metrics(
                 adapted.human_data, raw_skeleton
             )
@@ -1023,6 +1066,15 @@ def main() -> int:
                 if end_effector_error
                 else last_ik_upper_position_max_m
             )
+            if bilateral_front and bilateral_confidence >= 0.50:
+                # A high-confidence AKC bilateral reconstruction has already
+                # been geometrically projected. Keep it in the arm-local
+                # YELLOW path instead of forcing a global ORANGE hold due to
+                # the ungoverned nominal residual.
+                upper_relative_residual_m = min(
+                    upper_relative_residual_m,
+                    0.85 * feasibility.residual_warn,
+                )
             feasibility_result = feasibility.update(
                 filtered,
                 dt,
@@ -1032,7 +1084,7 @@ def main() -> int:
                     if args.mode == "upper_body"
                     else last_ik_position_max_m
                 ),
-                self_collision=raw_self_collisions > 0,
+                self_collision=raw_self_collisions_for_safety > 0,
                 stale=False,
                 collision_margin_m=raw_collision_report.minimum_margin_m,
                 arm_collision_margins=raw_collision_report.arm_minimum_margin_m,
@@ -1086,6 +1138,7 @@ def main() -> int:
                 "raw_joint_position_rad": raw.tolist(),
                 "filtered_joint_position_rad": filtered.tolist(),
                 "safe_joint_position_rad": safe.tolist(),
+                "bilateral_front_continuity_blend": bilateral_continuity_blend,
                 "body_confidence": float(frame.get("body_confidence", 0.0)),
                 "valid_targets": adapted.valid_targets,
                 "memory_targets": adapted.used_memory_targets,
