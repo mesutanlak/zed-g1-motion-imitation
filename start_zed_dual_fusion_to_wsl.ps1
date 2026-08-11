@@ -3,6 +3,7 @@ param(
     [switch]$SkipGmrCheck,
     [switch]$NoAnalysisStream,
     [switch]$NoRosStream,
+    [switch]$Headless,
     [ValidateSet("dual_safe_15", "dual_balanced_30", "dual_60_experimental")]
     [string]$Profile = "dual_balanced_30",
     [string]$FusionConfig = "",
@@ -78,10 +79,16 @@ if (-not $NoRosStream) {
 if ($Record) {
     $arguments += "--record"
 }
+if ($Headless) {
+    $arguments += "--headless"
+}
 
 Write-Host "Fusion config: $FusionConfig"
 Write-Host "GMR UDP: ${wslAddress}:15050"
 Write-Host "Single-camera launcher remains unchanged: start_zed_live_smooth_to_wsl.ps1"
+if (-not $Headless) {
+    Write-Host "Dual preview: both ZED images and BODY_38 skeletons will open in one window."
+}
 Set-Location -LiteralPath $projectDir
 & $zedPython @arguments
 $exitCode = $LASTEXITCODE

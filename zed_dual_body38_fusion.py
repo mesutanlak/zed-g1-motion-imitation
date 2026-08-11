@@ -32,6 +32,8 @@ from zed_g1_skeleton import (
     ConfidenceAwareLowPass,
     build_record,
     camera_metadata,
+    cv2,
+    draw_skeleton,
     finite_vector,
     sanitize_for_json,
     sl,
@@ -209,6 +211,79 @@ def _fusion_metrics_snapshot(fusion: Any) -> dict[str, object] | None:
         return None
 
 
+def _camera_frame(zed: Any, image: Any) -> np.ndarray | None:
+    """Retrieve an independent copy of a sender's current left image."""
+    try:
+        if zed.retrieve_image(image, sl.VIEW.LEFT) != sl.ERROR_CODE.SUCCESS:
+            return None
+        frame = np.asarray(image.get_data())
+        if frame.ndim != 3 or frame.shape[0] == 0 or frame.shape[1] == 0:
+            return None
+        frame = frame.copy()
+        if frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        return frame
+    except Exception:
+        return None
+
+
+def _draw_dual_preview(
+    frames: dict[int, np.ndarray],
+    bodies_by_serial: dict[int, list[Any]],
+    selected_raw_ids: dict[int, int],
+    confidence_threshold: float,
+    *,
+    fusion_mode: str,
+    operator_state: str,
+    contributing_views: int,
+    recording: bool,
+    recorded: int,
+    target_height: int = 540,
+) -> np.ndarray | None:
+    """Build one side-by-side diagnostic window without affecting Fusion."""
+    panels: list[np.ndarray] = []
+    for serial in sorted(frames):
+        frame = frames[serial].copy()
+        selected_id = selected_raw_ids.get(serial)
+        for body in bodies_by_serial.get(serial, []):
+            draw_skeleton(
+                frame,
+                body,
+                selected_id is not None and int(body.id) == int(selected_id),
+                confidence_threshold,
+            )
+        scale = target_height / max(1, frame.shape[0])
+        width = max(1, int(round(frame.shape[1] * scale)))
+        panel = cv2.resize(frame, (width, target_height), interpolation=cv2.INTER_AREA)
+        cv2.rectangle(panel, (0, 0), (panel.shape[1], 42), (18, 18, 18), -1)
+        cv2.putText(
+            panel, f"ZED 2i S/N {serial} | BODY_38", (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA,
+        )
+        panels.append(panel)
+    if not panels:
+        return None
+    height = max(panel.shape[0] for panel in panels)
+    panels = [
+        cv2.copyMakeBorder(panel, 0, height - panel.shape[0], 0, 0, cv2.BORDER_CONSTANT)
+        for panel in panels
+    ]
+    canvas = cv2.hconcat(panels)
+    header = np.full((74, canvas.shape[1], 3), 22, dtype=np.uint8)
+    state_color = (0, 220, 0) if operator_state in ("LOCKED", "CALIBRATING") else (0, 180, 255)
+    cv2.putText(
+        header,
+        f"DUAL ZED FUSION | source={fusion_mode} | operator={operator_state} "
+        f"| views={contributing_views} | REC={'ON' if recording else 'OFF'} {recorded}",
+        (12, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.66, state_color, 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        header, "S: JSONL kayit  R: operator/kalibrasyon reset  Q/ESC: cikis",
+        (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 1, cv2.LINE_AA,
+    )
+    return cv2.vconcat([header, canvas])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="İki ZED 2i ile ortak BODY_38 -> mevcut G1 GMR/Isaac UDP kaynağı")
     parser.add_argument("--fusion-config", type=Path, required=True)
@@ -231,6 +306,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ros-port", type=int, default=15054)
     parser.add_argument("--ros-max-hz", type=float, default=30.0)
     parser.add_argument("--record", action="store_true")
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Kamera/iskelet onizleme penceresini kapat.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "recordings")
     parser.add_argument("--duration", type=float, default=0.0)
     return parser.parse_args()
@@ -267,6 +346,8 @@ def main() -> int:
     shared.set_for_shared_memory()
     senders: dict[int, Any] = {}
     sender_bodies: dict[int, Any] = {}
+    sender_images: dict[int, Any] = {}
+    latest_frames: dict[int, np.ndarray] = {}
     last_sender_ok: dict[int, float] = {}
     metadata: dict[str, object] = {}
 
@@ -317,6 +398,7 @@ def main() -> int:
             continue
         senders[serial] = zed
         sender_bodies[serial] = sl.Bodies()
+        sender_images[serial] = sl.Mat()
         last_sender_ok[serial] = time.monotonic()
         metadata[str(serial)] = camera_metadata(zed)
         print(f"ZED {serial}: BODY_38 yayıncı HAZIR")
@@ -438,6 +520,51 @@ def main() -> int:
         recording = enabled
         print(f"Dual BODY_38 kayıt {'AÇIK' if enabled else 'KAPALI'}: {record_path} ({recorded} kare)")
 
+    def handle_key(key: str | int | None) -> bool:
+        """Handle keys from either the PowerShell console or preview window."""
+        nonlocal last_operator_anchor
+        if key is None or key == -1:
+            return False
+        if isinstance(key, int):
+            if key == 27:
+                return True
+            if key < 0 or key > 255:
+                return False
+            normalized = chr(key).lower()
+        else:
+            normalized = key.lower()
+        if normalized in ("q", "\x1b"):
+            return True
+        if normalized == "s":
+            set_recording(not recording)
+        elif normalized == "r":
+            selector.reset(); calibrator.reset(); arm_optimizer.reset(); low_pass.reset()
+            raw_identity.clear(); last_operator_anchor = None
+            print("R: dual operator lock, calibration and arm memory reset.")
+        return False
+
+    def show_preview(
+        raw_lists: dict[int, list[Any]],
+        *,
+        fusion_mode: str,
+        operator_state: str,
+        contributing_views: int,
+    ) -> bool:
+        if args.headless:
+            return False
+        preview = _draw_dual_preview(
+            latest_frames, raw_lists, raw_identity, args.confidence,
+            fusion_mode=fusion_mode,
+            operator_state=operator_state,
+            contributing_views=contributing_views,
+            recording=recording,
+            recorded=recorded,
+        )
+        if preview is None:
+            return False
+        cv2.imshow("Dual ZED 2i BODY_38 Fusion - G1", preview)
+        return handle_key(cv2.waitKey(1) & 0xFF)
+
     if args.record:
         set_recording(True)
     print("Hazır. Q/ESC: çıkış | S: JSONL kayıt | R: operatör/kalibrasyon/kol hafızası sıfırla")
@@ -470,6 +597,9 @@ def main() -> int:
                 if grab == sl.ERROR_CODE.SUCCESS:
                     active += 1
                     last_sender_ok[serial] = now
+                    frame = _camera_frame(zed, sender_images[serial])
+                    if frame is not None:
+                        latest_frames[serial] = frame
                     zed.retrieve_bodies(sender_bodies[serial], sender_runtime)
                 elif now - last_sender_ok[serial] > 1.0:
                     print(f"UYARI: ZED {serial} kare kesintisi; diğer kamera ile devam ediliyor ({grab}).")
@@ -477,7 +607,23 @@ def main() -> int:
             if active == 0:
                 time.sleep(0.002)
                 continue
+            preview_lists = {
+                serial: (
+                    list(value.body_list)
+                    if getattr(value, "is_new", False) else []
+                )
+                for serial, value in sender_bodies.items()
+            }
             if fusion.process() != sl.FUSION_ERROR_CODE.SUCCESS:
+                if show_preview(
+                    preview_lists,
+                    fusion_mode="fusion_wait",
+                    operator_state=(
+                        "LOCKED" if selector.locked_id is not None else "WAITING"
+                    ),
+                    contributing_views=active,
+                ):
+                    break
                 continue
             if now - last_fusion_metrics_s >= 1.0:
                 snapshot = _fusion_metrics_snapshot(fusion)
@@ -565,6 +711,13 @@ def main() -> int:
             selected = selection.body
             entry = next((item for item in candidate_entries if item[0] is selected), None)
             if selected is None or entry is None:
+                if show_preview(
+                    preview_lists,
+                    fusion_mode="waiting",
+                    operator_state=selection.state.value,
+                    contributing_views=0,
+                ):
+                    break
                 frame_index += 1
                 continue
             selected_quality, matches = entry[1], entry[2]
@@ -586,6 +739,13 @@ def main() -> int:
                     source="single_fallback", source_serial=serial,
                 )
             elif decision.mode == "hold":
+                if show_preview(
+                    preview_lists,
+                    fusion_mode="hold",
+                    operator_state=selection.state.value,
+                    contributing_views=len(matches),
+                ):
+                    break
                 frame_index += 1
                 continue
 
@@ -752,6 +912,13 @@ def main() -> int:
                         udp.sendto(payload, target)
                         last_send[target] = now
             previous_timestamp_ns = timestamp_ns
+            if show_preview(
+                preview_lists,
+                fusion_mode=selected.source,
+                operator_state=selection.state.value,
+                contributing_views=len(matches),
+            ):
+                break
             frame_index += 1
             if frame_index % max(1, args.fps * 2) == 0:
                 print(
@@ -770,6 +937,7 @@ def main() -> int:
                 zed.stop_publishing(); zed.disable_body_tracking(); zed.disable_positional_tracking(); zed.close()
             except Exception:
                 pass
+        cv2.destroyAllWindows()
         print(f"Dual Fusion kapatıldı. Kayıtlı BODY_38: {recorded}")
     return 0
 

@@ -53,6 +53,13 @@ powershell -ExecutionPolicy Bypass -File .\start_zed_dual_fusion_to_wsl.ps1 `
   -Profile dual_balanced_30 -Record
 ```
 
+Bu komut varsayılan olarak iki ZED 2i görüntüsünü yan yana açar. Her panelde
+kameranın kendi BODY_38 iskeleti, üst çubukta ise Fusion kaynağı, kilitli
+operatör, katkı veren kamera sayısı ve kayıt durumu gösterilir. Önizleme
+penceresi odaktayken `S` JSONL kaydını açıp kapatır, `R` operatör kilidi ve
+kalibrasyonu sıfırlar, `Q`/`ESC` uygulamayı kapatır. Görüntüsüz kullanım için
+ayrıca `-Headless` verilebilir.
+
 Tuşlar: `S` JSONL kaydını açar/kapatır, `R` operatör kilidi, kalibrasyon ve kol
 belleğini sıfırlar, `Q` güvenli çıkış yapar.
 
