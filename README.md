@@ -6,11 +6,20 @@ içeren araştırma projesidir.
 
 Yeni bilgisayar kurulumu için önce [INSTALL_TR.md](INSTALL_TR.md) belgesini
 izleyin. Otomatik kurulum ve doğrulama betikleri `install/` klasöründedir.
+Windows/WSL, ZED SDK, Isaac Lab, tek/çift kamera, Rerun, ROS 2/RViz ve MuJoCo'yu
+tek akışta kurmak için ayrıntılı
+[yeni bilgisayar kurulum ve çalıştırma rehberini](docs/YENI_BILGISAYAR_KURULUM_VE_CALISTIRMA_TR.md)
+kullanın.
 
 Operatör kilidi, 4 saniyelik antropometrik kalibrasyon, pelvis-yerel
 koordinatlar, G1 `raw_q/safe_q`, Rerun telemetrisi ve safety durumları için
 [güvenli canlı taklit hattı](docs/ZED_G1_SAFE_MIMIC_PIPELINE_TR.md) belgesini
 izleyin.
+
+İki ZED 2i ile resmî Fusion BODY_38, güvenli tek-görünüm fallback'i ve
+tek/çift kamera deney metrikleri için
+[dual ZED Fusion rehberini](docs/DUAL_ZED_BODY38_FUSION_TR.md) izleyin. Dual
+yol ayrıdır; mevcut tek-kamera başlatıcısı değiştirilmemiştir.
 
 > Fiziksel robot güvenliği: Bu depo doğrudan gerçek G1 motor kontrolü için
 > hazır değildir. Varsayılan akış simülasyon ve üst gövde takibidir. Sim2real

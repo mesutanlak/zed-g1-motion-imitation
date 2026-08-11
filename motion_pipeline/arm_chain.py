@@ -448,6 +448,7 @@ class ArmChainOptimizer:
         self, *, timestamp_s: float, points_3d: np.ndarray, points_2d: np.ndarray,
         confidence: Sequence[float], index: Mapping[str, int], threshold: float,
         calibration: Mapping[str, object] | None,
+        multiview_evidence: Mapping[str, Mapping[str, object]] | None = None,
     ) -> ArmChainResult:
         output = np.asarray(points_3d, dtype=np.float64).copy()
         pixel = np.asarray(points_2d, dtype=np.float64)
@@ -485,6 +486,18 @@ class ArmChainOptimizer:
             front_depth_by_side[side] = self._front_depth_ambiguity(
                 output, pixel, index, side
             )
+            # In dual-camera mode a frontal camera may report torso overlap
+            # while the oblique camera still sees the complete arm.  Trust the
+            # official fused 3-D target in that case and reserve AKC for frames
+            # where every view is ambiguous. The default None preserves the
+            # proven single-camera behavior byte-for-byte.
+            evidence = (multiview_evidence or {}).get(side.lower(), {})
+            if (
+                int(evidence.get("reliable_clear_views", 0)) >= 1
+                and float(evidence.get("best_chain_confidence", 0.0)) >= threshold
+            ):
+                detected_overlap_by_side[side] = False
+                front_depth_by_side[side] = False
         bilateral_front = all(
             detected_overlap_by_side[side] or front_depth_by_side[side]
             for side in ("LEFT", "RIGHT")

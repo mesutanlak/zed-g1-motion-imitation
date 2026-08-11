@@ -873,9 +873,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path(
-            "/home/misafir/ros2_ws/src/unitree_mujoco/"
-            "unitree_robots/g1/scene_23dof.xml"
+        default=(
+            Path.home() / "ros2_ws" / "src" / "unitree_mujoco"
+            / "unitree_robots" / "g1" / "scene_23dof.xml"
         ),
     )
     parser.add_argument("--bind", default="0.0.0.0")
@@ -1007,8 +1007,9 @@ def main() -> int:
     )
     ros_bridge = None
     if args.ros_sensors:
-        bridge_directory = Path(
-            "/home/misafir/ros2_ws/src/unitree_mujoco/simulate_python"
+        bridge_directory = (
+            Path.home() / "ros2_ws" / "src" / "unitree_mujoco"
+            / "simulate_python"
         )
         sys.path.insert(0, str(bridge_directory))
         try:

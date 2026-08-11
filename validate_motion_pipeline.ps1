@@ -57,7 +57,11 @@ Write-Host "[4/4] Capture benchmark: $resolvedRecording"
 if ($LASTEXITCODE -ne 0) { throw "Capture benchmark failed." }
 
 if (-not $SkipGmrReplay) {
-    $gmrPython = "/home/misafir/g1_isaaclab_project/envs/gmr_zed/bin/python"
+    $wslHome = (& wsl.exe -d Ubuntu-22.04 -- bash -lc 'printf %s "$HOME"').Trim()
+    if (-not $wslHome.StartsWith("/")) {
+        throw "WSL home directory could not be resolved: $wslHome"
+    }
+    $gmrPython = "$wslHome/g1_isaaclab_project/envs/gmr_zed/bin/python"
     $wslProject = Convert-ToWslPath $project
     $wslRecording = Convert-ToWslPath $resolvedRecording
     & wsl.exe -d Ubuntu-22.04 -- bash -lc `

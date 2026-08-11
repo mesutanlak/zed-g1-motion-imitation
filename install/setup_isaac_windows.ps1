@@ -41,6 +41,8 @@ Sync-Repo "unitree_rl_lab" "https://github.com/unitreerobotics/unitree_rl_lab.gi
     "4960b84732b0c2ec593dccbfe963fda1bcd7b1e3"
 Sync-Repo "unitree_ros" "https://github.com/unitreerobotics/unitree_ros.git" `
     "ac7714828e1a4cc2a8ddd5c78a1305475b913a73"
+Sync-Repo "unitree_sim_isaaclab" "https://github.com/unitreerobotics/unitree_sim_isaaclab.git" `
+    "e30c25b1dffdf92ada1d6c8c1fe9a47bdde0fecc"
 
 $isaacLab = Join-Path $repos "IsaacLab"
 foreach ($package in @("isaaclab", "isaaclab_assets", "isaaclab_rl", "isaaclab_tasks")) {

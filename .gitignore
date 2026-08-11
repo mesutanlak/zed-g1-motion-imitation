@@ -6,6 +6,8 @@ __pycache__/
 .mypy_cache/
 .vscode/
 .idea/
+.codex_review_*/
+.codex_video_*/
 
 # Secrets and machine-local configuration
 .env
@@ -33,6 +35,10 @@ sim_mujoco/*.err
 *.core
 core.*
 cache/
+reports/
+tmp/
+*.mp4
+*.rrd
 
 # ZED SDK wheels are installed by the official SDK helper.
 kurulum/*.whl

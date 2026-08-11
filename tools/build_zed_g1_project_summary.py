@@ -9,7 +9,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 
-ROOT = Path(r"C:\Users\Misafir\Desktop\ZED_G1_Projesi")
+ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "ZED2i_G1_EDU_Proje_Ozeti.docx"
 
 BLUE = "2E74B5"

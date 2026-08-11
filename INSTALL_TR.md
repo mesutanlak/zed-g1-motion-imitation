@@ -1,5 +1,9 @@
 # Yeni bilgisayara eksiksiz kurulum
 
+> Dual ZED Fusion, port tablosu, sabit sürümler, GitHub klonlama ve ayrıntılı
+> sorun giderme dahil güncel ana belge:
+> [docs/YENI_BILGISAYAR_KURULUM_VE_CALISTIRMA_TR.md](docs/YENI_BILGISAYAR_KURULUM_VE_CALISTIRMA_TR.md)
+
 Bu belge ZED 2i BODY_38 verisini GMR ile G1 EDU 23-DOF referansına
 dönüştüren ve Isaac Lab/MuJoCo/RViz üzerinde gösteren projeyi Windows 11 +
 WSL2 Ubuntu 22.04 bilgisayara kurar.

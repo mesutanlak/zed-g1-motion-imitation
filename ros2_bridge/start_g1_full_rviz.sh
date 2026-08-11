@@ -7,7 +7,7 @@ set -u
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OFFICIAL_URDF="${G1_URDF:-/home/misafir/g1_isaaclab_project/repos/unitree_ros/robots/g1_description/g1_23dof.urdf}"
+OFFICIAL_URDF="${G1_URDF:-$HOME/g1_isaaclab_project/repos/unitree_ros/robots/g1_description/g1_23dof.urdf}"
 RUNTIME_DIR="/tmp/zed_g1_rviz_${USER}"
 RUNTIME_URDF="$RUNTIME_DIR/g1_23dof_absolute.urdf"
 HEADLESS="${G1_RVIZ_HEADLESS:-0}"

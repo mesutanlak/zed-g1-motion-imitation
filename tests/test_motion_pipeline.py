@@ -121,6 +121,34 @@ def test_arm_chain_recovers_torso_overlap() -> None:
     assert result.overlap["left"] and result.recovered["left"]
 
 
+def test_dual_clear_view_prevents_unnecessary_torso_recovery() -> None:
+    optimizer = ArmChainOptimizer(hold_s=0.3)
+    points = neutral_points()
+    pixel = np.asarray([
+        [320, 350], [320, 240], [250, 220], [390, 220],
+        [180, 270], [460, 270], [120, 320], [520, 320],
+        [270, 400], [370, 400], [270, 520], [370, 520],
+        [270, 650], [370, 650], [260, 660], [380, 660],
+    ], dtype=float)
+    confidence = np.full(len(NAMES), 100.0)
+    optimizer.update(
+        timestamp_s=0.0, points_3d=points, points_2d=pixel,
+        confidence=confidence, index=INDEX, threshold=40.0, calibration=None,
+    )
+    pixel[INDEX["LEFT_ELBOW"]] = [300, 300]
+    pixel[INDEX["LEFT_WRIST"]] = [330, 330]
+    result = optimizer.update(
+        timestamp_s=0.05, points_3d=points, points_2d=pixel,
+        confidence=confidence, index=INDEX, threshold=40.0, calibration=None,
+        multiview_evidence={
+            "left": {"reliable_clear_views": 1, "best_chain_confidence": 95.0},
+        },
+    )
+    assert not result.overlap["left"]
+    assert not result.recovered["left"]
+    assert np.allclose(result.points, points)
+
+
 def test_arm_chain_recovers_depth_overlap_missed_by_2d_and_holds_branch() -> None:
     """A frontal wrist can miss the image polygon but still overlap in Y-Z."""
     optimizer = ArmChainOptimizer(hold_s=0.3)
