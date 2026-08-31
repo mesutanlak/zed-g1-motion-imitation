@@ -60,6 +60,10 @@ def main() -> int:
     init.coordinate_units = sl.UNIT.METER
     init.output_performance_metrics = True
     init.verbose = True
+    # HD720@15 produces one source frame every ~66.7 ms.  Keep a larger
+    # receive window than the SDK default 50 ms so a normal network jitter
+    # does not make the receiver report "no new data".
+    init.timeout_period_number = 15
     status = fusion.init(init)
     if status != sl.FUSION_ERROR_CODE.SUCCESS:
         print(f"HATA: Fusion baslatilamadi: {status}", file=sys.stderr)

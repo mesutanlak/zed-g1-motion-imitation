@@ -198,7 +198,9 @@ def main() -> int:
         fusion_init.coordinate_units = sl.UNIT.METER
         fusion_init.output_performance_metrics = True
         fusion_init.verbose = True
-        fusion_init.timeout_period_number = 5
+        # HD720@15 source period is ~66.7 ms; 150 ms avoids dropping a valid
+        # network body packet merely because it misses the 50 ms SDK default.
+        fusion_init.timeout_period_number = 15
         fusion = sl.Fusion()
         status = fusion.init(fusion_init)
         if status != sl.FUSION_ERROR_CODE.SUCCESS:
