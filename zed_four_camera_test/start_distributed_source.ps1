@@ -11,7 +11,9 @@ param(
     [ValidateSet(15, 30, 60)]
     [int]$Fps = 15,
     [ValidateSet("neural-light", "neural", "performance")]
-    [string]$DepthMode = "performance"
+    [string]$DepthMode = "performance",
+    [ValidateSet("strict", "monitor", "off")]
+    [string]$FrameIntegrityMode = "strict"
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -27,6 +29,7 @@ if (-not (Test-Path -LiteralPath $python)) {
     --model $Model `
     --depth-mode $DepthMode `
     --headless `
+    --frame-integrity-mode $FrameIntegrityMode `
     --stream-host $TargetHost `
     --stream-port $TargetPort `
     --stream-max-hz $Fps

@@ -162,3 +162,10 @@ başlatma.
 - USB yırtılması, FPS düşüşü: önce yalnız sorunlu kamerayı doğrudan USB 3
   porta bağlayıp ZED Diagnostic ile doğrula. ZED360/UDP kodu bozuk görüntüyü
   düzeltemez.
+
+ZED Diagnostic temiz olduğu halde uygulamanın satır-süreksizliği tanısı yanlış
+pozitif verirse, yalnız ham kalibrasyon/fusion kabul testi için kaynak komutuna
+`-FrameIntegrityMode monitor` eklenebilir. Bu mod şüpheli kareleri UDP durum
+paketi olarak işaretler fakat BODY_38 testini kesmez. Bu modda G1'e `OutputHost`
+ile veri yönlendirmeyin; önce alıcıdaki dört-kamera ve kalibrasyon sonuçlarını
+doğrulayın.

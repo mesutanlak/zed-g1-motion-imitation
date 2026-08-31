@@ -1050,6 +1050,15 @@ def parse_args() -> argparse.Namespace:
             "baslatmak icin uygulamadan hata koduyla cik (varsayilan: 30)"
         ),
     )
+    parser.add_argument(
+        "--frame-integrity-mode",
+        choices=("strict", "monitor", "off"),
+        default="strict",
+        help=(
+            "USB kare butunlugu davranisi: strict bozuk kareyi atar ve kesintide "
+            "kapatir; monitor uyarilari kaydedip test akisini surdurur; off denetimi kapatir."
+        ),
+    )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--seconds",
@@ -1519,6 +1528,8 @@ def main() -> int:
             # that the SDK may reuse asynchronously.
             frame = np.array(left_image.get_data(), copy=True)
             torn, torn_boundaries, torn_peak = detect_torn_frame(frame)
+            if args.frame_integrity_mode == "off":
+                torn = False
             if torn:
                 corrupt_consecutive += 1
                 corrupt_total += 1
@@ -1527,7 +1538,11 @@ def main() -> int:
                     "schema": "zed_body38_live/status/v1",
                     "sequence": frame_index,
                     "timestamp_ns": time.time_ns(),
-                    "status": "CORRUPT_FRAME",
+                    "status": (
+                        "CORRUPT_FRAME"
+                        if args.frame_integrity_mode == "strict"
+                        else "SUSPECT_FRAME_PASSTHROUGH"
+                    ),
                     "strong_horizontal_boundaries": torn_boundaries,
                     "peak_row_delta": torn_peak,
                     "consecutive": corrupt_consecutive,
@@ -1542,51 +1557,61 @@ def main() -> int:
                             stream_socket.sendto(status_payload, stream_target)
                         except OSError:
                             pass
-                # Never display a torn UVC image and never use its BODY_38
-                # result.  Holding the last complete frame gives the operator
-                # a short, explicit freeze instead of visually mixing several
-                # points in time.  The downstream watchdog receives the status
-                # packet above and safely holds its last feasible command.
-                display_frame = (
-                    last_good_frame.copy()
-                    if last_good_frame is not None
-                    else frame.copy()
-                )
-                if display_frame.ndim == 3 and display_frame.shape[2] == 4:
-                    display_frame = cv2.cvtColor(
-                        display_frame, cv2.COLOR_BGRA2BGR
+                if args.frame_integrity_mode == "strict":
+                    # Never display a torn UVC image and never use its BODY_38
+                    # result.  Holding the last complete frame gives the operator
+                    # a short, explicit freeze instead of visually mixing several
+                    # points in time.  The downstream watchdog receives the status
+                    # packet above and safely holds its last feasible command.
+                    display_frame = (
+                        last_good_frame.copy()
+                        if last_good_frame is not None
+                        else frame.copy()
                     )
-                cv2.putText(
-                    display_frame,
-                    (
-                        "USB KARE ATLANDI - son saglam goruntu tutuluyor "
-                        f"({corrupt_consecutive}/{args.max_corrupt_consecutive})"
-                    ),
-                    (20, 45),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                if not args.headless:
-                    cv2.imshow(
-                        "ZED 2i BODY_38 - G1 Skeleton Extractor",
+                    if display_frame.ndim == 3 and display_frame.shape[2] == 4:
+                        display_frame = cv2.cvtColor(
+                            display_frame, cv2.COLOR_BGRA2BGR
+                        )
+                    cv2.putText(
                         display_frame,
+                        (
+                            "USB KARE ATLANDI - son saglam goruntu tutuluyor "
+                            f"({corrupt_consecutive}/{args.max_corrupt_consecutive})"
+                        ),
+                        (20, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        (0, 0, 255),
+                        2,
+                        cv2.LINE_AA,
                     )
-                if handle_control_key(poll_control_key()):
-                    break
-                if corrupt_consecutive >= args.max_corrupt_consecutive:
-                    camera_failed = True
+                    if not args.headless:
+                        cv2.imshow(
+                            "ZED 2i BODY_38 - G1 Skeleton Extractor",
+                            display_frame,
+                        )
+                    if handle_control_key(poll_control_key()):
+                        break
+                    if corrupt_consecutive >= args.max_corrupt_consecutive:
+                        camera_failed = True
+                        print(
+                            "HATA: Ardisik bozuk ZED USB kareleri algilandi; "
+                            "kamera guvenli yeniden baslatma icin kapatiliyor.",
+                            file=sys.stderr,
+                        )
+                        break
+                    frame_index += 1
+                    continue
+                if now - last_grab_warning >= 1.0:
                     print(
-                        "HATA: Ardisik bozuk ZED USB kareleri algilandi; "
-                        "kamera guvenli yeniden baslatma icin kapatiliyor.",
+                        "UYARI: USB kare tanisi supheli goruntu algiladi; "
+                        "monitor modunda BODY_38 testi devam ediyor "
+                        f"(sinir={torn_boundaries}, pik={torn_peak:.1f}).",
                         file=sys.stderr,
                     )
-                    break
-                frame_index += 1
-                continue
-            corrupt_consecutive = 0
+                    last_grab_warning = now
+            else:
+                corrupt_consecutive = 0
             retrieve_result = zed.retrieve_bodies(bodies, runtime)
             if retrieve_result != sl.ERROR_CODE.SUCCESS:
                 now = time.monotonic()
