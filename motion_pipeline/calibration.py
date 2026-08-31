@@ -76,6 +76,48 @@ def to_pelvis_local(points: np.ndarray, index: Mapping[str, int]) -> tuple[np.nd
     return local, origin, rotation
 
 
+def stabilize_pelvis_rotation(
+    previous: np.ndarray | None,
+    measured: np.ndarray,
+    *,
+    static_alpha: float = 0.25,
+    moving_alpha: float = 0.85,
+    moving_angle_deg: float = 15.0,
+) -> np.ndarray:
+    """Causally suppress BODY_38 pelvis-frame jitter on SO(3).
+
+    Hip/shoulder depth noise rotates an otherwise static pelvis frame several
+    degrees per image and makes both arms appear to move together.  Matrix
+    blending followed by polar projection keeps the result a proper rotation.
+    The blend becomes responsive as the measured rotation step grows, so a
+    genuine torso turn is not treated like static-camera noise.
+    """
+    current = np.asarray(measured, dtype=np.float64)
+    if current.shape != (3, 3) or not np.isfinite(current).all():
+        raise ValueError("invalid_pelvis_rotation")
+    if previous is None:
+        return current.copy()
+    prior = np.asarray(previous, dtype=np.float64)
+    if prior.shape != (3, 3) or not np.isfinite(prior).all():
+        return current.copy()
+    relative = prior.T @ current
+    angle_deg = float(np.degrees(np.arccos(np.clip(
+        (float(np.trace(relative)) - 1.0) * 0.5, -1.0, 1.0,
+    ))))
+    fraction = float(np.clip(angle_deg / max(float(moving_angle_deg), 1.0), 0.0, 1.0))
+    alpha = float(np.clip(
+        static_alpha + (moving_alpha - static_alpha) * fraction,
+        0.0, 1.0,
+    ))
+    blended = (1.0 - alpha) * prior + alpha * current
+    u, _, vt = np.linalg.svd(blended)
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vt
+    return rotation
+
+
 class CalibrationManager:
     """Collect robust neutral anthropometry over a fixed 3–5 second window."""
 

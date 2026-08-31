@@ -23,13 +23,20 @@ G1_23_LIMITS_RAD = np.asarray([
     [-3.0892, 2.6704], [-2.2515, 1.5882], [-2.618, 2.618], [-1.0472, 2.0944], [-1.97222, 1.97222],
 ], dtype=np.float64)
 
-# The official actuator model allows a small negative elbow angle, but that
-# is the non-human mirrored IK branch.  GMR already solves both elbows with a
-# non-negative lower bound; use the same boundary for the final safe command
-# so velocity/acceleration state cannot carry an otherwise-valid solution
-# through anatomical hyper-extension.
+# The official G1 elbow motor coordinate is offset from the human flexion
+# angle: maximum reach is near +1.383 rad, while ordinary deep flexion uses
+# negative motor values.  Preserve the official negative lower range.  Human
+# hyperextension is prevented by the upper (post-straight) boundary below.
 G1_23_ANATOMICAL_LIMITS_RAD = G1_23_LIMITS_RAD.copy()
-G1_23_ANATOMICAL_LIMITS_RAD[[16, 21], 0] = 0.0
+# In the official 23-DOF linkage, shoulder-to-hand reach peaks at an elbow
+# command of about 1.383 rad because the visual link origins are offset.  The
+# feasibility filter applies a 0.04 rad soft margin below this table, therefore
+# the table must include that margin.  The old 1.40 bound projected a correct
+# straight arm to 1.36 rad on every frame, marked both elbows saturated and
+# globally slowed the reference.  1.45 keeps the effective command boundary
+# at 1.41 rad while remaining far below the mechanical 2.0944 rad limit and
+# still excluding the non-human folded branch.
+G1_23_ANATOMICAL_LIMITS_RAD[[16, 21], 1] = 1.45
 
 # Conservative command-boundary limits, deliberately below model maxima.
 G1_23_VELOCITY_RAD_S = np.asarray([3.0] * 12 + [3.5] + [6.0, 6.0, 6.0, 7.0, 5.0] * 2)
@@ -150,7 +157,14 @@ class G1FeasibilityFilter:
             external.append("self_collision_proximity")
             if collision_margin_m < 0.0:
                 external.append("self_collision_risk")
-        if self_collision and not continuous_collision_available:
+        # MuJoCo contact is authoritative. A coarse report is allowed to
+        # localize an exact contact to one arm only when it actually reports a
+        # penetration; merely having capsule telemetry must not mask contact.
+        localized_self_collision = self_collision and any(
+            float(arm_margins.get(side, float("inf"))) < 0.0
+            for side in ("left", "right")
+        )
+        if self_collision:
             external.append("self_collision_risk")
         if stale:
             external.append("stale_packet")
@@ -164,7 +178,7 @@ class G1FeasibilityFilter:
             or gmr_residual > self.residual_severe
             or joint_count >= 4
             or bilateral_penetration
-            or (self_collision and not continuous_collision_available)
+            or (self_collision and not localized_self_collision)
         )
         arm_severe = any(
             float(arm_margins.get(side, float("inf"))) < -0.020

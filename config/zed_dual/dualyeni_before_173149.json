@@ -1,0 +1,46 @@
+{
+  "33773329": {
+    "FusionConfiguration": {
+      "communication_parameters": {
+        "CommunicationParameters": {
+          "communication_type": "INTRA PROCESS",
+          "ip_add": "",
+          "ip_port": 0
+        }
+      },
+      "input_type": {
+        "InputType": {
+          "input_type_conf": "33773329",
+          "input_type_conf_right": "0",
+          "input_type_input": "AUTO",
+          "input_virtual_serial_number": 0
+        }
+      },
+      "override_gravity": false,
+      "pose": "1.000000 0.000000 0.000000 0.000000 0.000000 1.000000 0.000000 -0.843288 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000",
+      "serial_number": 33773329
+    }
+  },
+  "39504762": {
+    "FusionConfiguration": {
+      "communication_parameters": {
+        "CommunicationParameters": {
+          "communication_type": "INTRA PROCESS",
+          "ip_add": "",
+          "ip_port": 0
+        }
+      },
+      "input_type": {
+        "InputType": {
+          "input_type_conf": "39504762",
+          "input_type_conf_right": "0",
+          "input_type_input": "AUTO",
+          "input_virtual_serial_number": 0
+        }
+      },
+      "override_gravity": false,
+      "pose": "0.849443 -0.010052 -0.527584 1.163647 0.015773 0.999855 0.006345 -0.822837 0.527444 -0.013711 0.849479 0.220758 0.000000 0.000000 0.000000 1.000000",
+      "serial_number": 39504762
+    }
+  }
+}

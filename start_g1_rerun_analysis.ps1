@@ -7,9 +7,9 @@ param(
     [int]$ListenPort = 15052,
     [int]$GmrListenPort = 15053,
     [ValidateRange(1, 60)]
-    [int]$LiveMaxHz = 15,
+    [int]$LiveMaxHz = 30,
     [ValidateRange(1, 60)]
-    [int]$GmrLogMaxHz = 15,
+    [int]$GmrLogMaxHz = 30,
     [switch]$NoViewer,
     [switch]$Headless,
     [switch]$NoRealtime

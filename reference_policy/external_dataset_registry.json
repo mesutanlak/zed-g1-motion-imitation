@@ -1,0 +1,48 @@
+{
+  "schema": "g1_external_motion_dataset_registry/v1",
+  "policy_target": "upper_body_ik_residual_teleoperation",
+  "download_automatically": false,
+  "required_output_contract": "g1_reference_motion_npz/v1 at 50 Hz",
+  "sources": [
+    {
+      "id": "amass",
+      "priority": 1,
+      "official_url": "https://amass.is.tue.mpg.de/",
+      "format": "SMPL body model parameters",
+      "use": "broad multi-subject upper-body motion and cross-operator validation",
+      "integration": "retarget SMPL to G1 23-DOF, then pass existing NPZ validation gates",
+      "license_note": "registration and source-dataset terms apply",
+      "status": "manual_download_required"
+    },
+    {
+      "id": "nvidia_protomotions",
+      "priority": 2,
+      "official_url": "https://github.com/NVlabs/ProtoMotions",
+      "format": "framework plus AMASS/robot retargeting tools",
+      "use": "reference implementation for G1-scale retargeting, multi-motion sampling and deployment parity",
+      "integration": "adapter_required; do not replace the live IK residual contract",
+      "license_note": "Apache-2.0 framework; motion dataset licenses remain separate",
+      "status": "reference_adapter_planned"
+    },
+    {
+      "id": "cmu_mocap",
+      "priority": 3,
+      "official_url": "https://mocap.cs.cmu.edu/",
+      "format": "ASF/AMC and linked BVH conversions",
+      "use": "free supplemental gestures, common behaviors and interaction motions",
+      "integration": "BVH/ASF to canonical skeleton, GMR retarget, then 50 Hz NPZ",
+      "license_note": "free for research/commercial use but source data may not be resold",
+      "status": "adapter_required"
+    },
+    {
+      "id": "lafan1",
+      "priority": 4,
+      "official_url": "https://github.com/ubisoft/ubisoft-laforge-animation-dataset",
+      "format": "BVH at 30 Hz",
+      "use": "motion-transition and delayed-reference stress testing",
+      "integration": "BVH retarget and resample to 50 Hz",
+      "license_note": "CC BY-NC-ND 4.0; research-only constraints must be reviewed",
+      "status": "optional_research_only"
+    }
+  ]
+}

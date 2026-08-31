@@ -6,7 +6,9 @@ from motion_pipeline.multiview import (
     arm_evidence,
     body_quality,
     choose_output,
+    closest_timestamp_samples,
     keypoint_agreement,
+    robust_rigid_alignment,
     torso_overlap_2d,
 )
 
@@ -40,6 +42,43 @@ def skeleton() -> np.ndarray:
     points[IDX["LEFT_WRIST"]] = [2.8, 0.25, 1.20]
     points[IDX["RIGHT_WRIST"]] = [2.8, -0.25, 1.20]
     return points
+
+
+def test_closest_timestamp_samples_avoids_one_frame_latest_pair() -> None:
+    histories = {
+        1: [(1_000_000_000, "cam1-old"), (1_033_000_000, "cam1-new")],
+        2: [(1_001_000_000, "cam2-old"), (1_067_000_000, "cam2-new")],
+    }
+    selected = closest_timestamp_samples(
+        histories, preferred_delta_ns=10_000_000,
+    )
+    assert selected[1] == (1_000_000_000, "cam1-old")
+    assert selected[2] == (1_001_000_000, "cam2-old")
+
+
+def test_closest_timestamp_samples_prefers_newest_good_pair() -> None:
+    histories = {
+        1: [(1_000_000_000, "old"), (2_000_000_000, "new")],
+        2: [(1_001_000_000, "old"), (2_004_000_000, "new")],
+    }
+    selected = closest_timestamp_samples(
+        histories, preferred_delta_ns=10_000_000,
+    )
+    assert selected[1][1] == "new"
+    assert selected[2][1] == "new"
+
+
+def test_closest_timestamp_samples_never_replays_old_reference() -> None:
+    histories = {
+        1: [(1_000_000_000, "old"), (1_033_000_000, "new")],
+        2: [(1_001_000_000, "old"), (1_067_000_000, "new")],
+    }
+    selected = closest_timestamp_samples(
+        histories,
+        preferred_delta_ns=10_000_000,
+        after_timestamp_ns=1_001_000_000,
+    )
+    assert max(sample[0] for sample in selected.values()) > 1_001_000_000
 
 
 def test_fusion_preferred_and_fallback_rejects_identity_jump() -> None:
@@ -97,3 +136,23 @@ def test_torso_overlap_is_computed_per_camera_pixels() -> None:
     pixels[IDX["LEFT_ELBOW"]] = [500, 300]
     pixels[IDX["LEFT_WRIST"]] = [550, 350]
     assert not torso_overlap_2d(pixels, IDX, "LEFT")
+
+
+def test_robust_rigid_alignment_rejects_one_bad_joint() -> None:
+    rng = np.random.default_rng(4)
+    source = rng.normal(size=(40, 3))
+    angle = np.deg2rad(17.0)
+    rotation = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    translation = np.array([0.7, -0.2, 0.8])
+    target = source @ rotation.T + translation
+    target[3] += 2.0
+    result = robust_rigid_alignment(source, target)
+    assert result is not None
+    fitted_rotation, fitted_translation, metrics = result
+    assert np.allclose(fitted_rotation, rotation, atol=1e-8)
+    assert np.allclose(fitted_translation, translation, atol=1e-8)
+    assert 12 <= metrics["paired_keypoints"] < 40

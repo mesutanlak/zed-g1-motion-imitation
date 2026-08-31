@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from body38_to_gmr import Body38ToGMR, GMR_BODY38_MAP
 from g1_dof_projection import (
     AnatomicalElbowRegularizer,
+    SimpleArmPositionIK,
     G1_23DOF_ORDER,
     constrain_gmr_to_23dof,
     named_joint_values,
@@ -39,7 +40,10 @@ from motion_pipeline.safety import (
     SafetyLevel,
 )
 from motion_pipeline.metrics import PacketMetrics
-from motion_pipeline.collision_geometry import upper_body_capsule_report
+from motion_pipeline.collision_geometry import (
+    project_configuration_along_safe_path,
+    upper_body_capsule_report,
+)
 from motion_pipeline.mirror_rescue import (
     KinematicEvaluation,
     MirrorContinuationRescue,
@@ -206,10 +210,12 @@ class RelativeHandRoll:
     def __init__(
         self,
         calibration_frames: int = 12,
-        max_speed_rad_s: float = 4.5,
+        max_speed_rad_s: float = 2.4,
         nominal_fps: float = 60.0,
         invalid_hold_s: float = 0.25,
         neutral_return_tau_s: float = 0.80,
+        smoothing_tau_s: float = 0.10,
+        tracking_deadband_rad: float = 0.045,
     ) -> None:
         self.calibration_frames = calibration_frames
         self.max_speed_rad_s = float(max_speed_rad_s)
@@ -222,6 +228,8 @@ class RelativeHandRoll:
         self.invalid_elapsed_s: dict[str, float] = {"left": 0.0, "right": 0.0}
         self.invalid_hold_s = float(max(0.0, invalid_hold_s))
         self.neutral_return_tau_s = float(max(0.05, neutral_return_tau_s))
+        self.smoothing_tau_s = float(max(0.01, smoothing_tau_s))
+        self.tracking_deadband_rad = float(max(0.0, tracking_deadband_rad))
         self.quality: dict[str, str] = {"left": "CALIBRATING", "right": "CALIBRATING"}
 
     def reset(self) -> None:
@@ -292,7 +300,7 @@ class RelativeHandRoll:
                 f"{prefix}_HAND_PINKY_1",
             )
             try:
-                if min(float(confidence[lookup[name]]) for name in observed) < 35.0:
+                if min(float(confidence[lookup[name]]) for name in observed) < 45.0:
                     return None
             except (TypeError, ValueError, IndexError):
                 return None
@@ -317,7 +325,7 @@ class RelativeHandRoll:
         axis /= axis_norm
         reference = shoulder_axis - axis * float(np.dot(shoulder_axis, axis))
         lateral = hand_lateral - axis * float(np.dot(hand_lateral, axis))
-        if np.linalg.norm(reference) < 0.03 or np.linalg.norm(lateral) < 0.01:
+        if np.linalg.norm(reference) < 0.03 or np.linalg.norm(lateral) < 0.015:
             return None
         reference /= np.linalg.norm(reference)
         lateral /= np.linalg.norm(lateral)
@@ -379,13 +387,22 @@ class RelativeHandRoll:
             # Direct clipping of [-pi, pi] caused +1.75 -> -1.75 jumps when a
             # hand crossed the wrap boundary, visually flipping the G1 hand.
             previous_unwrapped = self.unwrapped.get(side, wrapped)
-            candidate = previous_unwrapped + float(
+            raw_candidate = previous_unwrapped + float(
                 np.arctan2(
                     np.sin(wrapped - previous_unwrapped),
                     np.cos(wrapped - previous_unwrapped),
                 )
             )
-
+            error = raw_candidate - previous_unwrapped
+            if abs(error) <= self.tracking_deadband_rad:
+                candidate = previous_unwrapped
+            else:
+                # Remove the sensor-noise deadband and low-pass the remaining
+                # circular error. BODY_38 finger points are much noisier than
+                # elbow/wrist positions and must not rotate a stationary hand.
+                error -= np.copysign(self.tracking_deadband_rad, error)
+                alpha = 1.0 - np.exp(-dt / self.smoothing_tau_s)
+                candidate = previous_unwrapped + alpha * error
             max_step = self.max_speed_rad_s * dt
             candidate = previous_unwrapped + float(
                 np.clip(candidate - previous_unwrapped, -max_step, max_step)
@@ -503,26 +520,6 @@ def close_kinematic_relatives(
     return False
 
 
-def benign_upper_body_mimic_contact(model: mujoco.MjModel, first: int, second: int) -> bool:
-    """Allow a hand to rest on the torso/pelvis/hips without freezing mimicry.
-
-    These are common intentional human poses (hands on hips or abdomen). The
-    previous binary contact gate classified every such target as severe and
-    held the last reliable pose. Elbow/torso, hand/hand and all other contacts
-    remain safety events.
-    """
-    names = {
-        str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, first)),
-        str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, second)),
-    }
-    has_hand = any("wrist_roll_rubber_hand" in name for name in names)
-    has_rest_surface = any(
-        name == "pelvis" or name == "torso_link" or "hip_" in name
-        for name in names
-    )
-    return has_hand and has_rest_surface
-
-
 def forward_g1_skeleton(
     model: mujoco.MjModel,
     base_qpos: np.ndarray,
@@ -549,7 +546,6 @@ def forward_g1_skeleton(
             and second > 0
             and first != second
             and not close_kinematic_relatives(model, first, second)
-            and not benign_upper_body_mimic_contact(model, first, second)
         ):
             self_contacts += 1
     return positions, self_contacts
@@ -657,6 +653,12 @@ def main() -> int:
         cost=max(0.0, args.elbow_posture_cost),
         nominal_fps=args.input_fps,
     )
+    # Live upper-body imitation uses one causal solve against reachable G1
+    # elbow/wrist targets reconstructed from BODY_38 limb directions.  The
+    # legacy multi-candidate refiner remains available to offline A/B tools.
+    arm_ik_refiner = SimpleArmPositionIK(
+        gmr, anchor_fixed_base=args.mode == "upper_body"
+    )
     order_29 = actuator_joint_names(gmr.model)
     fixed_lower_targets = (
         "left_hip",
@@ -717,7 +719,11 @@ def main() -> int:
         orange_return_tau_s=0.80,
     )
     mirror_rescue = MirrorContinuationRescue(
-        enabled=args.mirror_rescue,
+        # The event-driven mirrored branch competed with the deterministic
+        # arm solve on 97% of this recording and made forearm tracking worse.
+        # Keep it available for whole-body experiments, never in the clean
+        # upper-body command path.
+        enabled=args.mirror_rescue and args.mode != "upper_body",
         workers=max(1, args.mirror_workers),
         # The measured project baseline has useful upper-body solutions below
         # roughly 12 cm. Rescue is therefore reserved for the tail, not every
@@ -756,6 +762,7 @@ def main() -> int:
         hand_roll.reset()
         gmr.configuration.update(neutral_gmr_qpos.copy())
         elbow_regularizer.reset(neutral_gmr_qpos)
+        arm_ik_refiner.reset(neutral_gmr_qpos)
         last_update = time.monotonic()
         status_packet = {
             "schema": "zed_gmr_g1_23dof_live/status/v1",
@@ -820,13 +827,10 @@ def main() -> int:
                 continue
             stale_watchdog_active = False
             trace_in = frame.get("latency_trace_ns") or {}
+            # Do not subtract Windows and WSL wall clocks directly. Their
+            # epoch offset can jump after suspend/resume and produced false
+            # 150-400 ms "network" latency on this same-host UDP path.
             windows_to_wsl_ms = None
-            if trace_in.get("t2_windows_udp_send_ns"):
-                windows_to_wsl_ms = max(
-                    0.0,
-                    (receive_timestamp_ns - int(trace_in["t2_windows_udp_send_ns"]))
-                    / 1e6,
-                )
             packet_metrics.observe(
                 int(frame.get("sequence", accepted)),
                 receive_timestamp_ns,
@@ -894,6 +898,8 @@ def main() -> int:
                 offset_to_ground=True,
                 extra_tasks=(elbow_regularizer.task,),
             )
+            qpos = arm_ik_refiner.update(qpos, adapted.human_data)
+            gmr.configuration.update(qpos)
             last_ik_error = float(gmr.error1())
             position_errors = [
                 float(np.linalg.norm(task.compute_error(gmr.configuration)[:3]))
@@ -1017,6 +1023,44 @@ def main() -> int:
                     0.92 if akc_recovered.get(side) and confidence >= 0.50
                     else 0.72
                 )
+            # Multi-view confidence is segment-local. A weak wrist no longer
+            # disables the complete BODY_38 frame: only the corresponding arm
+            # task is softened while its upper/forearm direction remains live.
+            segment_quality = (frame.get("human_state") or {}).get(
+                "segment_quality", {}
+            )
+            retargeting_policy = (frame.get("human_state") or {}).get(
+                "retargeting_policy", {}
+            )
+            low_quality_blend = float(
+                retargeting_policy.get("low_quality_arm_blend", 0.55)
+            )
+            full_quality_blend = float(
+                retargeting_policy.get("full_quality_arm_blend", 1.0)
+            )
+            minimum_segment_quality = float(
+                retargeting_policy.get("minimum_segment_quality", 0.25)
+            )
+            for side in ("left", "right"):
+                value = segment_quality.get(f"{side}_arm", 1.0)
+                value = (
+                    float(value)
+                    if isinstance(value, (int, float)) and np.isfinite(value)
+                    else 0.0
+                )
+                confidence_blend = float(np.clip(
+                    low_quality_blend
+                    + (full_quality_blend - low_quality_blend) * value,
+                    min(low_quality_blend, full_quality_blend),
+                    max(low_quality_blend, full_quality_blend),
+                ))
+                arm_quality_blend[side] = min(
+                    arm_quality_blend.get(side, 1.0), confidence_blend
+                )
+                if value < minimum_segment_quality:
+                    arm_perception_reasons[side].append(
+                        f"low_{side}_arm_fusion_confidence"
+                    )
             bilateral_continuity_blend = 1.0
             bilateral_confidence = 0.0
             if bilateral_front and feasibility.safe_q is not None:
@@ -1075,6 +1119,11 @@ def main() -> int:
                     upper_relative_residual_m,
                     0.85 * feasibility.residual_warn,
                 )
+            previous_safe_command = (
+                feasibility.safe_q.copy()
+                if feasibility.safe_q is not None
+                else feasibility.nominal.copy()
+            )
             feasibility_result = feasibility.update(
                 filtered,
                 dt,
@@ -1092,6 +1141,35 @@ def main() -> int:
                 arm_quality_blend=arm_quality_blend,
             )
             safe = feasibility_result.safe_q
+
+            def evaluate_body_barrier(joint_position):
+                skeleton, contacts = forward_g1_skeleton(
+                    gmr.model, qpos, joint_position
+                )
+                return upper_body_capsule_report(skeleton), contacts
+
+            barrier_projection = project_configuration_along_safe_path(
+                previous_safe_command,
+                safe,
+                evaluate_body_barrier,
+                # The official neutral hand/hip arrangement sits almost on
+                # the conservative capsule shell.  Require non-penetration at
+                # the final projection; the upstream governor already starts
+                # fading commands inside the 5 mm warning band.
+                clearance_m=0.0,
+            )
+            safe = barrier_projection.joint_position
+            safety_reasons = list(feasibility_result.reasons)
+            safety_level = SafetyLevel(feasibility_result.level)
+            if barrier_projection.applied:
+                safety_reasons.append("robot_body_barrier_projection")
+                safety_level = max(safety_level, SafetyLevel.YELLOW)
+                # Keep the rate governor's state identical to the command that
+                # actually leaves the bridge; otherwise hidden velocity can
+                # push through the barrier on the following frame.
+                feasibility.safe_q = safe.copy()
+                feasibility.velocity = (safe - previous_safe_command) / dt
+                feasibility.last_reliable = safe.copy()
             saturation_low = G1_23_LIMITS_RAD[:, 0] + feasibility.margin
             saturation_high = G1_23_LIMITS_RAD[:, 1] - feasibility.margin
             saturation_names = [
@@ -1109,10 +1187,22 @@ def main() -> int:
             control_session_active = True
             last_solve_ms = (time.perf_counter() - solve_started) * 1000.0
             source_timestamp_ns = int(frame.get("timestamp_ns", 0))
-            last_source_age_ms = (
-                max(0.0, (time.time_ns() - source_timestamp_ns) / 1e6)
-                if source_timestamp_ns > 0
-                else 0.0
+            trace_in = frame.get("latency_trace_ns") or {}
+            try:
+                capture_to_windows_send_ms = max(
+                    0.0,
+                    (
+                        int(trace_in["t2_windows_udp_send_ns"])
+                        - int(trace_in["t0_capture_ns"])
+                    )
+                    / 1e6,
+                )
+            except (KeyError, TypeError, ValueError):
+                capture_to_windows_send_ms = 0.0
+            # Both terms below are measured inside one clock domain. Their sum
+            # is a stable source-age estimate without assuming clock alignment.
+            last_source_age_ms = capture_to_windows_send_ms + max(
+                0.0, (time.time_ns() - receive_timestamp_ns) / 1e6
             )
             accepted_times.append(now)
             while accepted_times and now - accepted_times[0] > 1.0:
@@ -1140,6 +1230,13 @@ def main() -> int:
                 "safe_joint_position_rad": safe.tolist(),
                 "bilateral_front_continuity_blend": bilateral_continuity_blend,
                 "body_confidence": float(frame.get("body_confidence", 0.0)),
+                "source_multi_camera": frame.get("multi_camera"),
+                "source_perception_metrics": frame.get("perception_metrics"),
+                "source_occlusion_analysis": frame.get("occlusion_analysis"),
+                "source_human_state": frame.get("human_state"),
+                "source_control_mode_request": frame.get(
+                    "control_mode_request"
+                ),
                 "valid_targets": adapted.valid_targets,
                 "memory_targets": adapted.used_memory_targets,
                 "raw_fallback_targets": adapted.raw_fallback_targets,
@@ -1147,8 +1244,8 @@ def main() -> int:
                 "pelvis_height_m": adapted.pelvis_height_m,
                 "physical_robot_output": False,
                 "safety": {
-                    "level": SafetyLevel(feasibility_result.level).name,
-                    "reasons": list(feasibility_result.reasons),
+                    "level": safety_level.name,
+                    "reasons": list(dict.fromkeys(safety_reasons)),
                     "blend": feasibility_result.blend,
                     "joint_limit_saturation": feasibility_result.joint_limit_saturation_count,
                     "joint_limit_saturation_names": saturation_names,
@@ -1158,6 +1255,15 @@ def main() -> int:
                     "operator_calibrated": adapted.operator_calibrated,
                     "raw_self_collision_count": raw_self_collisions,
                     "safe_self_collision_count": safe_self_collisions,
+                    "robot_body_barrier_projection_applied": bool(
+                        barrier_projection.applied
+                    ),
+                    "robot_body_barrier_projection_alpha": float(
+                        barrier_projection.alpha
+                    ),
+                    "robot_body_barrier_safe_margin_m": float(
+                        barrier_projection.minimum_margin_m
+                    ),
                     "minimum_collision_margin_m": raw_collision_report.minimum_margin_m,
                     "arm_collision_margin_m": raw_collision_report.arm_minimum_margin_m,
                     "collision_risk_pairs": list(raw_collision_report.risk_pairs),
@@ -1202,6 +1308,30 @@ def main() -> int:
                     ),
                     "right_elbow_regularizer_target_rad": (
                         elbow_regularizer.last_target_rad.get("right")
+                    ),
+                    "left_direct_arm_ik_rms_m": arm_ik_refiner.last_error_m["left"],
+                    "right_direct_arm_ik_rms_m": arm_ik_refiner.last_error_m["right"],
+                    "left_gmr_arm_rms_m": arm_ik_refiner.last_gmr_error_m["left"],
+                    "right_gmr_arm_rms_m": arm_ik_refiner.last_gmr_error_m["right"],
+                    "left_arm_baseline_preserved": arm_ik_refiner.last_used_baseline["left"],
+                    "right_arm_baseline_preserved": arm_ik_refiner.last_used_baseline["right"],
+                    "left_direct_ik_selected_source": arm_ik_refiner.last_selected_source["left"],
+                    "right_direct_ik_selected_source": arm_ik_refiner.last_selected_source["right"],
+                    "left_direct_ik_objective_m": arm_ik_refiner.last_candidate_objective_m["left"],
+                    "right_direct_ik_objective_m": arm_ik_refiner.last_candidate_objective_m["right"],
+                    "left_direct_ik_direction_error_deg": arm_ik_refiner.last_direction_error_deg["left"],
+                    "right_direct_ik_direction_error_deg": arm_ik_refiner.last_direction_error_deg["right"],
+                    "left_straight_arm_blend": (
+                        arm_ik_refiner.last_straightness_blend["left"]
+                    ),
+                    "right_straight_arm_blend": (
+                        arm_ik_refiner.last_straightness_blend["right"]
+                    ),
+                    "left_direct_ik_candidate_count": (
+                        arm_ik_refiner.last_candidate_count["left"]
+                    ),
+                    "right_direct_ik_candidate_count": (
+                        arm_ik_refiner.last_candidate_count["right"]
                     ),
                     "left_arm_pole_source": adapter.last_arm_pole_source["left"],
                     "right_arm_pole_source": adapter.last_arm_pole_source["right"],

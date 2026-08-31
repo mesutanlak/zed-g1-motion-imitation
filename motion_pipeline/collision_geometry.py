@@ -8,9 +8,19 @@ signal suitable for a reference governor and an event-triggered rescue path.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
+
+
+# These values are shared by deterministic IK safety and policy residual
+# safety.  The torso radius intentionally includes a small shell around the
+# visual mesh: a live command must stop before a physical forearm/hand reaches
+# the trunk, not after MuJoCo has already reported penetration.
+G1_TORSO_CAPSULE_RADIUS_M = 0.110
+G1_UPPER_ARM_CAPSULE_RADIUS_M = 0.038
+G1_FOREARM_CAPSULE_RADIUS_M = 0.038
+G1_HAND_CAPSULE_RADIUS_M = 0.045
 
 
 @dataclass(frozen=True)
@@ -24,8 +34,8 @@ class Capsule:
 @dataclass(frozen=True)
 class CollisionDistanceReport:
     # Hard pairs are allowed to govern the command.  Soft pairs are still
-    # measured and logged, but represent intentional manipulation contact
-    # such as a hand/forearm crossing the front of the torso.
+    # measured and logged, but are reserved for links that are physically
+    # attached and therefore overlap in the coarse capsule approximation.
     minimum_margin_m: float
     pair_margins_m: dict[str, float]
     arm_minimum_margin_m: dict[str, float]
@@ -33,6 +43,15 @@ class CollisionDistanceReport:
     soft_pair_margins_m: dict[str, float] = field(default_factory=dict)
     soft_risk_pairs: tuple[str, ...] = ()
     hard_pair_margins_m: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ConfigurationBarrierProjection:
+    joint_position: np.ndarray
+    alpha: float
+    applied: bool
+    minimum_margin_m: float
+    self_contact_count: int
 
 
 def _point(value: Sequence[float]) -> np.ndarray:
@@ -92,6 +111,83 @@ def capsule_margin(first: Capsule, second: Capsule) -> float:
     ) - first.radius - second.radius
 
 
+def project_configuration_along_safe_path(
+    previous_safe: Sequence[float],
+    candidate: Sequence[float],
+    evaluator: Callable[[np.ndarray], tuple[CollisionDistanceReport, int]],
+    *,
+    clearance_m: float = 0.005,
+    coarse_steps: int = 12,
+    bisection_steps: int = 10,
+) -> ConfigurationBarrierProjection:
+    """Keep the largest collision-free prefix of a joint-space command path.
+
+    The ordinary feasibility governor predicts collision from the final IK
+    target.  This last boundary also evaluates the actual command produced
+    after rate/acceleration limiting.  Scanning outward from the prior safe
+    pose avoids jumping across a narrow colliding interval.
+    """
+
+    previous = np.asarray(previous_safe, dtype=np.float64)
+    proposed = np.asarray(candidate, dtype=np.float64)
+    if previous.shape != proposed.shape or previous.ndim != 1:
+        raise ValueError("robot body projection expects matching 1-D joint arrays")
+
+    def evaluate(alpha: float):
+        q = previous + float(alpha) * (proposed - previous)
+        report, contacts = evaluator(q)
+        safe = int(contacts) == 0 and float(report.minimum_margin_m) >= float(clearance_m)
+        return q, report, int(contacts), safe
+
+    q_candidate, report_candidate, contacts_candidate, candidate_safe = evaluate(1.0)
+    if candidate_safe:
+        return ConfigurationBarrierProjection(
+            q_candidate,
+            1.0,
+            False,
+            float(report_candidate.minimum_margin_m),
+            contacts_candidate,
+        )
+
+    q_previous, report_previous, contacts_previous, previous_is_safe = evaluate(0.0)
+    if not previous_is_safe:
+        # Fail closed. The caller should provide its known nominal command as
+        # previous_safe when its last command is no longer valid.
+        return ConfigurationBarrierProjection(
+            q_previous,
+            0.0,
+            True,
+            float(report_previous.minimum_margin_m),
+            contacts_previous,
+        )
+
+    low = 0.0
+    low_q, low_report, low_contacts = q_previous, report_previous, contacts_previous
+    high = 1.0
+    for index in range(1, max(2, int(coarse_steps)) + 1):
+        alpha = index / max(2, int(coarse_steps))
+        q, report, contacts, safe = evaluate(alpha)
+        if safe:
+            low, low_q, low_report, low_contacts = alpha, q, report, contacts
+            continue
+        high = alpha
+        break
+    for _ in range(max(0, int(bisection_steps))):
+        middle = 0.5 * (low + high)
+        q, report, contacts, safe = evaluate(middle)
+        if safe:
+            low, low_q, low_report, low_contacts = middle, q, report, contacts
+        else:
+            high = middle
+    return ConfigurationBarrierProjection(
+        low_q,
+        float(low),
+        True,
+        float(low_report.minimum_margin_m),
+        int(low_contacts),
+    )
+
+
 def _trim_start(start: np.ndarray, end: np.ndarray, fraction: float) -> np.ndarray:
     return start + float(fraction) * (end - start)
 
@@ -104,9 +200,9 @@ def upper_body_capsule_report(
     """Approximate relevant G1 upper-body separation with smooth capsules.
 
     Proximal upper-arm sections are trimmed because the shoulder joint is
-    intentionally attached to the torso.  Hands touching the abdomen are not
-    treated as an immediate hard stop; the continuous margin lets the caller
-    slow/project the target instead of freezing the whole robot.
+    intentionally attached to the torso.  Forearms and hands are hard pairs:
+    a human hand-on-chest target may be valid for the operator, but the G1
+    command must remain outside the robot's trunk collision envelope.
     """
     required = (
         "pelvis",
@@ -125,7 +221,7 @@ def upper_body_capsule_report(
     torso = Capsule(
         xyz["pelvis"] + 0.10 * torso_axis,
         xyz["torso_link"] + np.array([0.0, 0.0, 0.08]),
-        0.085,
+        G1_TORSO_CAPSULE_RADIUS_M,
     )
     head_center = xyz["torso_link"] + np.array([0.0, 0.0, 0.285])
     head = Capsule(head_center, head_center, 0.105)
@@ -142,27 +238,33 @@ def upper_body_capsule_report(
             else wrist
         )
         capsules[f"{side}_upper"] = Capsule(
-            _trim_start(shoulder, elbow, 0.32), elbow, 0.038, side
+            _trim_start(shoulder, elbow, 0.32),
+            elbow,
+            G1_UPPER_ARM_CAPSULE_RADIUS_M,
+            side,
         )
-        capsules[f"{side}_fore"] = Capsule(elbow, wrist, 0.038, side)
-        capsules[f"{side}_hand"] = Capsule(wrist, hand_end, 0.045, side)
+        capsules[f"{side}_fore"] = Capsule(
+            elbow, wrist, G1_FOREARM_CAPSULE_RADIUS_M, side
+        )
+        capsules[f"{side}_hand"] = Capsule(
+            wrist, hand_end, G1_HAND_CAPSULE_RADIUS_M, side
+        )
 
-    # A forearm or hand in front of the chest is a common, valid imitation
-    # target.  Capsule overlap there is not equivalent to an inter-arm or
-    # hand/head collision, especially because the simplified torso capsule
-    # does not model the chest surface accurately.  Keep those distances as
-    # soft telemetry rather than letting them freeze the deterministic IK.
+    # Only the proximal upper arm is soft because it is attached beside the
+    # torso and the coarse capsules overlap in ordinary poses.  A forearm or
+    # hand penetrating the torso is never an intentional robot configuration.
     pairs = (
-        # The 12 mm mounting allowance compensates only for the simplified
-        # capsule near the physical shoulder attachment. Deep penetration is
-        # still a hard event.
-        ("left_upper", "torso", False, 0.012),
-        ("left_fore", "torso", True, 0.0),
-        ("left_hand", "torso", True, 0.0),
+        # The upper arm is physically attached beside the torso, so the two
+        # coarse capsules overlap in ordinary arms-down and chest-reaching
+        # poses. Treat this approximation as measured telemetry; inter-arm
+        # and hand/head contacts below remain hard safety events.
+        ("left_upper", "torso", True, 0.0),
+        ("left_fore", "torso", False, 0.0),
+        ("left_hand", "torso", False, 0.0),
         ("left_hand", "head", False, 0.0),
-        ("right_upper", "torso", False, 0.012),
-        ("right_fore", "torso", True, 0.0),
-        ("right_hand", "torso", True, 0.0),
+        ("right_upper", "torso", True, 0.0),
+        ("right_fore", "torso", False, 0.0),
+        ("right_hand", "torso", False, 0.0),
         ("right_hand", "head", False, 0.0),
         ("left_upper", "right_upper", False, 0.0),
         ("left_upper", "right_fore", False, 0.0),

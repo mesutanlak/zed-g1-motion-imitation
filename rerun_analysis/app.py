@@ -49,11 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmr-listen-host", default="0.0.0.0")
     parser.add_argument("--gmr-listen-port", type=int, default=15053)
     parser.add_argument(
-        "--live-max-hz", type=float, default=15.0,
+        "--live-max-hz", type=float, default=30.0,
         help="Canli BODY_38 analiz/render hizi; kontrol akisini etkilemez",
     )
     parser.add_argument(
-        "--gmr-log-max-hz", type=float, default=15.0,
+        "--gmr-log-max-hz", type=float, default=30.0,
         help="Her GMR telemetri semasi icin azami kayit hizi",
     )
     parser.add_argument(
@@ -376,9 +376,45 @@ class RerunSkeletonApp:
                 ik_position_max_m=float(bridge.get("ik_position_max_m", 0.0)),
             ),
         )
-        for name, value in {**latency, **isaac}.items():
+        for name, value in {
+            **latency,
+            **isaac,
+            **(packet.get("system_metrics") or {}),
+        }.items():
             if isinstance(value, (int, float)) and np.isfinite(value):
                 rr.log(f"/world/metrics/system/{name}", rr.Scalars(float(value)))
+        reference_motion = packet.get("reference_motion") or {}
+        reference_names = reference_motion.get("joint_names") or []
+        for metric_name, field_name in (
+            ("reference_q", "position_rad"),
+            ("reference_qd", "velocity_rad_s"),
+            ("reference_qdd", "acceleration_rad_s2"),
+        ):
+            for name, value in zip(reference_names, reference_motion.get(field_name) or []):
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    rr.log(
+                        f"/world/metrics/{metric_name}/{name}",
+                        rr.Scalars(float(value)),
+                    )
+        reference_confidence = reference_motion.get("confidence")
+        if isinstance(reference_confidence, (int, float)) and np.isfinite(
+            reference_confidence
+        ):
+            rr.log(
+                "/world/metrics/reference/confidence",
+                rr.Scalars(float(reference_confidence)),
+            )
+        for name in (
+            "solve_ms", "source_age_ms", "ik_position_mean_m",
+            "ik_position_max_m", "ik_upper_relative_residual_m",
+            "left_direct_arm_ik_rms_m", "right_direct_arm_ik_rms_m",
+            "left_straight_arm_blend", "right_straight_arm_blend",
+            "left_direct_ik_candidate_count",
+            "right_direct_ik_candidate_count", "mirror_rescue_solve_ms",
+        ):
+            value = bridge.get(name)
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                rr.log(f"/world/metrics/gmr/{name}", rr.Scalars(float(value)))
         writer = getattr(self, "writer", None)
         if writer is not None:
             writer.write_imitation(packet)
@@ -447,6 +483,10 @@ class RerunSkeletonApp:
         errors = derived.get("raw_filter_error_m", {})
         angles = derived.get("joint_angles_deg", {})
         angle_velocity = derived.get("joint_angle_velocity_deg_s", {})
+        human_state = source.get("human_state") or {}
+        fusion_joint_quality = human_state.get("joint_quality") or {}
+        fusion_joint_source = human_state.get("joint_source") or {}
+        fusion_joint_state = human_state.get("joint_state") or {}
 
         strips = [
             [points[first], points[second]]
@@ -458,8 +498,36 @@ class RerunSkeletonApp:
                 "/world/skeleton/bones",
                 rr.LineStrips3D(strips, radii=0.009, colors=[70, 190, 255]),
             )
+            rr.log(
+                "/fusion/body38_constrained",
+                rr.LineStrips3D(strips, radii=0.010, colors=[70, 230, 130]),
+            )
         else:
             rr.log("/world/skeleton/bones", rr.Clear(recursive=False))
+            rr.log("/fusion/body38_constrained", rr.Clear(recursive=False))
+
+        # The analysis-only UDP copy carries calibrated raw camera skeletons;
+        # the WSL/GMR control packet remains compact to avoid fragmentation.
+        camera_views = (source.get("multi_camera") or {}).get("per_camera") or []
+        for camera_index, view in enumerate(camera_views[:2], start=1):
+            raw_view = view.get("keypoints_3d_fusion_m") or []
+            camera_points = {
+                name: point
+                for index, name in enumerate(names)
+                if index < len(raw_view)
+                and (point := finite_point(raw_view[index])) is not None
+            }
+            camera_strips = [
+                [camera_points[first], camera_points[second]]
+                for first, second in EDGES
+                if first in camera_points and second in camera_points
+            ]
+            entity = f"/cam{camera_index}/body38"
+            if camera_strips:
+                color = [255, 180, 50] if camera_index == 1 else [180, 90, 255]
+                rr.log(entity, rr.LineStrips3D(camera_strips, radii=0.006, colors=color))
+            else:
+                rr.log(entity, rr.Clear(recursive=False))
 
         # A BODY_38 packet can temporarily omit a joint name altogether. Clear
         # any entity that existed in the previous packet but is absent now.
@@ -520,6 +588,9 @@ class RerunSkeletonApp:
             values = {
                 "joint_name": name,
                 "tracking_source": state,
+                "fusion_source": str(fusion_joint_source.get(name, "unknown")),
+                "fusion_state": str(fusion_joint_state.get(name, "unknown")),
+                "fusion_quality": fusion_joint_quality.get(name),
                 "confidence_percent": confidence,
                 "position_x_m": points[name][0],
                 "position_y_m": points[name][1],
@@ -544,6 +615,12 @@ class RerunSkeletonApp:
                     f"/world/metrics/joint_speed/{name}",
                     rr.Scalars(float(speeds[name])),
                 )
+            fusion_quality = fusion_joint_quality.get(name)
+            if isinstance(fusion_quality, (int, float)) and np.isfinite(fusion_quality):
+                rr.log(
+                    f"/world/metrics/fusion/joint_quality/{name}",
+                    rr.Scalars(float(fusion_quality)),
+                )
 
         for name, value in angles.items():
             if value is not None:
@@ -557,6 +634,14 @@ class RerunSkeletonApp:
         visibility = derived.get("visibility", {})
         transport = source.get("transport_metrics", {})
         perception = source.get("perception_metrics", {})
+        multi = source.get("multi_camera") or {}
+        agreement = multi.get("cross_view_agreement") or {}
+        fusion_metrics = multi.get("fusion_metrics") or {}
+        rig_refinement = (
+            multi.get("rig_extrinsics")
+            or multi.get("online_rig_refinement")
+            or {}
+        )
         quality_values = {
             "body_confidence_percent": source.get("body_confidence"),
             "valid_keypoints": visibility.get("valid_keypoints"),
@@ -565,13 +650,54 @@ class RerunSkeletonApp:
             "median_filter_error_m": quality.get("median_raw_filter_error_m"),
             "capture_to_send_ms": transport.get("capture_to_send_ms"),
             "source_interval_ms": transport.get("source_interval_ms"),
+            "effective_output_hz": transport.get("effective_output_hz"),
+            "record_queue_depth": transport.get("record_queue_depth"),
+            "record_dropped": transport.get("record_dropped"),
             "visible_keypoint_ratio": perception.get("visible_keypoint_ratio"),
             "bone_length_error": perception.get("bone_length_relative_error_mean"),
             "left_right_swap_count": perception.get("left_right_swap_count"),
+            "evidence_views": multi.get("contributing_views"),
+            "cross_view_mpjpe_m": agreement.get("mpjpe_m"),
+            "cross_view_p95_m": agreement.get("p95_error_m"),
+            "core_disagreement_m": human_state.get("core_disagreement_m"),
+            "pelvis_disagreement_m": agreement.get("pelvis_error_m"),
+            "left_wrist_disagreement_m": agreement.get("left_wrist_error_m"),
+            "right_wrist_disagreement_m": agreement.get(
+                "right_wrist_error_m"
+            ),
+            "camera_timestamp_delta_ms": multi.get(
+                "camera_timestamp_delta_ms"
+            ),
+            "fused_quality_score": multi.get("fused_quality_score"),
+            "best_single_quality_score": multi.get(
+                "best_single_quality_score"
+            ),
+            "mean_camera_fused": fusion_metrics.get("mean_camera_fused"),
+            "rig_refinement_rms_m": rig_refinement.get("rms_m"),
+            "rig_refinement_updates": rig_refinement.get("accepted_updates"),
         }
         for name, value in quality_values.items():
             if isinstance(value, (int, float)) and np.isfinite(value):
                 rr.log(f"/world/metrics/quality/{name}", rr.Scalars(float(value)))
+        for name, value in (agreement.get("per_joint_error_m") or {}).items():
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                rr.log(
+                    f"/world/metrics/fusion/disagreement/{name}",
+                    rr.Scalars(float(value)),
+                )
+        for name, value in (human_state.get("segment_quality") or {}).items():
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                rr.log(
+                    f"/world/metrics/fusion/segment_quality/{name}",
+                    rr.Scalars(float(value)),
+                )
+        rr.log(
+            "/world/fusion_state",
+            rr.AnyValues(
+                failure_codes=json.dumps(human_state.get("failure_codes") or []),
+                elbow_state=json.dumps(human_state.get("elbow_state") or {}),
+            ),
+        )
         rr.log(
             "/world/effective_parameters",
             rr.AnyValues(
@@ -834,6 +960,8 @@ class RerunSkeletonApp:
                     f"Body ID: {source.get('body_id')} | "
                     f"Güven: {float(source.get('body_confidence', 0)):.1f}% | "
                     f"Geçerli: {visibility.get('valid_keypoints', 0)}/{len(names)} | "
+                    f"Fusion: {(source.get('multi_camera') or {}).get('mode', 'n/a')} "
+                    f"({(source.get('multi_camera') or {}).get('contributing_views', 0)} view) | "
                     f"G1: {safety.get('level', 'WAITING')} ({safety_reason}) | "
                     f"Kaydedilen kare: {latest['frame_count']}"
                 )
@@ -851,6 +979,7 @@ class RerunSkeletonApp:
                             "operator_selection": source.get("operator_selection"),
                             "calibration": source.get("calibration"),
                             "perception_metrics": source.get("perception_metrics"),
+                            "multi_camera": source.get("multi_camera"),
                             "g1_safety": self.latest_gmr.get("safety"),
                             "gmr_metrics": self.latest_gmr.get("bridge_metrics"),
                             "isaac_metrics": self.latest_gmr.get("isaac_metrics"),

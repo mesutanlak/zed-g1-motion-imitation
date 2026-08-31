@@ -1,0 +1,15 @@
+{
+  "confidence_threshold": 35.0,
+  "smoothing_alpha": 0.55,
+  "scale": 1.0,
+  "offset_x_m": 0.0,
+  "offset_y_m": 0.0,
+  "offset_z_m": 0.0,
+  "max_joint_speed_m_s": 6.0,
+  "occlusion_hold_frames": 3,
+  "playback_rate": 1.0,
+  "paused": false,
+  "capture_enabled": true,
+  "selected_joint": "PELVIS",
+  "joint_offsets_m": {}
+}

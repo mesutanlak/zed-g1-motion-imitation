@@ -21,6 +21,11 @@ tek/çift kamera deney metrikleri için
 [dual ZED Fusion rehberini](docs/DUAL_ZED_BODY38_FUSION_TR.md) izleyin. Dual
 yol ayrıdır; mevcut tek-kamera başlatıcısı değiştirilmemiştir.
 
+Dört ZED 2i'nin iki bilgisayara dağıtılıp ağ üzerinden BODY_38 Fusion ile
+denenmesi için, G1/ROS/Isaac'a veri göndermeyen ayrı kabul testi
+[zed_four_camera_test/README_TR.md](zed_four_camera_test/README_TR.md)
+içindedir.
+
 > Fiziksel robot güvenliği: Bu depo doğrudan gerçek G1 motor kontrolü için
 > hazır değildir. Varsayılan akış simülasyon ve üst gövde takibidir. Sim2real
 > öncesinde tork/hız limitleri, watchdog, self-collision, düşme engelleme,

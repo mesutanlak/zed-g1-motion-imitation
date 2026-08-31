@@ -1,0 +1,56 @@
+{
+  "schema": "zed_g1_dual_teleoperation/v1",
+  "fusion": {
+    "preferred_sync_ms": 10.0,
+    "acceptable_sync_ms": 20.0,
+    "reject_sync_ms": 50.0,
+    "confidence_threshold": 40.0,
+    "core_calibration_max_m": 0.18,
+    "quality_difference_select": 0.15,
+    "fusion_lock_acquire_frames": 3,
+    "fusion_lock_release_ms": 1500.0,
+    "temporal_alpha_min": 0.55,
+    "temporal_alpha_max": 0.90,
+    "joint_disagreement_m": {
+      "core": 0.16,
+      "arm": 0.24,
+      "wrist": 0.30,
+      "hand": 0.38,
+      "leg": 0.22,
+      "head": 0.20
+    },
+    "prediction": {
+      "velocity_ms": 100.0,
+      "confidence_decay_ms": 250.0,
+      "safe_hold_ms": 400.0,
+      "max_velocity_m_s": 5.0
+    },
+    "quality_weights": {
+      "keypoint_confidence": 0.34,
+      "body_confidence": 0.08,
+      "temporal_continuity": 0.22,
+      "view_geometry": 0.16,
+      "distance": 0.08,
+      "bone_consistency": 0.12
+    }
+  },
+  "anatomy": {
+    "bone_length_tolerance": 0.14,
+    "projection_blend": 0.55,
+    "elbow_singular_sin": 0.08,
+    "elbow_flip_confirm_frames": 3,
+    "left_right_confirm_frames": 3
+  },
+  "retargeting": {
+    "minimum_segment_quality": 0.25,
+    "low_quality_arm_blend": 0.55,
+    "full_quality_arm_blend": 1.0
+  },
+  "safety": {
+    "upper_arm_torso_contact": "soft",
+    "forearm_torso_contact": "soft",
+    "hand_torso_contact": "soft",
+    "inter_arm_contact": "hard",
+    "hand_head_contact": "hard"
+  }
+}

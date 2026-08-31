@@ -19,9 +19,20 @@ def latency_breakdown_ms(trace: Mapping[str, int | float]) -> dict[str, float | 
 
     return {
         "zed_processing_ms": delta("t1_zed_processing_done_ns", "t0_capture_ns"),
-        "windows_to_wsl_ms": delta("t3_wsl_receive_ns", "t2_windows_udp_send_ns"),
+        # Windows and WSL time.time_ns() values can carry a changing epoch
+        # offset after suspend/resume. Never report their direct subtraction
+        # as transport latency. t2->t6 starts and ends on Windows and therefore
+        # remains a valid full bridge round-trip measurement.
+        "windows_to_wsl_ms": None,
+        "bridge_roundtrip_ms": delta(
+            "t6_isaac_receive_ns", "t2_windows_udp_send_ns"
+        ),
+        "gmr_queue_ms": delta("t4_gmr_start_ns", "t3_wsl_receive_ns"),
         "gmr_ms": delta("t5_gmr_finish_ns", "t4_gmr_start_ns"),
         "isaac_command_ms": delta("t7_isaac_command_applied_ns", "t6_isaac_receive_ns"),
+        "physics_observe_ms": delta(
+            "t8_control_observed_ns", "t7_isaac_command_applied_ns"
+        ),
         "total_control_ms": delta("t8_control_observed_ns", "t0_capture_ns"),
     }
 

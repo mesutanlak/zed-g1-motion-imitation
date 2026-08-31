@@ -9,8 +9,9 @@ It intentionally has no PyZED dependency so the rules can be unit tested.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 import math
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -40,6 +41,52 @@ class MultiViewDecision:
     reason: str
     fused_score: float | None
     best_single_score: float | None
+
+
+def closest_timestamp_samples(
+    histories: Mapping[int, Sequence[tuple[int, Any]]],
+    *,
+    preferred_delta_ns: int,
+    after_timestamp_ns: int | None = None,
+) -> dict[int, tuple[int, Any]]:
+    """Select the newest mutually synchronized sample from each camera.
+
+    USB ZED cameras are not hardware-triggered.  Pairing each camera's latest
+    result therefore alternates between a near-synchronous pair and a pair one
+    full video frame apart.  A tiny per-camera history lets us select the
+    newest pair already inside the preferred window.  If no such pair exists,
+    the minimum-spread pair is returned for the caller's normal reject gate.
+    """
+    serials = sorted(int(serial) for serial, values in histories.items() if values)
+    if not serials:
+        return {}
+    if len(serials) == 1:
+        sample = max(histories[serials[0]], key=lambda item: int(item[0]))
+        return {serials[0]: sample}
+
+    combinations = list(product(*(histories[serial] for serial in serials)))
+    if after_timestamp_ns is not None:
+        fresh = [
+            samples for samples in combinations
+            if max(int(sample[0]) for sample in samples) > int(after_timestamp_ns)
+        ]
+        combinations = fresh
+    if not combinations:
+        return {}
+
+    preferred = max(0, int(preferred_delta_ns))
+
+    def rank(samples: Sequence[tuple[int, Any]]) -> tuple[int, int, int]:
+        timestamps = [int(sample[0]) for sample in samples]
+        spread = max(timestamps) - min(timestamps)
+        # Any pair inside the preferred window outranks an older exact pair;
+        # among acceptable pairs newest common time is the real-time choice.
+        if spread <= preferred:
+            return (0, -min(timestamps), spread)
+        return (1, spread, -min(timestamps))
+
+    selected = min(combinations, key=rank)
+    return {serial: sample for serial, sample in zip(serials, selected)}
 
 
 def _finite_rows(points: np.ndarray) -> np.ndarray:
@@ -101,6 +148,7 @@ def choose_output(
     fused: ViewQuality | None,
     singles: Sequence[ViewQuality],
     minimum_fused_score: float = 0.58,
+    minimum_fused_upper_visible_ratio: float = 0.80,
     maximum_operator_jump_m: float = 0.75,
     previous_anchor_m: Sequence[float] | None = None,
 ) -> MultiViewDecision:
@@ -114,7 +162,7 @@ def choose_output(
     if (
         fused is not None
         and fused.score >= minimum_fused_score
-        and fused.upper_visible_ratio >= 0.80
+        and fused.upper_visible_ratio >= minimum_fused_upper_visible_ratio
     ):
         return MultiViewDecision(
             "fusion", None, "official_fusion_valid", fused.score,
@@ -168,6 +216,59 @@ def keypoint_agreement(
         "common_keypoints": count,
         "mpjpe_m": float(np.mean(errors)),
         "p95_error_m": float(np.percentile(errors, 95)),
+    }
+
+
+def robust_rigid_alignment(
+    source: np.ndarray,
+    target: np.ndarray,
+    *,
+    maximum_residual_m: float = 0.12,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]] | None:
+    """Estimate ``target = R @ source + t`` with trimmed Kabsch fitting.
+
+    This is used only to refine a static multi-camera extrinsic from paired
+    BODY_38 observations. Reflection solutions are rejected and trimming is
+    deterministic, so one occluded wrist cannot move the whole camera rig.
+    """
+    first = np.asarray(source, dtype=np.float64)
+    second = np.asarray(target, dtype=np.float64)
+    if first.shape != second.shape or first.ndim != 2 or first.shape[1] != 3:
+        return None
+    keep = np.isfinite(first).all(axis=1) & np.isfinite(second).all(axis=1)
+    if int(np.count_nonzero(keep)) < 12:
+        return None
+    for _ in range(3):
+        a = first[keep]
+        b = second[keep]
+        ca = np.mean(a, axis=0)
+        cb = np.mean(b, axis=0)
+        u, _singular, vt = np.linalg.svd((a - ca).T @ (b - cb))
+        rotation = vt.T @ u.T
+        if np.linalg.det(rotation) < 0.0:
+            vt[-1] *= -1.0
+            rotation = vt.T @ u.T
+        translation = cb - rotation @ ca
+        residual = np.linalg.norm(
+            first @ rotation.T + translation - second, axis=1
+        )
+        valid_residual = residual[keep]
+        cutoff = min(
+            float(maximum_residual_m),
+            max(0.035, float(np.percentile(valid_residual, 80))),
+        )
+        updated = keep & (residual <= cutoff)
+        if int(np.count_nonzero(updated)) < 12 or np.array_equal(updated, keep):
+            break
+        keep = updated
+    residual = np.linalg.norm(
+        first @ rotation.T + translation - second, axis=1
+    )[keep]
+    return rotation, translation, {
+        "paired_keypoints": int(np.count_nonzero(keep)),
+        "rms_m": float(np.sqrt(np.mean(residual * residual))),
+        "median_m": float(np.median(residual)),
+        "p95_m": float(np.percentile(residual, 95)),
     }
 
 

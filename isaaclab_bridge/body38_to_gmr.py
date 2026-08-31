@@ -163,6 +163,7 @@ class Body38ToGMR:
         fixed_stance: bool = False,
         anatomical_branch_continuity: bool = True,
         branch_confirm_frames: int = 4,
+        simple_arm_mapping: bool = True,
     ) -> None:
         self.confidence_threshold = float(confidence_threshold)
         self.max_memory_frames = max(0, int(round(memory_seconds * nominal_fps)))
@@ -177,6 +178,7 @@ class Body38ToGMR:
         self.fixed_stance = bool(fixed_stance)
         self.anatomical_branch_continuity = bool(anatomical_branch_continuity)
         self.branch_confirm_frames = int(np.clip(branch_confirm_frames, 3, 5))
+        self.simple_arm_mapping = bool(simple_arm_mapping)
         self._memory: dict[str, tuple[np.ndarray, int]] = {}
         self._velocity_memory: dict[str, np.ndarray] = {}
         self._raw_fallback_streak: dict[str, int] = {}
@@ -540,6 +542,20 @@ class Body38ToGMR:
             shoulder = mapped[shoulder_name]
             elbow_hint = shoulder + upper_vec / upper_norm * g1_upper
             wrist = elbow_hint + fore_vec / fore_norm * g1_fore
+
+            # The upper-body command path consumes limb directions.  These
+            # two independently scaled vectors already form an anatomical,
+            # reachable two-link target.  Reconstructing the elbow a second
+            # time from a projected wrist introduces a competing bend-plane
+            # state machine and was the source of visible branch flips in the
+            # 2026-08-19 recording.  Retain the legacy reconstruction below
+            # for controlled experiments, but keep live imitation direct.
+            if self.simple_arm_mapping:
+                mapped[elbow_name] = elbow_hint
+                mapped[wrist_name] = wrist
+                self.last_arm_pole_source[side] = "direct_limb_directions"
+                self._arm_pending_branch.pop(side, None)
+                continue
 
             # A single frontal stereo view is least reliable in depth when an
             # arm is nearly vertical. Do not allow that noisy depth component

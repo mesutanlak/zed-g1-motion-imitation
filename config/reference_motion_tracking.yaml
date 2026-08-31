@@ -1,0 +1,86 @@
+schema: g1_reference_motion_tracking/v1
+
+# This file is the contract for the next policy phase. It deliberately does
+# not start training; first the live reference stream must pass replay and
+# kinematic-debug acceptance tests.
+reference:
+  source_rate_hz: 30
+  control_rate_hz: 200
+  latest_valid_queue_depth: 1
+  tracking_mode: low_latency
+  # Unitree G1's official high-level user-control example uses a 20 ms
+  # command period and 0.5 rad/s maximum joint interpolation speed. The live
+  # simulator uses the same conservative physical envelope on the final IK
+  # reference, independent of operator speed and GUI render rate.
+  limits_basis: unitree_g1_userctrl_dds_example
+  response_hz: 5.0
+  # 1.3x responsive simulation profile; still bounded far below the old
+  # 5-6 rad/s live reference while reducing visible phase error.
+  max_joint_velocity_rad_s: 0.65
+  max_joint_acceleration_rad_s2: 2.5
+  max_joint_jerk_rad_s3: 25.0
+  noncyclic_phase_value: null
+
+observation:
+  components:
+    - projected_gravity
+    - base_ang_vel
+    - q_minus_q_default
+    - qd
+    - q_ref_minus_q
+    - qd_ref_minus_qd
+    - body_reference_error
+    - foot_contact_state
+    - previous_action
+    - reference_phase
+    - reference_confidence
+  normalization:
+    projected_gravity: 1.0
+    base_ang_vel: 0.25
+    joint_position: 1.0
+    joint_velocity: 0.05
+    body_error: 4.0
+  contact_source: isaac_lab_physx_contact_sensor
+
+reward:
+  positive:
+    joint_tracking: {weight: 4.0, kernel: exp, sigma: 0.25}
+    hand_position: {weight: 2.0, kernel: exp, sigma_m: 0.08}
+    elbow_position: {weight: 1.5, kernel: exp, sigma_m: 0.07}
+    limb_direction: {weight: 2.5, kernel: exp, sigma_rad: 0.20}
+    orientation: {weight: 1.0, kernel: exp, sigma_rad: 0.30}
+  penalty:
+    torque: {weight: -2.0e-5}
+    joint_acceleration: {weight: -2.5e-7}
+    action_rate: {weight: -0.02}
+    joint_limit: {weight: -3.0}
+    self_collision: {weight: -4.0}
+    foot_slip: {weight: -2.0}
+    undesired_contact: {weight: -3.0}
+
+safety:
+  terminate_on_fall: true
+  terminate_on_invalid_reference: true
+  confidence_gates:
+    full_tracking: 0.70
+    reduced_tracking: 0.40
+    hold_below: 0.25
+  reference_age_ms:
+    fresh: 100
+    decay_until: 250
+    hold_after: 400
+
+curriculum:
+  - kinematic_debug_replay
+  - fixed_base_reference_tracking
+  - fixed_double_support_upper_body
+  - dynamic_reference_tracking
+  - occlusion_and_disturbance_randomization
+
+acceptance:
+  joint_rmse_rad_p50_max: 0.05
+  body_mpjpe_m_p50_max: 0.03
+  reference_phase_lag_ms_p50_max: 120.0
+  foot_slip_m_s_p95_max: 0.08
+  joint_limit_saturation_rate_max: 0.01
+  self_collision_rate_max: 0.005

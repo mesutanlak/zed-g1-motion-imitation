@@ -102,6 +102,43 @@ class MirrorContinuationRescue:
                 components.append(weight * (target - current))
         if not components:
             return np.empty(0, dtype=np.float64), 0.0
+        shoulder_body = f"{side}_shoulder_pitch_link"
+        shoulder_target = f"{side}_shoulder"
+        elbow_body = f"{side}_elbow_link"
+        elbow_target = f"{side}_elbow"
+        wrist_body = f"{side}_wrist_roll_rubber_hand"
+        wrist_target = f"{side}_wrist"
+        if all(
+            name in positions
+            for name in (shoulder_body, elbow_body, wrist_body)
+        ) and all(
+            name in targets
+            for name in (shoulder_target, elbow_target, wrist_target)
+        ):
+            robot = [
+                np.asarray(positions[name], dtype=np.float64)
+                for name in (shoulder_body, elbow_body, wrist_body)
+            ]
+            human = [
+                np.asarray(targets[name], dtype=np.float64)
+                for name in (shoulder_target, elbow_target, wrist_target)
+            ]
+            for first, second in ((0, 1), (1, 2)):
+                robot_vector = robot[second] - robot[first]
+                human_vector = human[second] - human[first]
+                robot_norm = float(np.linalg.norm(robot_vector))
+                human_norm = float(np.linalg.norm(human_vector))
+                if robot_norm > 1.0e-8 and human_norm > 1.0e-8:
+                    # Metre-equivalent directional residual. It participates
+                    # in both the finite-difference correction and acceptance
+                    # score, preventing a rescue that improves wrist XYZ but
+                    # turns the elbow/forearm onto a mirrored branch.
+                    components.append(
+                        0.035 * (
+                            human_vector / human_norm
+                            - robot_vector / robot_norm
+                        )
+                    )
         vector = np.concatenate(components)
         return vector, float(np.sqrt(np.mean(np.square(vector))))
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import csv
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import rerun as rr
 
@@ -16,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from rerun_analysis.model import AnalysisConfig, SkeletonConditioner
 from rerun_analysis.app import RerunSkeletonApp
+from rerun_analysis.session import AnalysisSessionWriter
+import rerun_analysis.session as session_module
 
 
 def check_stale_joint_reacquisition() -> None:
@@ -98,11 +102,34 @@ def check_retarget_comparison_logging(output: Path) -> None:
         raise AssertionError("comparison RRD was not written")
 
 
+def check_snapshot_lock_is_nonfatal(output: Path) -> None:
+    """A transient OneDrive/editor lock must not terminate capture."""
+    writer = object.__new__(AnalysisSessionWriter)
+    writer._snapshot_warning_at = {}
+    target = output / "locked_quality_summary.json"
+    target.write_text("{}", encoding="utf-8")
+    real_replace = session_module.os.replace
+
+    def replace_with_locked_destination(source, destination):
+        if Path(destination) == target:
+            raise PermissionError(13, "simulated exclusive reader", str(target))
+        return real_replace(source, destination)
+
+    with patch.object(session_module.os, "replace", replace_with_locked_destination):
+        published = writer._write_json_snapshot(target, {"frames": 42})
+    if published:
+        raise AssertionError("locked destination unexpectedly published")
+    pending = target.with_name(f".{target.name}.pending")
+    if json.loads(pending.read_text(encoding="utf-8"))["frames"] != 42:
+        raise AssertionError(pending)
+
+
 def main() -> int:
     check_stale_joint_reacquisition()
     project = PROJECT_ROOT
     with tempfile.TemporaryDirectory(prefix="zed_g1_rerun_test_") as temp:
         output = Path(temp)
+        check_snapshot_lock_is_nonfatal(output)
         check_retarget_comparison_logging(output)
         completed = subprocess.run(
             [
@@ -128,10 +155,41 @@ def main() -> int:
         if manifest.get("frame_count", 0) < 2:
             raise AssertionError(manifest)
         session = manifests[0].parent
-        for name in ("skeleton_analysis.jsonl", "frames.csv", "joints.csv", "angles.csv"):
+        for name in (
+            "skeleton_analysis.jsonl", "frames.csv", "joints.csv", "angles.csv",
+            "imitation_comparison.csv", "quality_summary.json",
+        ):
             path = session / name
             if not path.exists() or path.stat().st_size < 50:
                 raise AssertionError(path)
+        if not (session / "imitation_comparison.jsonl").exists():
+            raise AssertionError(session / "imitation_comparison.jsonl")
+        quality = json.loads(
+            (session / "quality_summary.json").read_text(encoding="utf-8")
+        )
+        if quality.get("schema") != "zed_g1_quality_summary/v1":
+            raise AssertionError(quality)
+        with (session / "frames.csv").open(encoding="utf-8-sig") as stream:
+            frame_fields = next(csv.reader(stream))
+        for field in (
+            "fusion_mode", "evidence_views", "cross_view_mpjpe_m",
+            "mean_camera_fused", "camera_latency_max_ms",
+        ):
+            if field not in frame_fields:
+                raise AssertionError((field, frame_fields))
+        with (session / "imitation_comparison.csv").open(
+            encoding="utf-8-sig"
+        ) as stream:
+            imitation_fields = next(csv.reader(stream))
+        for field in (
+            "left_direct_arm_ik_rms_m", "left_raw_elbow_joint_rad",
+            "gmr_upper_relative_residual_m", "mirror_rescue_applied",
+            "reference_confidence", "reference_velocity_max_rad_s",
+            "fusion_state", "left_direct_ik_selected_source",
+            "right_direct_ik_forearm_error_deg",
+        ):
+            if field not in imitation_fields:
+                raise AssertionError((field, imitation_fields))
         print(
             "RERUN_ANALYSIS_OK "
             f"frames={manifest['frame_count']} rrd={rrd_files[0].name}"

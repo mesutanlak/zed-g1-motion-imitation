@@ -7,13 +7,13 @@ param(
     [switch]$AllowSvoWithIsaac,
     [string]$AnalysisHost = "127.0.0.1",
     [ValidateRange(1, 60)]
-    [int]$AnalysisHz = 15,
+    [int]$AnalysisHz = 30,
     [ValidateRange(1, 60)]
     [int]$RosHz = 30,
     [ValidateSet("akc", "legacy")]
     [string]$ArmRecoveryMode = "akc",
     [ValidateSet("shared_gpu_safe", "balanced_30", "realtime_60", "quality")]
-    [string]$Profile = "realtime_60"
+    [string]$Profile = "balanced_30"
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,12 +59,12 @@ Kamera veri setini Isaac kapaliyken ayri oturumda SVO2 olarak kaydedin.
 $bodyModel = "medium"
 $predictionTimeout = "0.25"
 if ($Profile -eq "shared_gpu_safe") {
-    $captureFps = "15"
+    $captureFps = "30"
     $depthMode = "performance"
     $filterTau = "0.025"
-    $streamHz = "15"
+    $streamHz = "30"
     $skeletonSmoothing = "0.10"
-    Write-Host "ZED Isaac-uyumlu profil: BODY_38 MEDIUM, HD720@15, PERFORMANCE, low-latency"
+    Write-Host "ZED Isaac-uyumlu profil: BODY_38 MEDIUM, HD720@30, PERFORMANCE, low-latency"
 }
 elseif ($Profile -eq "balanced_30") {
     $captureFps = "30"
@@ -98,6 +98,7 @@ else {
     Write-Host "ZED kalite profili: BODY_38 MEDIUM, HD720@30, NEURAL_LIGHT"
 }
 Write-Host "GMR UDP hedefi: ${wslAddress}:15050"
+Write-Host "Kontrol modu: P = Normal IK <-> Policy Powered (egitilmis policy Isaac tarafinda yuklenir)"
 if (-not $NoAnalysisStream) {
     Write-Host "3B analiz UDP hedefi: ${AnalysisHost}:15052 (${AnalysisHz} Hz, kontrol yolundan ayrik)"
 }

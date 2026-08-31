@@ -5,12 +5,17 @@ from dataclasses import dataclass
 import numpy as np
 
 from motion_pipeline.arm_chain import ArmChainOptimizer, _two_bone_candidates
-from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
-from motion_pipeline.metrics import PerceptionMetrics
+from motion_pipeline.calibration import (
+    CalibrationManager,
+    stabilize_pelvis_rotation,
+    to_pelvis_local,
+)
+from motion_pipeline.metrics import PerceptionMetrics, latency_breakdown_ms
 from motion_pipeline.operator_selector import OperatorSelector, OperatorState
 from motion_pipeline.safety import G1FeasibilityFilter, G1_23_LIMITS_RAD
 from motion_pipeline.collision_geometry import (
     CollisionDistanceReport,
+    project_configuration_along_safe_path,
     segment_segment_distance,
     upper_body_capsule_report,
 )
@@ -27,6 +32,27 @@ NAMES = [
     "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL", "RIGHT_HEEL",
 ]
 INDEX = {name: index for index, name in enumerate(NAMES)}
+
+
+def test_latency_breakdown_never_subtracts_windows_and_wsl_epochs() -> None:
+    trace = {
+        "t0_capture_ns": 1_000_000_000,
+        "t1_zed_processing_done_ns": 1_040_000_000,
+        "t2_windows_udp_send_ns": 1_041_000_000,
+        # Deliberately offset WSL clock: direct subtraction would be 459 ms.
+        "t3_wsl_receive_ns": 1_500_000_000,
+        "t4_gmr_start_ns": 1_501_000_000,
+        "t5_gmr_finish_ns": 1_511_000_000,
+        "t6_isaac_receive_ns": 1_075_000_000,
+        "t7_isaac_command_applied_ns": 1_080_000_000,
+        "t8_control_observed_ns": 1_090_000_000,
+    }
+    latency = latency_breakdown_ms(trace)
+    assert latency["windows_to_wsl_ms"] is None
+    assert latency["bridge_roundtrip_ms"] == 34.0
+    assert latency["gmr_queue_ms"] == 1.0
+    assert latency["gmr_ms"] == 10.0
+    assert latency["physics_observe_ms"] == 10.0
 
 
 def neutral_points(offset=(3.0, 0.0, 0.0)) -> np.ndarray:
@@ -96,6 +122,20 @@ def test_pelvis_frame_translation_invariance_and_calibration() -> None:
         )
     assert result is not None and result.state == "READY"
     assert abs(float(result.profile["shoulder_width_m"]) - 0.44) < 1e-6
+
+
+def test_pelvis_rotation_filter_reduces_static_jitter_and_stays_on_so3() -> None:
+    angle = np.radians(5.0)
+    measured = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    filtered = stabilize_pelvis_rotation(np.eye(3), measured)
+    filtered_angle = np.degrees(np.arctan2(filtered[1, 0], filtered[0, 0]))
+    assert 0.0 < filtered_angle < 5.0
+    np.testing.assert_allclose(filtered.T @ filtered, np.eye(3), atol=1.0e-12)
+    assert np.linalg.det(filtered) > 0.0
 
 
 def test_arm_chain_recovers_torso_overlap() -> None:
@@ -339,6 +379,24 @@ def test_feasibility_projects_limits_and_slew() -> None:
     assert np.all(result.safe_q >= G1_23_LIMITS_RAD[:, 0])
 
 
+def test_straight_g1_elbows_do_not_degrade_the_whole_reference() -> None:
+    filter_ = G1FeasibilityFilter()
+    command = np.zeros(23, dtype=np.float64)
+    command[[16, 21]] = 1.383
+    result = filter_.update(command, 1.0 / 30.0)
+    assert result.joint_limit_saturation_count == 0
+    assert "joint_limit_saturation" not in result.reasons
+
+
+def test_negative_g1_elbow_coordinate_is_valid_anatomical_flexion() -> None:
+    filter_ = G1FeasibilityFilter()
+    command = np.zeros(23, dtype=np.float64)
+    command[[16, 21]] = -0.80
+    result = filter_.update(command, 1.0 / 30.0)
+    assert result.joint_limit_saturation_count == 0
+    assert "joint_limit_saturation" not in result.reasons
+
+
 def test_elbow_command_never_crosses_anatomical_extension_limit() -> None:
     filter_ = G1FeasibilityFilter()
     command = np.zeros(23)
@@ -351,7 +409,8 @@ def test_elbow_command_never_crosses_anatomical_extension_limit() -> None:
         command[elbow_indices] = 0.041
         observed.append(filter_.update(command, 1.0 / 15.0).safe_q[elbow_indices])
     values = np.asarray(observed)
-    assert np.all(values >= 0.04 - 1.0e-9)
+    assert np.all(values >= -1.0472 + 0.04 - 1.0e-9)
+    assert np.all(values <= 1.45 - 0.04 + 1.0e-9)
     assert np.allclose(values[-1], 0.041, atol=0.01)
 
 
@@ -397,7 +456,28 @@ def test_capsule_segment_distance_is_continuous() -> None:
     assert abs(separated - 0.2) < 1.0e-9
 
 
-def test_forearm_across_torso_is_measured_as_soft_contact() -> None:
+def test_robot_body_barrier_keeps_largest_safe_command_prefix() -> None:
+    def evaluator(q):
+        # Synthetic contact starts at q=0.6; the 5 mm shell starts at 0.55.
+        margin = 0.060 - 0.10 * float(q[0])
+        report = CollisionDistanceReport(
+            margin,
+            {"arm__torso": margin},
+            {"left": margin, "right": float("inf")},
+            ("arm__torso",) if margin < 0.005 else (),
+        )
+        return report, int(margin < 0.0)
+
+    projected = project_configuration_along_safe_path(
+        [0.0], [1.0], evaluator, clearance_m=0.005
+    )
+    assert projected.applied is True
+    assert 0.54 <= projected.joint_position[0] <= 0.551
+    assert projected.minimum_margin_m >= 0.005 - 1.0e-5
+    assert projected.self_contact_count == 0
+
+
+def test_forearm_across_torso_is_a_hard_robot_body_barrier() -> None:
     positions = {
         "pelvis": [0.0, 0.0, 0.0],
         "torso_link": [0.0, 0.0, 0.4],
@@ -409,10 +489,11 @@ def test_forearm_across_torso_is_measured_as_soft_contact() -> None:
         "right_wrist_roll_rubber_hand": [0.0, -0.70, 0.20],
     }
     report = upper_body_capsule_report(positions)
-    assert "left_fore__torso" in report.soft_risk_pairs
-    assert "left_hand__torso" in report.soft_risk_pairs
-    assert report.minimum_margin_m > 0.0
-    assert not report.risk_pairs
+    assert "left_fore__torso" in report.risk_pairs
+    assert "left_hand__torso" in report.risk_pairs
+    assert "left_fore__torso" in report.hard_pair_margins_m
+    assert "left_hand__torso" in report.hard_pair_margins_m
+    assert report.minimum_margin_m < 0.0
 
 
 def test_collision_governor_degrades_only_unsafe_arm() -> None:
@@ -431,6 +512,22 @@ def test_collision_governor_degrades_only_unsafe_arm() -> None:
     assert result.arm_blend["right"] == 1.0
     assert result.level.name == "ORANGE"
     assert np.linalg.norm(result.safe_q[18:23]) > np.linalg.norm(result.safe_q[13:18])
+
+
+def test_exact_self_contact_is_not_masked_by_noncolliding_capsules() -> None:
+    filter_ = G1FeasibilityFilter()
+    command = np.zeros(23)
+    command[13] = 0.4
+    result = filter_.update(
+        command,
+        1.0 / 60.0,
+        self_collision=True,
+        collision_margin_m=0.10,
+        arm_collision_margins={"left": 0.10, "right": 0.10},
+    )
+    assert result.level.name == "ORANGE"
+    assert "self_collision_risk" in result.reasons
+    assert np.allclose(result.safe_q, 0.0)
 
 
 def test_occlusion_quality_governor_degrades_only_affected_arm() -> None:

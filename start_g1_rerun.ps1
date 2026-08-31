@@ -7,9 +7,9 @@ param(
     [int]$ListenPort = 15052,
     [int]$GmrListenPort = 15053,
     [ValidateRange(1, 60)]
-    [int]$LiveMaxHz = 15,
+    [int]$LiveMaxHz = 30,
     [ValidateRange(1, 60)]
-    [int]$GmrLogMaxHz = 15,
+    [int]$GmrLogMaxHz = 30,
     [switch]$NoViewer,
     [switch]$Headless,
     [switch]$NoRealtime
@@ -20,19 +20,30 @@ $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
 $requirements = Join-Path $project "requirements-rerun.txt"
 $output = Join-Path $project "rerun_recordings"
+$venv = Join-Path $project ".venv-rerun"
+$python = Join-Path $venv "Scripts\python.exe"
 
-python -c "import rerun, numpy" 2>$null
+if (-not (Test-Path -LiteralPath $python)) {
+    Write-Host "Rerun icin bagimsiz Python ortami olusturuluyor..."
+    & py.exe -3.11 -m venv $venv
+    if ($LASTEXITCODE -ne 0) {
+        throw "Rerun Python ortami olusturulamadi. Python 3.11 kurulumunu kontrol edin."
+    }
+}
+
+& $python -c "import rerun, numpy" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Rerun bagimliliklari kuruluyor..."
-    python -m pip install -r $requirements
+    & $python -m pip install -r $requirements
     if ($LASTEXITCODE -ne 0) {
         throw "Rerun bagimliliklari kurulamadi."
     }
 }
 
-# pip installs rerun.exe under the active Python Scripts directory. Add that
-# directory explicitly because it is not necessarily present in Windows PATH.
-$scriptsDirectory = (& python -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+# The virtual environment path is already known to PowerShell. Building the
+# Scripts path locally avoids corrupting non-ASCII characters when Windows
+# PowerShell decodes Python's stdout (for example, "Masaustu" with an umlaut).
+$scriptsDirectory = Join-Path $venv "Scripts"
 $rerunViewer = Join-Path $scriptsDirectory "rerun.exe"
 if (-not (Test-Path -LiteralPath $rerunViewer)) {
     throw "rerun.exe bulunamadi: $rerunViewer"
@@ -83,7 +94,7 @@ Write-Host "Mevcut analysis_panel dosyalari kullanilmiyor/degistirilmiyor."
 
 Push-Location $project
 try {
-    & python @arguments
+    & $python @arguments
 }
 finally {
     Pop-Location

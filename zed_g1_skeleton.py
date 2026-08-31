@@ -875,6 +875,17 @@ def parse_args() -> argparse.Namespace:
         help="ZED body tracking modeli (varsayılan: medium)",
     )
     parser.add_argument("--fps", type=int, choices=(15, 30, 60), default=30)
+    parser.add_argument(
+        "--svo-input",
+        type=Path,
+        default=None,
+        help="Canli kamera yerine mevcut SVO2 dosyasini offline BODY_38 olarak yeniden isle",
+    )
+    parser.add_argument(
+        "--record-stem",
+        default=None,
+        help="Offline donusumde deterministik JSONL dosya adi (uzantisiz)",
+    )
     parser.add_argument("--operator-acquire-frames", type=int, default=10)
     parser.add_argument("--calibration-seconds", type=float, default=4.0)
     parser.add_argument(
@@ -1003,8 +1014,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--monitor-max-hz",
         type=float,
-        default=15.0,
-        help="Rerun/analiz UDP kopyasi azami hizi (varsayilan: 15 Hz)",
+        default=30.0,
+        help="Rerun/analiz UDP kopyasi azami hizi (varsayilan: 30 Hz)",
     )
     parser.add_argument(
         "--ros-max-hz",
@@ -1147,6 +1158,12 @@ def main() -> int:
     if args.camera_timeout <= 0:
         print("--camera-timeout sıfırdan büyük olmalı.", file=sys.stderr)
         return 2
+    if args.svo_input is not None and args.record_svo2:
+        print("--svo-input ile --record-svo2 birlikte kullanilamaz.", file=sys.stderr)
+        return 2
+    if args.svo_input is not None and not args.svo_input.is_file():
+        print(f"SVO2 dosyasi bulunamadi: {args.svo_input}", file=sys.stderr)
+        return 2
     if not 0.0 <= args.skeleton_smoothing <= 1.0:
         print("--skeleton-smoothing 0 ile 1 arasında olmalıdır.", file=sys.stderr)
         return 2
@@ -1156,7 +1173,7 @@ def main() -> int:
         return list_devices()
 
     devices = sl.Camera.get_device_list()
-    if not devices:
+    if args.svo_input is None and not devices:
         print(
             "ZED kamera bulunamadı. ZED Depth Viewer'ı kapatın, kamerayı doğrudan "
             "USB 3.x porta bağlayın ve --list-devices ile tekrar deneyin.",
@@ -1165,7 +1182,14 @@ def main() -> int:
         return 3
 
     zed = sl.Camera()
-    init = sl.InitParameters()
+    if args.svo_input is not None:
+        input_type = sl.InputType()
+        input_type.set_from_svo_file(str(args.svo_input.resolve()))
+        # Keep capture timing during replay: operator/calibration gates use elapsed
+        # time and must see the same cadence as the original recording.
+        init = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
+    else:
+        init = sl.InitParameters()
     init.camera_resolution = sl.RESOLUTION.HD720
     init.camera_fps = args.fps
     init.depth_mode = {
@@ -1241,7 +1265,7 @@ def main() -> int:
     perception_metrics = PerceptionMetrics()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    record_stem = time.strftime("zed_body38_%Y%m%d_%H%M%S")
+    record_stem = args.record_stem or time.strftime("zed_body38_%Y%m%d_%H%M%S")
     record_path = args.output_dir / f"{record_stem}.jsonl"
     svo_path = args.output_dir / f"{record_stem}.svo2"
     record_file = None
@@ -1256,6 +1280,9 @@ def main() -> int:
     fps_frames = 0
     measured_fps = 0.0
     diagnostics_visible = True
+    policy_powered_requested = False
+    control_mode_revision = 0
+    control_mode_session_ns = time.time_ns()
     stream_targets = []
     stream_target_rates: dict[tuple[str, int], float] = {}
     stream_target_roles: dict[tuple[str, int], str] = {}
@@ -1386,6 +1413,7 @@ def main() -> int:
 
     def handle_control_key(key: int) -> bool:
         nonlocal locked_id, diagnostics_visible
+        nonlocal policy_powered_requested, control_mode_revision
         if key in (ord("q"), 27):
             return True
         if key == ord("r"):
@@ -1397,6 +1425,18 @@ def main() -> int:
             print("R: Kisi kilidi, kalibrasyon ve kol hafizasi sifirlandi.")
         elif key == ord("s"):
             set_recording(not recording)
+        elif key == ord("p"):
+            policy_powered_requested = not policy_powered_requested
+            control_mode_revision += 1
+            print(
+                "P: "
+                + (
+                    "POLICY POWERED istendi (BODY_38/GMR IK + residual)."
+                    if policy_powered_requested
+                    else "NORMAL IK istendi."
+                ),
+                flush=True,
+            )
         elif key == ord("d"):
             diagnostics_visible = not diagnostics_visible
             print(f"D: Tani paneli {'ACIK' if diagnostics_visible else 'KAPALI'}.")
@@ -1407,7 +1447,7 @@ def main() -> int:
 
     print(
         "Hazır. Q/ESC: çıkış | S: kayıt aç/kapat | "
-        "R: kişi kilidini sıfırla | D: tanı paneli"
+        "P: Normal IK/Policy Powered | R: kişi kilidini sıfırla | D: tanı paneli"
     )
     camera_failed = False
     grab_failure_started: float | None = None
@@ -1421,6 +1461,10 @@ def main() -> int:
         while True:
             grab_result = zed.grab()
             if grab_result != sl.ERROR_CODE.SUCCESS:
+                end_of_svo = getattr(sl.ERROR_CODE, "END_OF_SVOFILE_REACHED", None)
+                if args.svo_input is not None and end_of_svo is not None and grab_result == end_of_svo:
+                    print("SVO2 sonuna ulasildi; offline BODY_38 donusumu tamamlandi.")
+                    break
                 now = time.monotonic()
                 if grab_failure_started is None:
                     grab_failure_started = now
@@ -1577,7 +1621,7 @@ def main() -> int:
                     args.confidence,
                 )
 
-            ready_text = "İnsan bekleniyor"
+            ready_text = "Kisi bekleniyor"
             current_record: dict[str, Any] | None = None
             if selected is not None:
                 raw = np.asarray(selected.keypoint, dtype=np.float64)
@@ -1686,6 +1730,11 @@ def main() -> int:
                     overlap=arm_result.overlap,
                     calibration_profile=calibration.profile,
                 )
+                record["control_mode_request"] = {
+                    "session_ns": control_mode_session_ns,
+                    "revision": control_mode_revision,
+                    "policy_powered": policy_powered_requested,
+                }
                 current_record = record
                 distance_m = number_or_none(record.get("euclidean_distance_m"))
                 record["distance_quality"] = {
@@ -1774,6 +1823,9 @@ def main() -> int:
                             "calibration": record["calibration"],
                             "occlusion_analysis": record["occlusion_analysis"],
                             "perception_metrics": record["perception_metrics"],
+                            "control_mode_request": record[
+                                "control_mode_request"
+                            ],
                             "shoulder_width_normalized_keypoints": record[
                                 "shoulder_width_normalized_keypoints"
                             ],
@@ -1866,8 +1918,9 @@ def main() -> int:
                     f"ID {locked_id} {selection.state.value}{acquisition_text} "
                     f"CAL={calibration.state} {calibration.progress * 100:.0f}% | "
                     f"kontrol={control_text} | "
-                    f"üst gövde={'HAZIR' if upper_ready else 'EKSİK'} "
-                    f"| tüm vücut={'HAZIR' if whole_ready else 'EKSİK'}"
+                    f"mod={'POLICY' if policy_powered_requested else 'IK'} | "
+                    f"ust govde={'HAZIR' if upper_ready else 'EKSIK'} "
+                    f"| tum vucut={'HAZIR' if whole_ready else 'EKSIK'}"
                 )
                 if recording and record_file is not None:
                     record_file.write(
@@ -1958,7 +2011,7 @@ def main() -> int:
                 frame,
                 (
                     f"{ready_text} | "
-                    f"Kayıt={'AÇIK ' + str(recorded_frames) + ' kare' if recording else 'KAPALI'}"
+                    f"Kayit={'ACIK ' + str(recorded_frames) + ' kare' if recording else 'KAPALI'}"
                 ),
                 (12, 55),
                 cv2.FONT_HERSHEY_SIMPLEX,

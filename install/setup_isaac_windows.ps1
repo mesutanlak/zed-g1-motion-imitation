@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Force -Path $repos, (Join-Path $InstallRoot "cache
 if (-not (Test-Path $python)) {
     & py.exe -3.11 -m venv $venv
 }
-& $python -m pip install --upgrade pip setuptools wheel
+& $python -m pip install --upgrade pip wheel "setuptools==80.9.0"
 & $python -m pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 `
     --index-url https://download.pytorch.org/whl/cu128
 & $python -m pip install "isaacsim[all,extscache]==5.0.0" `
