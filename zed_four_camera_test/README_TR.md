@@ -13,6 +13,16 @@ Her iki bilgisayarda aynı ZED SDK 5.4.1, güncel NVIDIA sürücüsü, Python 3.
 Bu izole ZED360 kabul aracı ZED360'ın beklediği `RIGHT_HANDED_Y_UP` koordinat
 sistemini kullanır; G1/ROS dönüşümü bu testten sonra ayrı uygulanmalıdır.
 
+> **Mevcut ağ-Fusion durumu (2026-08-31):** Bu iki Windows host ve ZED SDK
+> 5.4.1 ile, dört publisher'ın aynı BODY_18 ve aynı BODY_38 formatını gönderdiği
+> doğrudan doğrulanmasına rağmen `sl.Fusion.enable_body_tracking()`
+> `WRONG BODY FORMAT` ile başarısız olmuştur. Bu nedenle aşağıdaki ağ/ZED360
+> adımları yalnız tanı amaçlıdır; bu hata ortadan kalkmadan üretim ya da G1
+> retarget için kullanılmamalıdır. Güvenilir native yol, dört kamerayı tek
+> hostta bağımsız USB denetleyicilerine bağlayıp ZED360 `Auto Discover` ile
+> kalibre etmektir. PCIe kartı istemeyen alternatif ise BODY_38 eklemlerini
+> uygulama seviyesinde Ethernet ile birleştiren ayrı bir alıcı/fusion katmanıdır.
+
 ## 1. Ağ ve seri numaraları
 
 Doğrudan CAT6 bağlantısı için örnek IPv4 değerleri: ana PC `192.168.50.10/24`, laptop `192.168.50.11/24`. İki yönde `ping` çalışmalıdır.
@@ -25,7 +35,7 @@ Her bilgisayarda yalnız ona bağlı kameraları görün:
 
 Her seri numarasını not edin. Bir kamera yalnız bir bilgisayarda görünmelidir.
 
-## 2. ZED360 için dört ağ yayını (kalibrasyon: BODY_18)
+## 2. ZED360 için dört ağ yayını (yalnız tanı amaçlı)
 
 ZED360 ağ kalibrasyonunda dört kameranın da `start_publishing` ile yayın yapması gerekir. `L1,L2` laptop; `P1,P2` ana PC seri numaralarıdır.
 
@@ -45,7 +55,7 @@ Ana PC'de ikinci PowerShell penceresinde:
 
 Önce HD720@15 ile doğrulayın. `HAZIR | ... | BODY18` ve yaklaşık 15 publisher FPS görmelisiniz. Güvenlik duvarı izin sorarsa yalnız **Özel ağ** için izin verin. Dört publisher penceresinde de ortak alanda duran kişi için `bodies=1` görmeden ZED360'ı başlatmayın.
 
-## 3. Ağ ZED360 kalibrasyonu
+## 3. Ağ ZED360 kalibrasyonu (yalnız tanı amaçlı)
 
 Mevcut `fourkamera.json` önceki masa düzenine aittir; tripodlar yerleşince geçersizdir. Yalnız seri numaralarını taşıyan yeni bir ağ seed'i üretmek için ana PC'de:
 
@@ -60,7 +70,7 @@ Ana PC'de `ZED360.exe` açın; ilk ekranda **LOAD** ile `network_seed.json` dosy
 
 ZED360'daki **Auto Discover** düğmesine basmayın ve senderları sonradan elle eklemeyin. Bu yol tamamen ağ yayınıdır: PC'deki iki kamera da Python publisher tarafından açılır.
 
-## 4. Dört-kamera BODY_38 Fusion kabul testi
+## 4. Dört-kamera BODY_38 Fusion kabul testi (ağ hatası çözülene kadar çalıştırmayın)
 
 ZED360 kaydından sonra iki bilgisayardaki geçici BODY_18 publisher'ı `Ctrl+C` ile kapatın. Nihai testte laptop publisher'ını BODY_38 ile yeniden açın; ana PC, kendi iki kamerasını Fusion testinin içinde doğrudan USB'den açar.
 
