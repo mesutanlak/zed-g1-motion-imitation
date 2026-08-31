@@ -5,6 +5,8 @@ param(
     [int]$Fps = 15,
     [ValidateSet("fast", "medium", "accurate")]
     [string]$Model = "fast",
+    [ValidateSet("body18", "body38")]
+    [string]$BodyFormat = "body38",
     [ValidateSet("performance", "neural-light", "neural", "ultra")]
     [string]$DepthMode = "neural-light",
     [double]$Duration = 0
@@ -18,23 +20,24 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw "ZED Python ortami bulunamadi. Once install\setup_zed_windows.ps1 calistirin."
 }
 if ($Camera.Count -ne 2) {
-    throw "Laptop publisher icin iki --Camera SERIAL:PORT degeri verin."
+    throw "Bu host publisher'i icin iki -Camera SERIAL:PORT degeri verin."
 }
 
 $arguments = @(
     (Join-Path $scriptDir "publisher.py"),
     "--fps", $Fps,
     "--model", $Model,
+    "--body-format", $BodyFormat,
     "--depth-mode", $DepthMode,
     "--duration", $Duration
 )
 foreach ($item in $Camera) {
     $arguments += @("--camera", $item)
 }
-Write-Host "Laptop BODY_38 publisher basliyor: $($Camera -join ', ')"
+Write-Host "Fusion publisher basliyor ($BodyFormat): $($Camera -join ', ')"
 Write-Host "Durdurmak icin Ctrl+C kullanin. Bu arac G1'e veri veya komut gondermez."
 Set-Location -LiteralPath $projectDir
 & $python @arguments
 if ($LASTEXITCODE -ne 0) {
-    throw "BODY_38 publisher hata ile kapandi: $LASTEXITCODE"
+    throw "Fusion publisher hata ile kapandi: $LASTEXITCODE"
 }

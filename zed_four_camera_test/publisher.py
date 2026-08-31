@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish one or more local ZED 2i BODY_38 streams to a Fusion host.
+"""Publish local ZED 2i body streams to a Fusion host.
 
 This is deliberately a test-only edge publisher.  It never sends G1 commands,
 does not open a Fusion subscriber, and publishes only the SDK Fusion payload
@@ -29,7 +29,7 @@ class Publisher:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Yerel ZED 2i kameralarini ag uzerinden BODY_38 Fusion yayincisi yapar."
+        description="Yerel ZED 2i kameralarini ag uzerinden Fusion yayincisi yapar."
     )
     parser.add_argument(
         "--camera",
@@ -40,6 +40,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fps", type=int, choices=(15, 30, 60), default=15)
     parser.add_argument("--model", choices=("fast", "medium", "accurate"), default="fast")
+    parser.add_argument(
+        "--body-format",
+        choices=("body18", "body38"),
+        default="body38",
+        help=(
+            "ZED360 ag kalibrasyonu icin body18; nihai G1 retarget/Fusion testi icin body38. "
+            "Varsayilan: body38"
+        ),
+    )
     parser.add_argument(
         "--depth-mode",
         choices=("performance", "neural-light", "neural", "ultra"),
@@ -78,6 +87,10 @@ def main() -> int:
         "fast": sl.BODY_TRACKING_MODEL.HUMAN_BODY_FAST,
         "medium": sl.BODY_TRACKING_MODEL.HUMAN_BODY_MEDIUM,
         "accurate": sl.BODY_TRACKING_MODEL.HUMAN_BODY_ACCURATE,
+    }
+    body_format_map = {
+        "body18": sl.BODY_FORMAT.BODY_18,
+        "body38": sl.BODY_FORMAT.BODY_38,
     }
     depth_map = {
         "performance": sl.DEPTH_MODE.PERFORMANCE,
@@ -118,7 +131,7 @@ def main() -> int:
 
         body = sl.BodyTrackingParameters()
         body.detection_model = model_map[args.model]
-        body.body_format = sl.BODY_FORMAT.BODY_38
+        body.body_format = body_format_map[args.body_format]
         body.body_selection = sl.BODY_KEYPOINTS_SELECTION.FULL
         body.enable_tracking = False
         body.enable_body_fitting = False
@@ -127,7 +140,7 @@ def main() -> int:
         body.allow_reduced_precision_inference = args.model == "fast"
         status = camera.enable_body_tracking(body)
         if status != sl.ERROR_CODE.SUCCESS:
-            print(f"ZED {serial} BODY_38 acilamadi: {status}", file=sys.stderr)
+            print(f"ZED {serial} {args.body_format.upper()} acilamadi: {status}", file=sys.stderr)
             camera.close()
             continue
 
@@ -140,7 +153,10 @@ def main() -> int:
             continue
 
         publishers.append(Publisher(serial, port, camera, sl.Bodies(), last_report=time.monotonic()))
-        print(f"HAZIR | ZED {serial} | BODY_38 | UDP port {port} | HD720@{args.fps}")
+        print(
+            f"HAZIR | ZED {serial} | {args.body_format.upper()} "
+            f"| UDP port {port} | HD720@{args.fps}"
+        )
 
     if not publishers:
         print("Hicbir yerel kamera yayina baslayamadi.", file=sys.stderr)
