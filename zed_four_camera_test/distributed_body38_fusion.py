@@ -387,6 +387,7 @@ def main() -> int:
     output_sequence = 0
     input_packets = 0
     invalid_packets = 0
+    status_packets = 0
     fused_packets = 0
     raw_records = 0
     started = time.monotonic()
@@ -408,7 +409,17 @@ def main() -> int:
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         invalid_packets += 1
                         continue
-                    if not isinstance(document, dict) or document.get("schema") != "zed_body38_live/v1":
+                    if not isinstance(document, dict):
+                        invalid_packets += 1
+                        continue
+                    if document.get("schema") == "zed_body38_live/status/v1":
+                        # A strict/monitor source reports frame-integrity state
+                        # on the same port.  It is not a body payload and must
+                        # never make the receiver's real malformed-packet count
+                        # look like a network fault.
+                        status_packets += 1
+                        continue
+                    if document.get("schema") != "zed_body38_live/v1":
                         invalid_packets += 1
                         continue
                     declared_serial = int(document.get("source_serial", endpoint.serial) or endpoint.serial)
@@ -471,7 +482,8 @@ def main() -> int:
                 online = ", ".join(str(serial) for serial in sorted(latest)) or "yok"
                 print(
                     f"DURUM | kaynak={len(latest)}/4 [{online}] | input={input_packets} "
-                    f"| ham_kayit={raw_records} | fusion_cikis={fused_packets} | gecersiz={invalid_packets}",
+                    f"| ham_kayit={raw_records} | fusion_cikis={fused_packets} "
+                    f"| durum={status_packets} | gecersiz={invalid_packets}",
                     flush=True,
                 )
                 last_status = now

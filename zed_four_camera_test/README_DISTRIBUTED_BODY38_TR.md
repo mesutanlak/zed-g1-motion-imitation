@@ -169,3 +169,7 @@ pozitif verirse, yalnız ham kalibrasyon/fusion kabul testi için kaynak komutun
 paketi olarak işaretler fakat BODY_38 testini kesmez. Bu modda G1'e `OutputHost`
 ile veri yönlendirmeyin; önce alıcıdaki dört-kamera ve kalibrasyon sonuçlarını
 doğrulayın.
+
+Bu mod gerekirse dört kaynak komutunun tamamına uygulanmalıdır. Alıcıdaki
+`durum=...` sayısı yalnız bu tanı paketlerini sayar; `gecersiz=0` ise UDP BODY_38
+paketleri bozuk değildir.
