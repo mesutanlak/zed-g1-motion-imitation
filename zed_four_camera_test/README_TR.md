@@ -22,6 +22,10 @@ sistemini kullanır; G1/ROS dönüşümü bu testten sonra ayrı uygulanmalıdı
 > hostta bağımsız USB denetleyicilerine bağlayıp ZED360 `Auto Discover` ile
 > kalibre etmektir. PCIe kartı istemeyen alternatif ise BODY_38 eklemlerini
 > uygulama seviyesinde Ethernet ile birleştiren ayrı bir alıcı/fusion katmanıdır.
+> Bu alternatif artık projede uygulanmıştır: seçilen laptop-USB-hub + ana-PC-USB
+> topolojisi için [README_DISTRIBUTED_BODY38_TR.md](README_DISTRIBUTED_BODY38_TR.md)
+> belgesini izleyin. Bu ana belge yalnız ZED360/native ağ hatasını tanılamak için
+> tutulmaktadır.
 
 ## 1. Ağ ve seri numaraları
 

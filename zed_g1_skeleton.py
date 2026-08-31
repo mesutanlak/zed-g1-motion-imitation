@@ -876,6 +876,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fps", type=int, choices=(15, 30, 60), default=30)
     parser.add_argument(
+        "--serial",
+        type=int,
+        default=0,
+        help=(
+            "Acilacak ZED'in seri numarasi. Birden fazla ZED bagliyken zorunludur; "
+            "0 birakilirsa SDK'nin varsayilan kamerasi acilir."
+        ),
+    )
+    parser.add_argument(
         "--svo-input",
         type=Path,
         default=None,
@@ -1201,6 +1210,11 @@ def main() -> int:
     init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
     init.depth_maximum_distance = 8.0
     init.sdk_verbose = 1
+    if args.svo_input is None and int(args.serial) > 0:
+        # Without an explicit serial, two independent extractor processes can
+        # both attach to the SDK's first camera.  Pin the device before open so
+        # distributed BODY_38 sources stay one-process-per-physical-ZED.
+        init.set_from_serial_number(int(args.serial))
     # Let the SDK recover a temporarily interrupted USB/UVC stream in the
     # background.  ZED SDK 4+ exposes this option; keep compatibility with
     # older Python bindings used on secondary machines.
@@ -1211,6 +1225,17 @@ def main() -> int:
     if open_result != sl.ERROR_CODE.SUCCESS:
         print(f"ZED açılamadı: {open_result}", file=sys.stderr)
         return 4
+
+    opened_camera = camera_metadata(zed)
+    source_serial = int(opened_camera.get("serial_number", 0) or 0)
+    if int(args.serial) > 0 and source_serial != int(args.serial):
+        print(
+            f"HATA: istenen ZED {args.serial}, acilan ZED {source_serial}.",
+            file=sys.stderr,
+        )
+        zed.close()
+        return 4
+    print(f"Acik ZED seri numarasi: {source_serial}")
 
     positional = sl.PositionalTrackingParameters()
     positional.set_as_static = True
@@ -1788,6 +1813,7 @@ def main() -> int:
                     packet = sanitize_for_json(
                         {
                             "schema": "zed_body38_live/v1",
+                            "source_serial": source_serial,
                             "sequence": frame_index,
                             "timestamp_ns": timestamp_ns,
                             "coordinate_system": record["coordinate_system"],
