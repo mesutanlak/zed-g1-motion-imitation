@@ -56,6 +56,24 @@ Mevcut `fourkamera.json` önceki masa düzenine aittir; tripodlar yerleşince ge
 
 Ana PC'de `ZED360.exe` açın; ilk ekranda **LOAD** ile `network_seed.json` dosyasını seçin ve Setup the room ile kalibre edin. Bir kişi tüm çalışma alanında yavaş yürüsün. Kameralar/tripodlar kalibrasyon bitene kadar hareket etmemelidir. Sonucu `config\zed_four\tripod_calibrated.json` diye kaydedin.
 
+### Hibrit Load akışı (iki PC USB + iki laptop network)
+
+ZED360'ın yerel USB Auto Discover akışı sorunsuz ama tüm-network manuel sender
+akışı iskelet göstermiyorsa, ana PC publisher'ını kapatın ve laptop publisher'ını
+açık bırakın. Ana PC'de aşağıdaki hibrit yapılandırmayı oluşturun:
+
+```powershell
+.\zed_four_camera_test\new_zed_hybrid_calibration_config.ps1 `
+  -SourceConfig "C:\Program Files (x86)\ZED SDK\tools\fourkamera.json" `
+  -LocalSerial P1,P2 `
+  -RemoteCamera "L1@192.168.50.11:30000","L2@192.168.50.11:30002" `
+  -OutputConfig ".\config\zed_four\hybrid_network_seed.json"
+```
+
+ZED360'ı açıp **LOAD** ile `hybrid_network_seed.json` seçin. Bu modda
+Auto Discover'a basmayın: ZED360 `P1,P2` kameralarını doğrudan USB'den açar;
+`L1,L2` iskeletleri laptop publisher'dan gelir.
+
 ## 4. Dört-kamera Fusion kabul testi
 
 ZED360 kaydından sonra ana PC'deki geçici publisher'ı `Ctrl+C` ile kapatın. Laptop publisher açık kalır. Ana PC'de:
