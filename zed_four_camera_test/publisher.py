@@ -184,7 +184,8 @@ def main() -> int:
                     elapsed = max(now - publisher.last_report, 1.0e-6)
                     print(
                         f"ZED {publisher.serial} | publisher_fps={publisher.frames / elapsed:.1f} "
-                        f"| bodies={len(publisher.bodies.body_list)} | port={publisher.port}"
+                        f"| bodies={len(publisher.bodies.body_list)} "
+                        f"| received_format={publisher.bodies.body_format} | port={publisher.port}"
                     )
                     publisher.frames = 0
                     publisher.last_report = now

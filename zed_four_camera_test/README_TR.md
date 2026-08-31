@@ -86,3 +86,18 @@ Ana PC'de:
 Konsolda `cameras_present=4/4`, yaklaşık 15 Fusion FPS ve operatör varken sıfır olmayan `body_frames` görmelisiniz. Önce `-MinimumCameras 2`, sonra 3 ve 4 ile tekrarlayın.
 
 Başlangıç kabulü: 5 dakika kopmasız çalışma, `cameras_present=4/4`, 15 FPS talebinde yaklaşık 14+ Fusion FPS ve JSONL kaydında BODY_38 eklemleri. Bu geçmeden G1 kontrol hattına bağlamayın.
+
+## Ağ tanı aracı
+
+ZED360 dört publisher'ı FPS ile görürken ham iskelet göstermiyorsa ZED360'ı kapatın,
+publisher'lar açık kalırken ana PC'de aşağıdaki aracı çalıştırın. Bu araç kalibrasyon
+üretmez; Fusion API'nin her sender'dan ham iskelet alıp almadığını ölçer.
+
+```powershell
+.\zed_four_camera_test\start_network_body_probe.ps1 `
+  -Camera "39504762@192.168.50.11:30000","31571870@192.168.50.11:30002","33773329@192.168.50.10:30004","34760587@192.168.50.10:30006" `
+  -Duration 20
+```
+
+Her seri için `raw_bodies: SERIAL=1` görülmelidir. Sıfırsa sender/güvenlik duvarı;
+bir ise ZED360 arayüzü/uyumluluğu incelenmelidir.
