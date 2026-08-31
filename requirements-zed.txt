@@ -2,3 +2,4 @@
 # pyzed itself is installed by ZED SDK/get_python_api.py.
 numpy>=2.0,<3
 opencv-python>=4.10,<5
+requests>=2.31,<3
