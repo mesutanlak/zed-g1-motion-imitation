@@ -1,8 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Input,
+    [Alias("Input")]
+    [string]$CapturePath,
     [Parameter(Mandatory = $true)]
-    [string]$Output,
+    [Alias("Output")]
+    [string]$OutputPath,
     [Parameter(Mandatory = $true)]
     [long]$ReferenceSerial
 )
@@ -13,5 +15,5 @@ $calibrator = Join-Path $PSScriptRoot "calibrate_distributed_body38.py"
 if (-not (Test-Path -LiteralPath $python)) {
     throw "ZED sanal ortami bulunamadi: $python"
 }
-& $python $calibrator --input $Input --output $Output --reference-serial $ReferenceSerial
+& $python $calibrator --input $CapturePath --output $OutputPath --reference-serial $ReferenceSerial
 exit $LASTEXITCODE

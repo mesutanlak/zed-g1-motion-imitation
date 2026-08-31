@@ -107,8 +107,8 @@ Ana PC'de:
 
 ```powershell
 .\zed_four_camera_test\start_distributed_calibration.ps1 `
-  -Input ".\recordings\four_body38_static_calibration.jsonl" `
-  -Output ".\config\zed_four\distributed_body38_extrinsics.json" `
+  -CapturePath ".\recordings\four_body38_static_calibration.jsonl" `
+  -OutputPath ".\config\zed_four\distributed_body38_extrinsics.json" `
   -ReferenceSerial 33773329
 ```
 

@@ -104,7 +104,11 @@ def collect_correspondences(
             continue
         indices = {str(name): index for index, name in enumerate(names)}
         required = [indices[name] for name in CORE_NAMES if name in indices]
-        if len(required) < 12:
+        # One oblique camera can legitimately lose one complete arm/leg.  Six
+        # non-collinear torso/limb correspondences in one synchronized frame
+        # are enough; robust_rigid_alignment still requires at least twelve
+        # accumulated points before any transform can be emitted.
+        if len(required) < 6:
             continue
         reference_points = array(reference.get("keypoints_3d_m"), (len(names), 3))
         target_points = array(target.get("keypoints_3d_m"), (len(names), 3))
@@ -119,7 +123,7 @@ def collect_correspondences(
             and reference_confidence[index] >= threshold
             and target_confidence[index] >= threshold
         ]
-        if len(keep) < 12:
+        if len(keep) < 6:
             continue
         source_rows.extend(target_points[keep])
         target_rows.extend(reference_points[keep])
