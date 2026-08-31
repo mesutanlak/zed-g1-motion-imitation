@@ -29,14 +29,14 @@ Laptopta:
 
 ```powershell
 .\zed_four_camera_test\start_publisher.ps1 `
-  -Camera "L1:30000","L2:30001" -Fps 15 -Model fast -DepthMode neural-light
+  -Camera "L1:30000","L2:30002" -Fps 15 -Model fast -DepthMode neural-light
 ```
 
 Ana PC'de ikinci PowerShell penceresinde:
 
 ```powershell
 .\zed_four_camera_test\start_publisher.ps1 `
-  -Camera "P1:30002","P2:30003" -Fps 15 -Model fast -DepthMode neural-light
+  -Camera "P1:30004","P2:30006" -Fps 15 -Model fast -DepthMode neural-light
 ```
 
 Önce HD720@15 ile doğrulayın. `HAZIR` ve yaklaşık 15 publisher FPS görmelisiniz. Güvenlik duvarı izin sorarsa yalnız **Özel ağ** için izin verin.
@@ -48,7 +48,7 @@ Mevcut `fourkamera.json` önceki masa düzenine aittir; tripodlar yerleşince ge
 ```powershell
 .\zed_four_camera_test\new_network_calibration_seed.ps1 `
   -SourceConfig "C:\Program Files (x86)\ZED SDK\tools\fourkamera.json" `
-  -Camera "L1@192.168.50.11:30000","L2@192.168.50.11:30001","P1@192.168.50.10:30002","P2@192.168.50.10:30003" `
+  -Camera "L1@192.168.50.11:30000","L2@192.168.50.11:30002","P1@192.168.50.10:30004","P2@192.168.50.10:30006" `
   -OutputConfig ".\config\zed_four\network_seed.json"
 ```
 
@@ -62,7 +62,7 @@ ZED360 kaydından sonra ana PC'deki geçici publisher'ı `Ctrl+C` ile kapatın. 
 .\zed_four_camera_test\start_fusion_test.ps1 `
   -FusionConfig ".\config\zed_four\tripod_calibrated.json" `
   -LocalSerial P1,P2 `
-  -RemoteCamera "L1@192.168.50.11:30000","L2@192.168.50.11:30001" `
+  -RemoteCamera "L1@192.168.50.11:30000","L2@192.168.50.11:30002" `
   -Fps 15 -Model fast -DepthMode neural-light -Duration 300 `
   -MinimumCameras 2 `
   -Record ".\recordings\four_zed_body38_test.jsonl"

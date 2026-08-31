@@ -26,7 +26,7 @@ foreach ($item in $Camera) {
     catch {
         throw "Gecersiz kamera bicimi '$item'. SERIAL@IP:PORT kullanin."
     }
-    if ($endpoints.ContainsKey($serial) -or [string]::IsNullOrWhiteSpace($ip) -or $port -lt 1 -or $port -gt 65535) {
+    if ($endpoints.ContainsKey($serial) -or [string]::IsNullOrWhiteSpace($ip) -or $port -lt 1 -or $port -gt 65535 -or ($port % 2 -ne 0)) {
         throw "Gecersiz veya yinelenen kamera endpoint'i: $item"
     }
     $endpoints[$serial] = @{ Ip = $ip; Port = $port }

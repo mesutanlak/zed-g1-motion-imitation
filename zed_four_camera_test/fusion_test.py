@@ -52,8 +52,8 @@ def parse_remote(value: str) -> tuple[int, str, int]:
         serial, port = int(serial_text), int(port_text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("Uzak kamera bicimi SERIAL@IP:PORT olmali.") from exc
-    if serial <= 0 or not ip or not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("Gecersiz uzak kamera seri numarasi, IP veya port.")
+    if serial <= 0 or not ip or not 1 <= port <= 65535 or port % 2:
+        raise argparse.ArgumentTypeError("Gecersiz uzak kamera seri numarasi, IP veya port; port cift olmali.")
     return serial, ip, port
 
 

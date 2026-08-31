@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         required=True,
         metavar="SERIAL:PORT",
-        help="Her yerel kamera icin seri numarasi ve benzersiz UDP portu. Ornek: 12345678:30000",
+        help="Her yerel kamera icin seri numarasi ve benzersiz, cift UDP portu. Ornek: 12345678:30000",
     )
     parser.add_argument("--fps", type=int, choices=(15, 30, 60), default=15)
     parser.add_argument("--model", choices=("fast", "medium", "accurate"), default="fast")
@@ -55,8 +55,8 @@ def parse_camera(value: str) -> tuple[int, int]:
         serial, port = int(serial_text), int(port_text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("Kamera bicimi SERIAL:PORT olmali.") from exc
-    if serial <= 0 or not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("Seri pozitif, port 1-65535 araliginda olmali.")
+    if serial <= 0 or not 1 <= port <= 65535 or port % 2:
+        raise argparse.ArgumentTypeError("Seri pozitif; port 1-65535 araliginda ve cift olmali.")
     return serial, port
 
 
