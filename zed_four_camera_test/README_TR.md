@@ -8,6 +8,8 @@ ZED C + ZED D -> USB -------------------------------> ana PC
 ```
 
 Her iki bilgisayarda aynı ZED SDK 5.4.1, güncel NVIDIA sürücüsü, Python 3.11 ve projenin `.venv-zed` ortamı olmalıdır.
+Bu izole ZED360 kabul aracı ZED360'ın beklediği `RIGHT_HANDED_Y_UP` koordinat
+sistemini kullanır; G1/ROS dönüşümü bu testten sonra ayrı uygulanmalıdır.
 
 ## 1. Ağ ve seri numaraları
 

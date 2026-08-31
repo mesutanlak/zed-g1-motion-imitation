@@ -94,7 +94,10 @@ def main() -> int:
         init.camera_fps = args.fps
         init.depth_mode = depth_map[args.depth_mode]
         init.coordinate_units = sl.UNIT.METER
-        init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
+        # ZED360 and the official multi-camera BODY sample use OpenGL's Y-up
+        # convention.  Keep every network publisher in that same frame while
+        # producing the extrinsic calibration.
+        init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
         init.depth_maximum_distance = 8.0
         if hasattr(init, "async_grab_camera_recovery"):
             init.async_grab_camera_recovery = True

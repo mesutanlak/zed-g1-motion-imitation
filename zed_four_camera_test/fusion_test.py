@@ -120,7 +120,7 @@ def main() -> int:
         return 2
 
     configs = sl.read_fusion_configuration_file(
-        str(config_path), sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD, sl.UNIT.METER
+        str(config_path), sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP, sl.UNIT.METER
     )
     by_serial = {int(conf.serial_number): conf for conf in configs}
     expected = local.union(remote)
@@ -153,7 +153,7 @@ def main() -> int:
             init.camera_fps = args.fps
             init.depth_mode = depth_map[args.depth_mode]
             init.coordinate_units = sl.UNIT.METER
-            init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
+            init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
             init.depth_maximum_distance = 8.0
             if hasattr(init, "async_grab_camera_recovery"):
                 init.async_grab_camera_recovery = True
@@ -194,7 +194,7 @@ def main() -> int:
             print(f"UZAK BEKLENIYOR | ZED {serial} | {ip}:{port}")
 
         fusion_init = sl.InitFusionParameters()
-        fusion_init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
+        fusion_init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
         fusion_init.coordinate_units = sl.UNIT.METER
         fusion_init.output_performance_metrics = True
         fusion_init.verbose = True
