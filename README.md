@@ -21,8 +21,10 @@ tek/çift kamera deney metrikleri için
 [dual ZED Fusion rehberini](docs/DUAL_ZED_BODY38_FUSION_TR.md) izleyin. Dual
 yol ayrıdır; mevcut tek-kamera başlatıcısı değiştirilmemiştir.
 
-Dört ZED 2i'nin iki bilgisayara dağıtılıp ağ üzerinden BODY_38 Fusion ile
-denenmesi için, G1/ROS/Isaac'a veri göndermeyen ayrı kabul testi
+Dört ZED 2i'nin iki bilgisayara dağıtıldığı canlı BODY_38 Fusion, 2x2 kamera
+arayüzü, Isaac/GMR, Rerun, JSONL kaydı ve yeniden kalibrasyon akışı için
+[dört ZED BODY_38 çalıştırma kaydını](docs/FOUR_ZED_BODY38_RUNBOOK_TR.md)
+izleyin. ZED360/native ağ Fusion tanı adı ayrı olarak
 [zed_four_camera_test/README_TR.md](zed_four_camera_test/README_TR.md)
 içindedir.
 

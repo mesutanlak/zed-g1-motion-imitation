@@ -13,7 +13,18 @@ param(
     [ValidateSet("neural-light", "neural", "performance")]
     [string]$DepthMode = "performance",
     [ValidateSet("strict", "monitor", "off")]
-    [string]$FrameIntegrityMode = "strict"
+    [string]$FrameIntegrityMode = "strict",
+    [string]$PreviewHost = "",
+    [ValidateRange(1024, 65535)]
+    [int]$PreviewPort = 16100,
+    [ValidateRange(1, 15)]
+    [double]$PreviewHz = 5,
+    [ValidateRange(320, 960)]
+    [int]$PreviewWidth = 640,
+    [ValidateRange(35, 90)]
+    [int]$PreviewJpegQuality = 65,
+    [switch]$RecordLocal,
+    [switch]$RecordSvo2
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -23,14 +34,32 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw "ZED sanal ortami bulunamadi: $python"
 }
 
-& $python $source `
-    --serial $Serial `
-    --fps $Fps `
-    --model $Model `
-    --depth-mode $DepthMode `
-    --headless `
-    --frame-integrity-mode $FrameIntegrityMode `
-    --stream-host $TargetHost `
-    --stream-port $TargetPort `
-    --stream-max-hz $Fps
+$arguments = @(
+    $source,
+    "--serial", "$Serial",
+    "--fps", "$Fps",
+    "--model", $Model,
+    "--depth-mode", $DepthMode,
+    "--headless",
+    "--frame-integrity-mode", $FrameIntegrityMode,
+    "--stream-host", $TargetHost,
+    "--stream-port", "$TargetPort",
+    "--stream-max-hz", "$Fps"
+)
+if ($PreviewHost) {
+    $arguments += @(
+        "--preview-stream-host", $PreviewHost,
+        "--preview-stream-port", "$PreviewPort",
+        "--preview-stream-max-hz", "$PreviewHz",
+        "--preview-stream-width", "$PreviewWidth",
+        "--preview-jpeg-quality", "$PreviewJpegQuality"
+    )
+}
+if ($RecordSvo2) {
+    $arguments += @("--record", "--record-svo2")
+}
+elseif ($RecordLocal) {
+    $arguments += "--record"
+}
+& $python @arguments
 exit $LASTEXITCODE

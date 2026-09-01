@@ -682,6 +682,50 @@ def draw_skeleton(
         )
 
 
+def encode_network_preview(
+    frame: np.ndarray,
+    *,
+    target_width: int,
+    jpeg_quality: int,
+    maximum_bytes: int = 60_000,
+) -> bytes | None:
+    """Encode one diagnostic frame into a single safe UDP datagram.
+
+    The four-camera preview is deliberately independent from BODY_38 control
+    packets.  It may reduce JPEG quality/size, but it must never fragment the
+    real-time skeleton stream or delay a camera's control publication.
+    """
+    if frame.ndim != 3 or frame.shape[0] == 0 or frame.shape[1] == 0:
+        return None
+    value = frame
+    if value.shape[2] == 4:
+        value = cv2.cvtColor(value, cv2.COLOR_BGRA2BGR)
+    width = min(int(target_width), int(value.shape[1]))
+    scale = width / max(float(value.shape[1]), 1.0)
+    height = max(1, int(round(value.shape[0] * scale)))
+    value = cv2.resize(value, (width, height), interpolation=cv2.INTER_AREA)
+    quality = int(jpeg_quality)
+    while True:
+        ok, encoded = cv2.imencode(
+            ".jpg", value, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        )
+        if not ok:
+            return None
+        payload = encoded.tobytes()
+        if len(payload) <= maximum_bytes:
+            return payload
+        if quality > 35:
+            quality = max(35, quality - 10)
+            continue
+        if value.shape[1] <= 320:
+            return None
+        value = cv2.resize(
+            value,
+            (max(320, int(value.shape[1] * 0.8)), max(180, int(value.shape[0] * 0.8))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+
 def number_or_none(value: Any) -> float | None:
     try:
         converted = float(value)
@@ -1004,6 +1048,38 @@ def parse_args() -> argparse.Namespace:
         help="Canlı analiz paneli UDP portu (varsayılan: 15052)",
     )
     parser.add_argument(
+        "--preview-stream-host",
+        default=None,
+        help=(
+            "Düşük hızlı JPEG tanı görüntüsünün hedefi. Dört kameralı ana "
+            "önizleme arayüzü için ana PC IP adresini verin."
+        ),
+    )
+    parser.add_argument(
+        "--preview-stream-port",
+        type=int,
+        default=16100,
+        help="JPEG tanı görüntüsü UDP hedef portu (varsayılan: 16100)",
+    )
+    parser.add_argument(
+        "--preview-stream-max-hz",
+        type=float,
+        default=5.0,
+        help="JPEG tanı görüntüsü azami yayın hızı (varsayılan: 5 Hz)",
+    )
+    parser.add_argument(
+        "--preview-stream-width",
+        type=int,
+        default=640,
+        help="Ağ önizlemesi genişliği; en-boy oranı korunur (varsayılan: 640)",
+    )
+    parser.add_argument(
+        "--preview-jpeg-quality",
+        type=int,
+        default=65,
+        help="Ağ önizleme JPEG kalitesi, 35-90 (varsayılan: 65)",
+    )
+    parser.add_argument(
         "--ros-host",
         default=None,
         help="Üçüncü BODY_38 UDP kopyası; ROS 2 köprüsü için WSL IP adresi",
@@ -1158,12 +1234,16 @@ def main() -> int:
     if (
         not 1 <= args.stream_port <= 65535
         or not 1 <= args.monitor_port <= 65535
+        or not 1 <= args.preview_stream_port <= 65535
         or args.stream_max_hz <= 0
         or args.monitor_max_hz <= 0
         or args.ros_max_hz <= 0
+        or args.preview_stream_max_hz <= 0
+        or args.preview_stream_width < 160
+        or not 35 <= args.preview_jpeg_quality <= 90
     ):
         print(
-            "--stream-port, --monitor-port veya --stream-max-hz geçersiz.",
+            "UDP portu, yayın hızı veya ağ önizleme ayarı geçersiz.",
             file=sys.stderr,
         )
         return 2
@@ -1341,6 +1421,18 @@ def main() -> int:
         if stream_targets
         else None
     )
+    preview_target = (
+        (args.preview_stream_host, args.preview_stream_port)
+        if args.preview_stream_host
+        else None
+    )
+    preview_socket = (
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if preview_target is not None
+        else None
+    )
+    last_preview_stream_time = 0.0
+    preview_streamed_frames = 0
     last_target_stream_time = {target: 0.0 for target in stream_targets}
     last_stream_source_timestamp_ns: int | None = None
     # When the requested UDP rate equals the camera rate, an elapsed-time
@@ -1361,6 +1453,12 @@ def main() -> int:
         print(
             f"Canlı BODY_38 UDP {role} hedefi: "
             f"{stream_target[0]}:{stream_target[1]}"
+        )
+    if preview_target is not None:
+        print(
+            "Dört-kamera JPEG önizleme hedefi: "
+            f"{preview_target[0]}:{preview_target[1]} "
+            f"({args.preview_stream_max_hz:g} Hz, {args.preview_stream_width}px)"
         )
 
     def set_recording(enabled: bool) -> None:
@@ -2089,6 +2187,32 @@ def main() -> int:
                     streamed_frames,
                 )
 
+            preview_now = time.monotonic()
+            if (
+                preview_socket is not None
+                and preview_target is not None
+                and preview_now - last_preview_stream_time
+                >= 0.98 / max(float(args.preview_stream_max_hz), 1.0)
+            ):
+                preview_payload = encode_network_preview(
+                    frame,
+                    target_width=args.preview_stream_width,
+                    jpeg_quality=args.preview_jpeg_quality,
+                )
+                if preview_payload is not None:
+                    try:
+                        preview_socket.sendto(preview_payload, preview_target)
+                        last_preview_stream_time = preview_now
+                        preview_streamed_frames += 1
+                    except OSError as exc:
+                        if preview_now - last_grab_warning >= 1.0:
+                            print(
+                                "JPEG önizleme yayın uyarısı "
+                                f"({preview_target[0]}:{preview_target[1]}): {exc}",
+                                file=sys.stderr,
+                            )
+                            last_grab_warning = preview_now
+
             if not args.headless:
                 cv2.imshow("ZED 2i BODY_38 - G1 Skeleton Extractor", frame)
             key = poll_control_key()
@@ -2107,6 +2231,8 @@ def main() -> int:
             zed.disable_recording()
         if stream_socket is not None:
             stream_socket.close()
+        if preview_socket is not None:
+            preview_socket.close()
         zed.disable_body_tracking()
         zed.disable_positional_tracking()
         zed.close()
@@ -2129,6 +2255,8 @@ def main() -> int:
             print(f"Kaydedilen BODY_38 kare sayısı: {recorded_frames}")
     print("Kamera güvenli şekilde kapatıldı.")
     print(f"USB frame integrity: corrupt={corrupt_total} total={frame_index}")
+    if preview_target is not None:
+        print(f"JPEG önizleme kareleri: {preview_streamed_frames}")
     return 7 if camera_failed else 0
 
 

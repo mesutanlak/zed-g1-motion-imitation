@@ -18,13 +18,25 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import queue
 import selectors
 import socket
 import sys
+import threading
 import time
 from typing import Any
 
 import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -299,8 +311,11 @@ def synchronized_samples(
         spread_ns = max(item.received_ns for item in selected) - min(item.received_ns for item in selected)
         if spread_ns > maximum_spread_ns:
             continue
-        # Prefer more cameras, then tighter synchronization, then newer data.
-        score = (len(selected), -spread_ns, max(item.received_ns for item in selected))
+        # Prefer more cameras, then the newest valid bundle.  Using spread as
+        # the second key can pin the selector to an older, unusually tight
+        # bundle until it ages out of source_timeout_ns, throttling a 15 Hz
+        # input to only a few fused packets per second.
+        score = (len(selected), max(item.received_ns for item in selected), -spread_ns)
         if best is None or score > best[0]:
             best = (score, selected, spread_ns / 1.0e6)
     return (best[1], best[2]) if best is not None else None
@@ -379,6 +394,107 @@ def compact_sample(sample: Sample) -> dict[str, Any]:
     })
 
 
+def event_rate(events: deque[float], now: float, window_s: float = 2.0) -> float:
+    while events and now - events[0] > window_s:
+        events.popleft()
+    if len(events) < 2:
+        return 0.0
+    elapsed = events[-1] - events[0]
+    return (len(events) - 1) / elapsed if elapsed > 1.0e-6 else 0.0
+
+
+def cross_view_agreement(
+    prepared: list[tuple[int, np.ndarray, np.ndarray]],
+    fused: np.ndarray,
+    minimum_confidence: float,
+) -> dict[str, Any]:
+    errors: list[float] = []
+    per_joint: dict[str, float | None] = {}
+    for joint, name in enumerate(BODY38_NAMES):
+        joint_errors: list[float] = []
+        if np.isfinite(fused[joint]).all():
+            for _serial, xyz, conf in prepared:
+                if np.isfinite(xyz[joint]).all() and conf[joint] >= minimum_confidence:
+                    joint_errors.append(float(np.linalg.norm(xyz[joint] - fused[joint])))
+        per_joint[name] = float(np.mean(joint_errors)) if joint_errors else None
+        errors.extend(joint_errors)
+    finite = np.asarray(errors, dtype=np.float64)
+    return sanitize({
+        "mpjpe_m": float(np.mean(finite)) if finite.size else None,
+        "p95_error_m": float(np.percentile(finite, 95)) if finite.size else None,
+        "pelvis_error_m": per_joint["PELVIS"],
+        "left_wrist_error_m": per_joint["LEFT_WRIST"],
+        "right_wrist_error_m": per_joint["RIGHT_WRIST"],
+        "per_joint_error_m": per_joint,
+    })
+
+
+def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Remove analysis-only arrays so the real-time GMR datagram stays small."""
+    result = dict(packet)
+    multi = dict(result.get("multi_camera") or {})
+    compact_views = []
+    for view in multi.get("per_camera") or []:
+        item = dict(view)
+        item.pop("keypoints_3d_fusion_m", None)
+        item.pop("keypoint_confidence", None)
+        compact_views.append(item)
+    multi["per_camera"] = compact_views
+    multi.pop("camera_pose_fusion_from_local", None)
+    result["multi_camera"] = multi
+    return result
+
+
+def draw_four_preview(
+    frames: dict[int, np.ndarray],
+    endpoints: list[InputEndpoint],
+    source_metrics: dict[int, dict[str, Any]],
+    *,
+    connected: list[int],
+    body_fresh: list[int],
+    contributing: list[int],
+    output_hz: float,
+    arrival_spread_ms: float,
+    recording: bool,
+    recorded: int,
+    record_dropped: int,
+) -> np.ndarray | None:
+    if cv2 is None:
+        return None
+    tile_width, tile_height = 640, 360
+    tiles: list[np.ndarray] = []
+    now_ns = time.time_ns()
+    for endpoint in endpoints:
+        source = frames.get(endpoint.serial)
+        if source is None:
+            tile = np.zeros((tile_height, tile_width, 3), dtype=np.uint8)
+            cv2.putText(tile, "ONIZLEME BEKLENIYOR", (145, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 180, 255), 2, cv2.LINE_AA)
+        else:
+            tile = source
+            if tile.ndim == 2:
+                tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+            tile = cv2.resize(tile, (tile_width, tile_height), interpolation=cv2.INTER_AREA)
+        metric = source_metrics.get(endpoint.serial, {})
+        age_ms = (now_ns - int(metric.get("last_body_ns", 0))) / 1.0e6 if metric.get("last_body_ns") else math.inf
+        body_fps = float(metric.get("body_fps", 0.0))
+        rx_fps = float(metric.get("rx_fps", 0.0))
+        capture_ms = metric.get("capture_to_receive_ms")
+        capture_text = f"{float(capture_ms):.1f}ms" if isinstance(capture_ms, (int, float)) and math.isfinite(float(capture_ms)) else "n/a"
+        color = (40, 220, 80) if endpoint.serial in body_fresh else (0, 165, 255)
+        cv2.rectangle(tile, (0, 0), (tile_width, 62), (18, 18, 18), -1)
+        cv2.putText(tile, f"ZED {endpoint.serial}  BODY {body_fps:.1f} fps  RX {rx_fps:.1f} fps", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, color, 2, cv2.LINE_AA)
+        cv2.putText(tile, f"durum={metric.get('status', 'YOK')}  gecikme={capture_text}  body_yasi={age_ms:.0f}ms", (12, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 235), 1, cv2.LINE_AA)
+        tiles.append(tile)
+    while len(tiles) < 4:
+        tiles.append(np.zeros((tile_height, tile_width, 3), dtype=np.uint8))
+    grid = np.vstack((np.hstack((tiles[0], tiles[1])), np.hstack((tiles[2], tiles[3]))))
+    footer = np.zeros((82, grid.shape[1], 3), dtype=np.uint8)
+    spread = f"{arrival_spread_ms:.1f} ms" if math.isfinite(arrival_spread_ms) else "n/a"
+    cv2.putText(footer, f"4-ZED BODY_38 | bagli={len(connected)}/4 | body_taze={len(body_fresh)}/4 | fusion_katki={len(contributing)}/4 | fusion={output_hz:.1f} fps | yayilim={spread}", (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (80, 235, 235), 2, cv2.LINE_AA)
+    cv2.putText(footer, f"REC={'ON' if recording else 'OFF'} kare={recorded} drop={record_dropped} | S: kayit ac/kapat | Q/ESC: cikis", (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (60, 220, 80) if recording else (200, 200, 200), 2, cv2.LINE_AA)
+    return np.vstack((grid, footer))
+
+
 def make_output_packet(
     views: list[tuple[Sample, Extrinsic]],
     *,
@@ -387,6 +503,11 @@ def make_output_packet(
     output_sequence: int,
     reference_serial: int,
     arrival_spread_ms: float,
+    source_metrics: dict[int, dict[str, Any]] | None = None,
+    connected_serials: list[int] | None = None,
+    effective_output_hz: float = 0.0,
+    record_queue_depth: int = 0,
+    record_dropped: int = 0,
 ) -> dict[str, Any]:
     best_sample, best_extrinsic = max(
         views,
@@ -413,6 +534,37 @@ def make_output_packet(
         else np.full_like(fused, np.nan)
     )
     fused_features = build_g1_features(fused, fused_confidence, minimum_confidence)
+    prepared_views = [
+        (
+            sample.serial,
+            transformed_points(sample.packet, extrinsic),
+            confidence(sample.packet.get("keypoint_confidence")),
+        )
+        for sample, extrinsic in views
+    ]
+    metrics = source_metrics or {}
+    view_descriptions = []
+    camera_poses: dict[str, Any] = {}
+    now_ns = time.time_ns()
+    for (sample, extrinsic), (_serial, world_points, source_confidence) in zip(views, prepared_views):
+        source_metric = metrics.get(sample.serial, {})
+        view_descriptions.append(sanitize({
+            "serial_number": sample.serial,
+            "sequence": sample.sequence,
+            "body_confidence": sample.packet.get("body_confidence", 0.0),
+            "source_timestamp_ns": int(sample.packet.get("timestamp_ns", 0) or 0),
+            "receiver_timestamp_ns": sample.received_ns,
+            "receiver_age_ms": (now_ns - sample.received_ns) / 1.0e6,
+            "quality_score": sample_quality(sample.packet, minimum_confidence),
+            "keypoints_3d_fusion_m": world_points,
+            "keypoint_confidence": source_confidence,
+            "source_metrics": source_metric,
+        }))
+        camera_poses[str(sample.serial)] = sanitize({
+            "rotation_camera_to_world": extrinsic.rotation,
+            "translation_camera_to_world_m": extrinsic.translation,
+        })
+    agreement = cross_view_agreement(prepared_views, fused, minimum_confidence)
     calibration = dict(packet.get("calibration") or {})
     profile = dict(calibration.get("profile") or {})
     neutral = np.asarray(profile.get("neutral_pelvis_rotation_matrix"), dtype=np.float64)
@@ -462,6 +614,34 @@ def make_output_packet(
             "maximum_joint_spread_m": maximum_spread_m,
             "arrival_spread_ms": arrival_spread_ms,
         },
+        "multi_camera": {
+            "mode": "FOUR_FUSED" if len(views) == 4 else "PARTIAL_FUSED",
+            "contributing_views": len(views),
+            "contributing_serials": [sample.serial for sample, _ in views],
+            "connected_serials": connected_serials or [sample.serial for sample, _ in views],
+            "configured_serials": sorted(metrics) if metrics else [sample.serial for sample, _ in views],
+            "camera_timestamp_delta_ms": arrival_spread_ms,
+            "camera_sync_ok": bool(arrival_spread_ms <= 110.0),
+            "fused_quality_score": float(np.mean(fused_confidence) / 100.0),
+            "best_single_quality_score": sample_quality(best_sample.packet, minimum_confidence),
+            "cross_view_agreement": agreement,
+            "fusion_metrics": {
+                "mean_camera_fused": float(np.mean(contributions)),
+                "mean_stdev_between_camera_s": arrival_spread_ms / 1000.0,
+                "per_camera": metrics,
+            },
+            "per_camera": view_descriptions,
+            "camera_pose_fusion_from_local": camera_poses,
+            "failure_codes": [] if len(views) == 4 else ["PARTIAL_CAMERA_SET"],
+        },
+        "transport_metrics": {
+            "source_interval_ms": 1000.0 / effective_output_hz if effective_output_hz > 0.0 else None,
+            "effective_output_hz": effective_output_hz,
+            "capture_to_send_ms": (now_ns - int(best_sample.packet.get("timestamp_ns", 0) or now_ns)) / 1.0e6,
+            "record_queue_depth": record_queue_depth,
+            "record_dropped": record_dropped,
+            "source_mode": "distributed_four_zed_body38",
+        },
         "latency_trace_ns": {
             "t0_capture_ns": int(best_sample.packet.get("timestamp_ns", 0) or 0),
             "t2_windows_udp_receive_ns": best_sample.received_ns,
@@ -474,11 +654,18 @@ def make_output_packet(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Iki-host, dort-ZED application BODY_38 fusion alicisi")
     parser.add_argument("--source", type=parse_endpoint, action="append", required=True, help="Her kamera icin SERIAL:UDP_PORT; dort kez verin.")
+    parser.add_argument("--preview-source", type=parse_endpoint, action="append", default=[], help="Canli JPEG icin SERIAL:UDP_PORT; arayuz icin dort kez verin.")
     parser.add_argument("--bind", default="0.0.0.0", help="Dinlenecek PC IPv4 adresi (varsayilan tum arayuzler).")
     parser.add_argument("--extrinsics", type=Path, default=None, help="Kalibre edilmis zed_body38_distributed_extrinsics/v1 JSON dosyasi.")
     parser.add_argument("--output-host", default="", help="Birlesik BODY_38 UDP hedefi; bos ise cikis yayini kapali.")
     parser.add_argument("--output-port", type=int, default=15050)
     parser.add_argument("--output-max-hz", type=float, default=15.0)
+    parser.add_argument("--monitor-host", default="", help="Tam analiz/Rerun BODY_38 kopyasi.")
+    parser.add_argument("--monitor-port", type=int, default=15052)
+    parser.add_argument("--monitor-max-hz", type=float, default=15.0)
+    parser.add_argument("--ros-host", default="", help="Kompakt ROS/WSL BODY_38 kopyasi.")
+    parser.add_argument("--ros-port", type=int, default=15054)
+    parser.add_argument("--ros-max-hz", type=float, default=15.0)
     parser.add_argument("--confidence", type=float, default=45.0)
     parser.add_argument("--max-sync-ms", type=float, default=110.0, help="Ana PC'ye varis zamanina gore azami dortlu paket yayilimi.")
     parser.add_argument("--source-timeout-ms", type=float, default=750.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
@@ -486,6 +673,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-joint-spread-m", type=float, default=0.30)
     parser.add_argument("--calibration-record", type=Path, default=None, help="Dortlu senkron ham BODY_38 karelerini JSONL olarak kaydet.")
     parser.add_argument("--calibration-max-hz", type=float, default=12.0)
+    parser.add_argument("--record", action="store_true", help="Fusion JSONL kaydini baslangicta ac.")
+    parser.add_argument("--output-dir", type=Path, default=REPOSITORY_ROOT / "recordings")
+    parser.add_argument("--record-stem", default="four_body38_fusion")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--preview-hz", type=float, default=10.0, help="2x2 arayuz yenileme hizi.")
     parser.add_argument("--duration", type=float, default=0.0)
     return parser.parse_args()
 
@@ -493,14 +685,35 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     endpoints: list[InputEndpoint] = args.source
+    preview_endpoints: list[InputEndpoint] = args.preview_source
     if len(endpoints) != 4 or len({item.serial for item in endpoints}) != 4 or len({item.port for item in endpoints}) != 4:
         print("HATA: tam dort farkli SERIAL:PORT kaynagi gerekli.", file=sys.stderr)
         return 2
-    if not 0.0 <= args.confidence <= 100.0 or args.max_sync_ms <= 0.0 or args.source_timeout_ms <= 0.0 or args.max_joint_spread_m <= 0.0:
+    if preview_endpoints and (
+        len(preview_endpoints) != 4
+        or {item.serial for item in preview_endpoints} != {item.serial for item in endpoints}
+        or len({item.port for item in preview_endpoints}) != 4
+    ):
+        print("HATA: onizleme icin ayni dort seriye ait dort farkli SERIAL:PORT gerekli.", file=sys.stderr)
+        return 2
+    if preview_endpoints and not args.headless and cv2 is None:
+        print("HATA: dortlu arayuz icin opencv-python kurulu olmali.", file=sys.stderr)
+        return 2
+    if (
+        not 0.0 <= args.confidence <= 100.0
+        or args.max_sync_ms <= 0.0
+        or args.source_timeout_ms <= 0.0
+        or args.max_joint_spread_m <= 0.0
+        or args.output_max_hz <= 0.0
+        or args.monitor_max_hz <= 0.0
+        or args.ros_max_hz <= 0.0
+        or args.preview_hz <= 0.0
+    ):
         print("HATA: confidence, max-sync-ms, source-timeout-ms veya max-joint-spread-m gecersiz.", file=sys.stderr)
         return 2
+    resolved_extrinsics = args.extrinsics.expanduser().resolve() if args.extrinsics else None
     try:
-        extrinsics = load_extrinsics(args.extrinsics.resolve() if args.extrinsics else None, endpoints)
+        extrinsics = load_extrinsics(resolved_extrinsics, endpoints)
     except ValueError as exc:
         print(f"HATA: {exc}", file=sys.stderr)
         return 2
@@ -517,16 +730,32 @@ def main() -> int:
             receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             receiver.bind((args.bind, endpoint.port))
             receiver.setblocking(False)
-            selector.register(receiver, selectors.EVENT_READ, data=endpoint)
+            selector.register(receiver, selectors.EVENT_READ, data=("body", endpoint))
             sockets.append(receiver)
             print(f"DINLE | ZED {endpoint.serial} | {args.bind}:{endpoint.port}")
+        for endpoint in preview_endpoints:
+            receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            receiver.bind((args.bind, endpoint.port))
+            receiver.setblocking(False)
+            selector.register(receiver, selectors.EVENT_READ, data=("preview", endpoint))
+            sockets.append(receiver)
+            print(f"ONIZLE | ZED {endpoint.serial} | {args.bind}:{endpoint.port}")
     except OSError as exc:
         print(f"HATA: UDP portu acilamadi: {exc}", file=sys.stderr)
         for item in sockets:
             item.close()
         return 3
 
-    output_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if args.output_host else None
+    output_targets: dict[str, tuple[tuple[str, int], float]] = {}
+    if args.output_host:
+        output_targets["gmr"] = ((args.output_host, args.output_port), args.output_max_hz)
+    if args.monitor_host:
+        output_targets["monitor"] = ((args.monitor_host, args.monitor_port), args.monitor_max_hz)
+    if args.ros_host:
+        output_targets["ros"] = ((args.ros_host, args.ros_port), args.ros_max_hz)
+    output_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if output_targets else None
+    last_target_send = {name: 0.0 for name in output_targets}
     record_file = None
     if args.calibration_record:
         path = args.calibration_record.expanduser().resolve()
@@ -542,6 +771,64 @@ def main() -> int:
             "instruction": "Tripodlar sabitken ortak gorus alaninda 20-30 saniye T-pozda sakin durun.",
         }), ensure_ascii=False, allow_nan=False) + "\n")
         print(f"HAM KALIBRASYON KAYDI: {path}")
+
+    args.output_dir = args.output_dir.expanduser().resolve()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    record_path = args.output_dir / f"{args.record_stem}_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+    fusion_record_file = None
+    recording = False
+    recorded = 0
+    record_dropped = 0
+    record_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=300)
+    writer_stop = threading.Event()
+    writer_thread: threading.Thread | None = None
+    writer_errors: list[str] = []
+
+    def writer_loop() -> None:
+        nonlocal recorded
+        while not writer_stop.is_set() or not record_queue.empty():
+            try:
+                item = record_queue.get(timeout=0.10)
+            except queue.Empty:
+                continue
+            try:
+                if fusion_record_file is not None:
+                    fusion_record_file.write(json.dumps(sanitize(item), ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n")
+                    recorded += 1
+            except Exception as exc:
+                writer_errors.append(str(exc))
+            finally:
+                record_queue.task_done()
+
+    def set_recording(enabled: bool) -> None:
+        nonlocal fusion_record_file, writer_thread, recording
+        if enabled and fusion_record_file is None:
+            fusion_record_file = record_path.open("w", encoding="utf-8", buffering=1024 * 1024)
+            extrinsic_document = None
+            if resolved_extrinsics is not None:
+                try:
+                    extrinsic_document = json.loads(resolved_extrinsics.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    extrinsic_document = None
+            header = sanitize({
+                "schema": "zed_four_body38_g1_reference/metadata/v1",
+                "created_unix_ns": time.time_ns(),
+                "body_format": "BODY_38",
+                "keypoint_names": BODY38_NAMES,
+                "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+                "units": "meter",
+                "serial_numbers": [item.serial for item in endpoints],
+                "body_sources": [{"serial": item.serial, "port": item.port} for item in endpoints],
+                "preview_sources": [{"serial": item.serial, "port": item.port} for item in preview_endpoints],
+                "extrinsics_path": str(resolved_extrinsics) if resolved_extrinsics else None,
+                "extrinsics": extrinsic_document,
+                "safety": "Perception only; contains no physical robot motor commands.",
+            })
+            fusion_record_file.write(json.dumps(header, ensure_ascii=False, allow_nan=False) + "\n")
+            writer_thread = threading.Thread(target=writer_loop, name="four-body38-jsonl-writer", daemon=True)
+            writer_thread.start()
+        recording = enabled
+        print(f"4-ZED fusion kayit {'ACIK' if enabled else 'KAPALI'}: {record_path} ({recorded} kare, drop={record_dropped})", flush=True)
 
     histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=16) for item in endpoints}
     last_any_packet_ns: dict[int, int] = {}
@@ -560,13 +847,29 @@ def main() -> int:
     raw_records = 0
     last_fused_serials: list[int] = []
     last_arrival_spread_ms = math.nan
+    preview_frames: dict[int, np.ndarray] = {}
+    preview_received_ns: dict[int, int] = {}
+    any_events = {item.serial: deque(maxlen=120) for item in endpoints}
+    body_events = {item.serial: deque(maxlen=120) for item in endpoints}
+    output_events: deque[float] = deque(maxlen=120)
+    source_metrics: dict[int, dict[str, Any]] = {item.serial: {} for item in endpoints}
+    last_preview_at = 0.0
     started = time.monotonic()
     last_status = started
+    if args.record:
+        set_recording(True)
+    print("HAZIR | Q/ESC: cikis | S: fusion JSONL kayit ac/kapat")
     try:
         while True:
+            if msvcrt is not None and msvcrt.kbhit():
+                pressed = msvcrt.getwch().lower()
+                if pressed in ("q", "\x1b"):
+                    break
+                if pressed == "s":
+                    set_recording(not recording)
             events = selector.select(timeout=0.20)
             for key, _ in events:
-                endpoint: InputEndpoint = key.data
+                kind, endpoint = key.data
                 while True:
                     try:
                         payload, _sender = key.fileobj.recvfrom(65535)
@@ -574,6 +877,14 @@ def main() -> int:
                         break
                     except OSError:
                         break
+                    if kind == "preview":
+                        if cv2 is not None:
+                            encoded_image = np.frombuffer(payload, dtype=np.uint8)
+                            decoded = cv2.imdecode(encoded_image, cv2.IMREAD_COLOR)
+                            if decoded is not None:
+                                preview_frames[endpoint.serial] = decoded
+                                preview_received_ns[endpoint.serial] = time.time_ns()
+                        continue
                     try:
                         document = json.loads(payload.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -584,6 +895,7 @@ def main() -> int:
                         continue
                     received_ns = time.time_ns()
                     last_any_packet_ns[endpoint.serial] = received_ns
+                    any_events[endpoint.serial].append(time.monotonic())
                     if document.get("schema") == "zed_body38_live/status/v1":
                         # A strict/monitor source reports frame-integrity state
                         # on the same port.  It is not a body payload and must
@@ -611,6 +923,7 @@ def main() -> int:
                         sequence=int(document.get("sequence", 0) or 0),
                     ))
                     last_body_packet_ns[endpoint.serial] = received_ns
+                    body_events[endpoint.serial].append(time.monotonic())
                     last_source_status[endpoint.serial] = "BODY"
                     per_source_input[endpoint.serial] += 1
                     input_packets += 1
@@ -641,6 +954,23 @@ def main() -> int:
                         last_record_at = now
                     if extrinsics is not None and now - last_output_at >= 0.98 / args.output_max_hz:
                         views = [(sample, extrinsics.cameras[sample.serial]) for sample in samples]
+                        status_now_ns = time.time_ns()
+                        online_serials = sorted(serial for serial, stamp in last_any_packet_ns.items() if status_now_ns - stamp <= int(args.source_timeout_ms * 1.0e6))
+                        for sample in samples:
+                            capture_ns = int(sample.packet.get("timestamp_ns", 0) or 0)
+                            trace = sample.packet.get("latency_trace_ns") or {}
+                            if isinstance(trace, dict):
+                                capture_ns = int(trace.get("t0_capture_ns", capture_ns) or capture_ns)
+                            latency_ms = (sample.received_ns - capture_ns) / 1.0e6 if capture_ns else None
+                            source_metrics[sample.serial].update({
+                                "status": last_source_status.get(sample.serial, "BODY"),
+                                "body_fps": event_rate(body_events[sample.serial], now),
+                                "rx_fps": event_rate(any_events[sample.serial], now),
+                                "capture_to_receive_ms": latency_ms,
+                                "last_body_ns": last_body_packet_ns.get(sample.serial),
+                                "source_transport": sample.packet.get("transport_metrics") or {},
+                            })
+                        effective_hz = event_rate(output_events, now)
                         packet = make_output_packet(
                             views,
                             minimum_confidence=args.confidence,
@@ -648,27 +978,83 @@ def main() -> int:
                             output_sequence=output_sequence,
                             reference_serial=extrinsics.reference_serial,
                             arrival_spread_ms=arrival_spread_ms,
+                            source_metrics=source_metrics,
+                            connected_serials=online_serials,
+                            effective_output_hz=effective_hz,
+                            record_queue_depth=record_queue.qsize(),
+                            record_dropped=record_dropped,
                         )
-                        encoded = json.dumps(packet, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-                        if len(encoded) <= 60000:
+                        compact = compact_live_packet(packet)
+                        compact_encoded = json.dumps(compact, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+                        full_encoded = json.dumps(packet, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+                        if len(compact_encoded) > 60000:
+                            print(f"UYARI: kompakt fusion UDP paketi cok buyuk ({len(compact_encoded)} byte).", file=sys.stderr)
+                        else:
+                            # Control is deliberately sent before analysis and disk work.
+                            if output_socket is not None:
+                                for target_name in ("gmr", "monitor", "ros"):
+                                    target_config = output_targets.get(target_name)
+                                    if target_config is None:
+                                        continue
+                                    target, target_hz = target_config
+                                    if now - last_target_send[target_name] < 0.98 / target_hz:
+                                        continue
+                                    outgoing = full_encoded if target_name == "monitor" and len(full_encoded) <= 60000 else compact_encoded
+                                    try:
+                                        output_socket.sendto(outgoing, target)
+                                        last_target_send[target_name] = now
+                                    except OSError as exc:
+                                        print(f"UYARI: {target_name} UDP gonderilemedi: {exc}", file=sys.stderr)
                             output_sequence += 1
                             fused_packets += 1
+                            output_events.append(now)
                             last_fused_serials = sorted(sample.serial for sample in samples)
                             last_arrival_spread_ms = arrival_spread_ms
                             last_output_at = now
-                            if output_socket is not None:
-                                output_socket.sendto(encoded, (args.output_host, args.output_port))
-                        else:
-                            print(f"UYARI: birlesik UDP paketi cok buyuk ({len(encoded)} byte).", file=sys.stderr)
+                            if recording:
+                                try:
+                                    record_queue.put_nowait(packet)
+                                except queue.Full:
+                                    record_dropped += 1
 
             now = time.monotonic()
+            status_now_ns = time.time_ns()
+            timeout_ns = int(args.source_timeout_ms * 1.0e6)
+            online_serials = sorted(serial for serial, stamp in last_any_packet_ns.items() if status_now_ns - stamp <= timeout_ns)
+            body_serials = sorted(serial for serial, stamp in last_body_packet_ns.items() if status_now_ns - stamp <= timeout_ns)
+            for endpoint in endpoints:
+                metric = source_metrics[endpoint.serial]
+                metric.update({
+                    "status": last_source_status.get(endpoint.serial, "YOK"),
+                    "body_fps": event_rate(body_events[endpoint.serial], now),
+                    "rx_fps": event_rate(any_events[endpoint.serial], now),
+                    "last_body_ns": last_body_packet_ns.get(endpoint.serial),
+                    "preview_age_ms": (status_now_ns - preview_received_ns[endpoint.serial]) / 1.0e6 if endpoint.serial in preview_received_ns else None,
+                })
+            if preview_endpoints and not args.headless and now - last_preview_at >= 0.98 / args.preview_hz:
+                preview = draw_four_preview(
+                    preview_frames, endpoints, source_metrics,
+                    connected=online_serials,
+                    body_fresh=body_serials,
+                    contributing=last_fused_serials,
+                    output_hz=event_rate(output_events, now),
+                    arrival_spread_ms=last_arrival_spread_ms,
+                    recording=recording,
+                    recorded=recorded,
+                    record_dropped=record_dropped,
+                )
+                if preview is not None:
+                    cv2.imshow("Four ZED 2i BODY_38 Fusion - G1", preview)
+                    key_code = cv2.waitKey(1) & 0xFF
+                    if key_code in (ord("q"), ord("Q"), 27):
+                        break
+                    if key_code in (ord("s"), ord("S")):
+                        set_recording(not recording)
+                last_preview_at = now
+
             if now - last_status >= 1.0:
-                status_now_ns = time.time_ns()
-                timeout_ns = int(args.source_timeout_ms * 1.0e6)
-                online_serials = sorted(serial for serial, stamp in last_any_packet_ns.items() if status_now_ns - stamp <= timeout_ns)
-                body_serials = sorted(serial for serial, stamp in last_body_packet_ns.items() if status_now_ns - stamp <= timeout_ns)
                 details = ", ".join(
-                    f"{item.serial}:{last_source_status.get(item.serial, 'YOK')}/b{per_source_input[item.serial]}/s{per_source_status[item.serial]}"
+                    f"{item.serial}:{last_source_status.get(item.serial, 'YOK')}/body={source_metrics[item.serial].get('body_fps', 0.0):.1f}fps/rx={source_metrics[item.serial].get('rx_fps', 0.0):.1f}fps"
                     for item in endpoints
                 )
                 print(
@@ -676,7 +1062,9 @@ def main() -> int:
                     f"| body_taze={len(body_serials)}/4 [{', '.join(map(str, body_serials)) or 'yok'}] | input={input_packets} "
                     f"| ham_kayit={raw_records} | fusion_cikis={fused_packets} "
                     f"| son_katki=[{', '.join(map(str, last_fused_serials)) or 'yok'}] "
+                    f"| fusion_fps={event_rate(output_events, now):.1f} "
                     f"| yayilim_ms={last_arrival_spread_ms:.1f} "
+                    f"| rec={recorded}/drop={record_dropped}/q={record_queue.qsize()} "
                     f"| durum={status_packets} | gecersiz={invalid_packets} | {details}",
                     flush=True,
                 )
@@ -690,6 +1078,16 @@ def main() -> int:
             record_file.close()
         if output_socket is not None:
             output_socket.close()
+        if fusion_record_file is not None:
+            recording = False
+            record_queue.join()
+            writer_stop.set()
+            if writer_thread is not None:
+                writer_thread.join(timeout=5.0)
+            fusion_record_file.flush()
+            fusion_record_file.close()
+        if cv2 is not None and not args.headless:
+            cv2.destroyAllWindows()
         for item in sockets:
             try:
                 selector.unregister(item)
@@ -697,7 +1095,11 @@ def main() -> int:
                 pass
             item.close()
         selector.close()
-    print(f"Bitti | input={input_packets} | ham_kayit={raw_records} | fusion_cikis={fused_packets}")
+    print(f"Bitti | input={input_packets} | ham_kayit={raw_records} | fusion_cikis={fused_packets} | kayit={recorded} | drop={record_dropped}")
+    if fusion_record_file is not None:
+        print(f"FUSION JSONL: {record_path}")
+    if writer_errors:
+        print(f"UYARI: JSONL yazici hatasi: {writer_errors[-1]}", file=sys.stderr)
     return 0
 
 

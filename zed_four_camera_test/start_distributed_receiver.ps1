@@ -1,10 +1,21 @@
 param(
     [Parameter(Mandatory = $true)]
     [string[]]$Source,
+    [string[]]$PreviewSource = @(),
     [string]$Extrinsics = "",
     [string]$OutputHost = "",
     [ValidateRange(1024, 65535)]
     [int]$OutputPort = 15050,
+    [string]$MonitorHost = "",
+    [ValidateRange(1024, 65535)]
+    [int]$MonitorPort = 15052,
+    [ValidateRange(1, 60)]
+    [int]$MonitorHz = 15,
+    [string]$RosHost = "",
+    [ValidateRange(1024, 65535)]
+    [int]$RosPort = 15054,
+    [ValidateRange(1, 60)]
+    [int]$RosHz = 15,
     [string]$CalibrationRecord = "",
     [ValidateRange(1, 60)]
     [int]$Fps = 15,
@@ -14,6 +25,12 @@ param(
     [double]$MaxSyncMs = 110,
     [ValidateRange(100, 5000)]
     [double]$SourceTimeoutMs = 750,
+    [ValidateRange(1, 30)]
+    [double]$PreviewHz = 10,
+    [string]$OutputDir = "",
+    [string]$RecordStem = "four_body38_fusion",
+    [switch]$Record,
+    [switch]$Headless,
     [ValidateRange(0, 86400)]
     [double]$Duration = 0
 )
@@ -31,6 +48,10 @@ if ($Source.Count -ne 4) {
 $arguments = @($receiver)
 foreach ($item in $Source) {
     $arguments += "--source"
+    $arguments += $item
+}
+foreach ($item in $PreviewSource) {
+    $arguments += "--preview-source"
     $arguments += $item
 }
 $arguments += "--minimum-sources"
@@ -53,9 +74,25 @@ if ($OutputHost) {
     $arguments += "--output-max-hz"
     $arguments += "$Fps"
 }
+if ($MonitorHost) {
+    $arguments += @("--monitor-host", $MonitorHost, "--monitor-port", "$MonitorPort", "--monitor-max-hz", "$MonitorHz")
+}
+if ($RosHost) {
+    $arguments += @("--ros-host", $RosHost, "--ros-port", "$RosPort", "--ros-max-hz", "$RosHz")
+}
 if ($CalibrationRecord) {
     $arguments += "--calibration-record"
     $arguments += $CalibrationRecord
+}
+$arguments += @("--preview-hz", "$PreviewHz", "--record-stem", $RecordStem)
+if ($OutputDir) {
+    $arguments += @("--output-dir", $OutputDir)
+}
+if ($Record) {
+    $arguments += "--record"
+}
+if ($Headless) {
+    $arguments += "--headless"
 }
 & $python @arguments
 exit $LASTEXITCODE

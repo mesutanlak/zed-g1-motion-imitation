@@ -508,8 +508,29 @@ class RerunSkeletonApp:
 
         # The analysis-only UDP copy carries calibrated raw camera skeletons;
         # the WSL/GMR control packet remains compact to avoid fragmentation.
-        camera_views = (source.get("multi_camera") or {}).get("per_camera") or []
-        for camera_index, view in enumerate(camera_views[:2], start=1):
+        multi_camera = source.get("multi_camera") or {}
+        camera_views = multi_camera.get("per_camera") or []
+        views_by_serial = {
+            int(view.get("serial_number")): view
+            for view in camera_views
+            if isinstance(view, dict) and view.get("serial_number") is not None
+        }
+        camera_serials = sorted(
+            int(serial)
+            for serial in (
+                multi_camera.get("configured_serials")
+                or multi_camera.get("connected_serials")
+                or views_by_serial
+            )
+        )[:4]
+        camera_colors = (
+            [255, 180, 50],
+            [180, 90, 255],
+            [60, 220, 110],
+            [70, 170, 255],
+        )
+        for camera_index, serial in enumerate(camera_serials, start=1):
+            view = views_by_serial.get(serial, {})
             raw_view = view.get("keypoints_3d_fusion_m") or []
             camera_points = {
                 name: point
@@ -524,10 +545,16 @@ class RerunSkeletonApp:
             ]
             entity = f"/cam{camera_index}/body38"
             if camera_strips:
-                color = [255, 180, 50] if camera_index == 1 else [180, 90, 255]
+                color = camera_colors[camera_index - 1]
                 rr.log(entity, rr.LineStrips3D(camera_strips, radii=0.006, colors=color))
             else:
                 rr.log(entity, rr.Clear(recursive=False))
+            rr.log(
+                f"/cam{camera_index}",
+                rr.AnyValues(serial_number=serial, has_current_body=bool(camera_strips)),
+            )
+        for camera_index in range(len(camera_serials) + 1, 5):
+            rr.log(f"/cam{camera_index}/body38", rr.Clear(recursive=False))
 
         # A BODY_38 packet can temporarily omit a joint name altogether. Clear
         # any entity that existed in the previous packet but is absent now.

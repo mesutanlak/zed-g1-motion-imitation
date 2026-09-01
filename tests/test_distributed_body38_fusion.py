@@ -12,6 +12,7 @@ from zed_four_camera_test.distributed_body38_fusion import (
     Extrinsic,
     InputEndpoint,
     Sample,
+    compact_live_packet,
     load_extrinsics,
     make_output_packet,
     synchronized_samples,
@@ -83,6 +84,64 @@ def test_synchronized_samples_prefers_four_fresh_sources_and_ignores_stale() -> 
     assert spread_ms == 4.0
 
 
+def test_synchronized_samples_advances_past_an_older_tighter_bundle() -> None:
+    now = 2_000_000_000
+    histories = {
+        serial: deque([
+            Sample(serial, packet(serial, serial), now - 200_000_000, serial),
+            Sample(serial, packet(serial, serial + 10), now - (20 - serial * 2) * 1_000_000, serial + 10),
+        ], maxlen=16)
+        for serial in (1, 2, 3, 4)
+    }
+
+    selected = synchronized_samples(
+        histories,
+        now_ns=now,
+        source_timeout_ns=750_000_000,
+        maximum_spread_ns=110_000_000,
+        minimum_sources=4,
+    )
+
+    assert selected is not None
+    samples, spread_ms = selected
+    assert {sample.sequence for sample in samples} == {11, 12, 13, 14}
+    assert spread_ms == 6.0
+
+
+def test_synchronized_samples_keeps_up_with_four_15_hz_sources() -> None:
+    histories = {serial: deque(maxlen=16) for serial in (1, 2, 3, 4)}
+    selected_markers = []
+    period_ns = 66_666_667
+
+    for frame in range(15):
+        frame_start_ns = 1_000_000_000 + frame * period_ns
+        for serial in histories:
+            # The first bundle is perfectly aligned; subsequent bundles have
+            # realistic receive jitter and must still replace it immediately.
+            jitter_ns = 0 if frame == 0 else (serial - 1) * 2_000_000
+            received_ns = frame_start_ns + jitter_ns
+            histories[serial].append(Sample(
+                serial,
+                packet(serial, frame),
+                received_ns,
+                frame,
+            ))
+
+        selected = synchronized_samples(
+            histories,
+            now_ns=frame_start_ns + 10_000_000,
+            source_timeout_ns=750_000_000,
+            maximum_spread_ns=110_000_000,
+            minimum_sources=4,
+        )
+        assert selected is not None
+        samples, _ = selected
+        selected_markers.append(tuple((sample.serial, sample.sequence) for sample in samples))
+
+    assert len(set(selected_markers)) == 15
+    assert {sequence for _, sequence in selected_markers[-1]} == {14}
+
+
 def test_load_extrinsics_preserves_explicit_reference_serial(tmp_path) -> None:
     path = tmp_path / "extrinsics.json"
     path.write_text(json.dumps({
@@ -133,6 +192,41 @@ def test_fused_packet_rebuilds_world_and_g1_reference_features() -> None:
     assert np.allclose(fused["root_position_m"], base[IDX["PELVIS"]])
     assert fused["pelvis_frame"]["reference_frame"] == "FUSION_WORLD"
     assert fused["reference_ready"]["whole_body"] is True
+
+
+def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -> None:
+    base = body38_points()
+    views = [
+        (
+            Sample(serial, packet(serial, index), 1_000_000_000 + index * 1_000_000, index),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        )
+        for index, serial in enumerate((39504762, 31571870, 33773329, 34760587), start=1)
+    ]
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=8,
+        reference_serial=33773329,
+        arrival_spread_ms=3.0,
+        source_metrics={serial: {"body_fps": 15.0} for serial in (39504762, 31571870, 33773329, 34760587)},
+        connected_serials=[39504762, 31571870, 33773329, 34760587],
+        effective_output_hz=14.8,
+        record_queue_depth=2,
+    )
+
+    assert fused["multi_camera"]["mode"] == "FOUR_FUSED"
+    assert fused["multi_camera"]["contributing_views"] == 4
+    assert len(fused["multi_camera"]["per_camera"]) == 4
+    assert all(len(view["keypoints_3d_fusion_m"]) == 38 for view in fused["multi_camera"]["per_camera"])
+    assert fused["multi_camera"]["cross_view_agreement"]["mpjpe_m"] == 0.0
+    assert fused["transport_metrics"]["effective_output_hz"] == 14.8
+
+    compact = compact_live_packet(fused)
+    assert "camera_pose_fusion_from_local" not in compact["multi_camera"]
+    assert all("keypoints_3d_fusion_m" not in view for view in compact["multi_camera"]["per_camera"])
+    assert compact["keypoints_3d_m"] == fused["keypoints_3d_m"]
 
 
 def test_world_pose_jsonl_contains_metadata_and_one_line_per_camera(tmp_path) -> None:
