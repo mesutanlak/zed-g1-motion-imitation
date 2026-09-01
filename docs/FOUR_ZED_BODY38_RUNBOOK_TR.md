@@ -81,6 +81,15 @@ Saglikli bir kayitta `bagli=4/4`, `gecersiz=0`, `drop=0`, fusion FPS yaklasik
 14-15 ve mumkun oldugunca cok `fusion_katki=4/4` beklenir. `cross_view_mpjpe_m`
 dusuk olmalidir; 0.10 m uzeri kalibrasyon/ortak gorus kontrolu gerektirir.
 
+Kayit bittikten sonra son oturumun sayisal kabul ozetini al:
+
+```powershell
+.\zed_four_camera_test\summarize_four_body38_recording.ps1
+```
+
+Belirli bir dosya icin `-InputPath ".\recordings\four_body38_fusion_....jsonl"`
+verilebilir.
+
 ## Tripod hareket ederse yeniden kalibrasyon
 
 Kaynaklar acik, Isaac/Rerun/fusion alicisi kapali olsun. Ana PC'de 25-30 saniye
