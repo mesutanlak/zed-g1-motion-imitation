@@ -56,6 +56,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--duration", type=float, default=0.0, help="0 sonsuz calisma demektir.")
     parser.add_argument("--sdk-verbose", action="store_true", help="ZED SDK ayrintili logunu ac.")
+    parser.add_argument(
+        "--wait-for-body",
+        action="store_true",
+        help=(
+            "ZED360 ag uyumluluk testi icin ilk gecerli iskelet algilanana kadar "
+            "start_publishing cagrisini geciktir."
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-body-timeout",
+        type=float,
+        default=90.0,
+        help="--wait-for-body icin saniye cinsinden azami bekleme.",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +86,9 @@ def parse_camera(value: str) -> tuple[int, int]:
 
 def main() -> int:
     args = parse_args()
+    if args.wait_for_body_timeout <= 0.0:
+        print("--wait-for-body-timeout pozitif olmali.", file=sys.stderr)
+        return 2
     try:
         requested = [parse_camera(item) for item in args.camera]
     except argparse.ArgumentTypeError as exc:
@@ -153,6 +170,34 @@ def main() -> int:
             camera.close()
             continue
 
+        bodies = sl.Bodies()
+        if args.wait_for_body:
+            runtime = sl.BodyTrackingRuntimeParameters()
+            runtime.detection_confidence_threshold = 40
+            runtime.skeleton_smoothing = 0.7
+            deadline = time.monotonic() + args.wait_for_body_timeout
+            print(
+                f"BEKLE | ZED {serial} | yayin oncesi BODY_18 iskeleti bekleniyor "
+                f"(azami {args.wait_for_body_timeout:.0f}s)..."
+            )
+            while time.monotonic() < deadline:
+                if camera.grab() == sl.ERROR_CODE.SUCCESS:
+                    camera.retrieve_bodies(bodies, runtime)
+                    if bodies.body_list:
+                        print(
+                            f"WARMUP OK | ZED {serial} | bodies={len(bodies.body_list)} "
+                            f"| received_format={bodies.body_format}"
+                        )
+                        break
+                time.sleep(0.001)
+            else:
+                print(
+                    f"ZED {serial} yayin oncesi insan algilayamadi; yayin baslatilmadi.",
+                    file=sys.stderr,
+                )
+                camera.close()
+                continue
+
         communication = sl.CommunicationParameters()
         communication.set_for_local_network(port)
         status = camera.start_publishing(communication)
@@ -161,7 +206,7 @@ def main() -> int:
             camera.close()
             continue
 
-        publishers.append(Publisher(serial, port, camera, sl.Bodies(), last_report=time.monotonic()))
+        publishers.append(Publisher(serial, port, camera, bodies, last_report=time.monotonic()))
         print(
             f"HAZIR | ZED {serial} | {args.body_format.upper()} "
             f"| UDP port {port} | HD720@{args.fps}"
