@@ -79,35 +79,39 @@ if (-not $SkipGmrCheck) {
 $source = @("39504762:16000", "31571870:16002", "33773329:16004", "34760587:16006")
 $previewSource = @("39504762:16100", "31571870:16102", "33773329:16104", "34760587:16106")
 $receiver = Join-Path $project "zed_four_camera_test\start_distributed_receiver.ps1"
-$arguments = @(
-    "-Source", $source,
-    "-Extrinsics", $Extrinsics,
-    "-OutputHost", $wslAddress,
-    "-OutputPort", 15050,
-    "-Fps", $FusionHz,
-    "-MinimumSources", $MinimumSources,
-    "-MaxSyncMs", 110,
-    "-SourceTimeoutMs", 750,
-    "-PreviewHz", $PreviewHz,
-    "-RecordStem", "four_body38_fusion"
-)
+$receiverArguments = @{
+    Source = $source
+    Extrinsics = $Extrinsics
+    OutputHost = $wslAddress
+    OutputPort = 15050
+    Fps = $FusionHz
+    MinimumSources = $MinimumSources
+    MaxSyncMs = 110
+    SourceTimeoutMs = 750
+    PreviewHz = $PreviewHz
+    RecordStem = "four_body38_fusion"
+}
 if (-not $Headless) {
-    $arguments += @("-PreviewSource", $previewSource)
+    $receiverArguments.PreviewSource = $previewSource
 }
 if (-not $NoAnalysisStream) {
-    $arguments += @("-MonitorHost", $AnalysisHost, "-MonitorPort", 15052, "-MonitorHz", $FusionHz)
+    $receiverArguments.MonitorHost = $AnalysisHost
+    $receiverArguments.MonitorPort = 15052
+    $receiverArguments.MonitorHz = $FusionHz
 }
 if (-not $NoRosStream) {
-    $arguments += @("-RosHost", $wslAddress, "-RosPort", 15054, "-RosHz", $FusionHz)
+    $receiverArguments.RosHost = $wslAddress
+    $receiverArguments.RosPort = 15054
+    $receiverArguments.RosHz = $FusionHz
 }
-if ($Record) { $arguments += "-Record" }
-if ($Headless) { $arguments += "-Headless" }
+if ($Record) { $receiverArguments.Record = $true }
+if ($Headless) { $receiverArguments.Headless = $true }
 
 Write-Host "GMR/Isaac: ${wslAddress}:15050 | Rerun: ${AnalysisHost}:15052 | ROS: ${wslAddress}:15054"
 Write-Host "Fusion: en az $MinimumSources/4 taze kamera, azami ${FusionHz}Hz | arayuz=${PreviewHz}Hz"
 Write-Host "JSONL klasoru: $(Join-Path $project 'recordings')"
 Set-Location -LiteralPath $project
-& $receiver @arguments
+& $receiver @receiverArguments
 $exitCode = $LASTEXITCODE
 if ($exitCode -ne 0) {
     throw "4-ZED fusion alicisi hata ile kapandi: $exitCode"
