@@ -12,7 +12,7 @@ param(
     [ValidateSet("strict", "monitor", "off")]
     [string]$FrameIntegrityMode = "monitor",
     [ValidateRange(1, 10)]
-    [double]$PreviewHz = 5,
+    [double]$PreviewHz = 10,
     [switch]$RecordLocal,
     [switch]$RecordSvo2
 )
