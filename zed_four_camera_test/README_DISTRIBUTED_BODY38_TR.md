@@ -1,11 +1,15 @@
 # Laptop USB hub + ana PC USB: 4 ZED 2i BODY_38 akışı
 
+> Güncel, ZED360 denemesini de içeren uçtan uca çalışma sırası için
+> `docs/ZED360_DORT_KAMERA_BODY38_RUNBOOK_TR.md` belgesini kullanın. Bu belge
+> yalnız uygulama-seviyesi fallback'in teknik özetidir.
+
 Bu belge, seçtiğin fiziksel düzen için üretim-deney akışıdır:
 
 ```text
-ZED 39504762 + ZED 31571870 -> laptop USB 3 hub -> laptop
+ZED 39504762 + ZED 34760587 -> laptop USB 3 hub -> laptop
                                                   | CAT6 Ethernet
-ZED 33773329 + ZED 34760587 -> ana PC USB -------+-> ana PC alici/fusion
+ZED 33773329 + ZED 31571870 -> ana PC USB -------+-> ana PC alici/fusion
 ```
 
 Bu yol ZED360/`sl.Fusion` Network Workflow'u kullanmaz. Bu iki hostta ortaya
@@ -45,13 +49,13 @@ Laptopta, `C:\Users\MSI\Desktop\zed-g1-motion-imitation` dizininde:
 ```powershell
 .\zed_four_camera_test\start_distributed_source.ps1 `
   -Serial 39504762 -TargetHost 192.168.50.10 -TargetPort 16000 `
-  -Fps 15 -Model medium -DepthMode performance
+  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
 ```
 
 ```powershell
 .\zed_four_camera_test\start_distributed_source.ps1 `
-  -Serial 31571870 -TargetHost 192.168.50.10 -TargetPort 16002 `
-  -Fps 15 -Model medium -DepthMode performance
+  -Serial 34760587 -TargetHost 192.168.50.10 -TargetPort 16006 `
+  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
 ```
 
 Ana PC'de, `C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation`
@@ -61,13 +65,13 @@ PC alıcısına gider:
 ```powershell
 .\zed_four_camera_test\start_distributed_source.ps1 `
   -Serial 33773329 -TargetHost 127.0.0.1 -TargetPort 16004 `
-  -Fps 15 -Model medium -DepthMode performance
+  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
 ```
 
 ```powershell
 .\zed_four_camera_test\start_distributed_source.ps1 `
-  -Serial 34760587 -TargetHost 127.0.0.1 -TargetPort 16006 `
-  -Fps 15 -Model medium -DepthMode performance
+  -Serial 31571870 -TargetHost 127.0.0.1 -TargetPort 16002 `
+  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
 ```
 
 Her pencerede `Acik ZED seri numarasi: ...` yazısı kendi seri numarasıyla
@@ -86,7 +90,7 @@ Ana PC'de beşinci PowerShell penceresinde aşağıdaki alıcıyı aç:
 .\zed_four_camera_test\start_distributed_receiver.ps1 `
   -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
   -CalibrationRecord ".\recordings\four_body38_static_calibration.jsonl" `
-  -Fps 15
+  -Fps 15 -MinimumSources 4
 ```
 
 Konsolda `DURUM | kaynak=4/4 [...] | ham_kayit=...` görmelisin. `ham_kayit`
@@ -109,6 +113,7 @@ Ana PC'de:
 .\zed_four_camera_test\start_distributed_calibration.ps1 `
   -CapturePath ".\recordings\four_body38_static_calibration.jsonl" `
   -OutputPath ".\config\zed_four\distributed_body38_extrinsics.json" `
+  -WorldPosesJsonl ".\config\zed_four\four_camera_world_poses.jsonl" `
   -ReferenceSerial 33773329
 ```
 
@@ -126,7 +131,7 @@ dosyasıyla tekrar çalıştır:
 .\zed_four_camera_test\start_distributed_receiver.ps1 `
   -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
   -Extrinsics ".\config\zed_four\distributed_body38_extrinsics.json" `
-  -Fps 15
+  -Fps 15 -MinimumSources 4
 ```
 
 `fusion_cikis` sayısı yaklaşık 15/s artmalıdır. Bu ilk kabul testinde birleşik

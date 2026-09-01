@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
         default="neural-light",
     )
     parser.add_argument("--duration", type=float, default=0.0, help="0 sonsuz calisma demektir.")
+    parser.add_argument("--sdk-verbose", action="store_true", help="ZED SDK ayrintili logunu ac.")
     return parser.parse_args()
 
 
@@ -82,6 +83,13 @@ def main() -> int:
     if len({port for _, port in requested}) != len(requested):
         print("Her kamera icin farkli bir ag portu gerekir.", file=sys.stderr)
         return 2
+    ordered_ports = sorted(port for _, port in requested)
+    if any(second - first < 10 for first, second in zip(ordered_ports, ordered_ports[1:])):
+        print(
+            "UYARI: Fusion RTP oturumlarinin cakismamasi icin kamera baslangic portlari arasinda "
+            "en az 10 birim birakmak daha guvenlidir (or. 30000 ve 30010).",
+            file=sys.stderr,
+        )
 
     model_map = {
         "fast": sl.BODY_TRACKING_MODEL.HUMAN_BODY_FAST,
@@ -112,6 +120,7 @@ def main() -> int:
         # producing the extrinsic calibration.
         init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
         init.depth_maximum_distance = 8.0
+        init.sdk_verbose = 1 if args.sdk_verbose else 0
         if hasattr(init, "async_grab_camera_recovery"):
             init.async_grab_camera_recovery = True
 
@@ -171,6 +180,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     runtime = sl.BodyTrackingRuntimeParameters()
+    runtime.detection_confidence_threshold = 40
+    runtime.skeleton_smoothing = 0.7
     started = time.monotonic()
     try:
         while running and (args.duration <= 0.0 or time.monotonic() - started < args.duration):

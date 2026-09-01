@@ -9,7 +9,8 @@ param(
     [string]$BodyFormat = "body38",
     [ValidateSet("performance", "neural-light", "neural", "ultra")]
     [string]$DepthMode = "neural-light",
-    [double]$Duration = 0
+    [double]$Duration = 0,
+    [switch]$SdkVerbose
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,9 @@ $arguments = @(
 )
 foreach ($item in $Camera) {
     $arguments += @("--camera", $item)
+}
+if ($SdkVerbose) {
+    $arguments += "--sdk-verbose"
 }
 Write-Host "Fusion publisher basliyor ($BodyFormat): $($Camera -join ', ')"
 Write-Host "Durdurmak icin Ctrl+C kullanin. Bu arac G1'e veri veya komut gondermez."

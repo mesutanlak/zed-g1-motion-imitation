@@ -13,6 +13,7 @@ transforms and confidence-fuses keypoints, then emits the same downstream
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass
 import json
 import math
@@ -24,6 +25,12 @@ import time
 from typing import Any
 
 import numpy as np
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from motion_pipeline.calibration import to_pelvis_local
 
 
 BODY38_NAMES = (
@@ -59,6 +66,21 @@ class Sample:
 class Extrinsic:
     rotation: np.ndarray
     translation: np.ndarray
+
+
+@dataclass(frozen=True)
+class ExtrinsicSet:
+    reference_serial: int
+    cameras: dict[int, Extrinsic]
+
+
+CRITICAL_GROUPS = {
+    "torso": ("PELVIS", "SPINE_3", "NECK", "LEFT_SHOULDER", "RIGHT_SHOULDER"),
+    "left_arm": ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
+    "right_arm": ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
+    "left_leg": ("LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"),
+    "right_leg": ("RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"),
+}
 
 
 def sanitize(value: Any) -> Any:
@@ -159,9 +181,9 @@ def matrix_to_quaternion_xyzw(matrix: np.ndarray) -> np.ndarray:
     return quat / max(float(np.linalg.norm(quat)), 1.0e-12)
 
 
-def load_extrinsics(path: Path | None, endpoints: list[InputEndpoint]) -> dict[int, Extrinsic]:
+def load_extrinsics(path: Path | None, endpoints: list[InputEndpoint]) -> ExtrinsicSet | None:
     if path is None:
-        return {}
+        return None
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -173,6 +195,10 @@ def load_extrinsics(path: Path | None, endpoints: list[InputEndpoint]) -> dict[i
     cameras = document.get("cameras")
     if not isinstance(cameras, dict):
         raise ValueError("Extrinsic dosyasinda cameras nesnesi yok.")
+    try:
+        reference_serial = int(document["reference_world_serial"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Extrinsic dosyasinda reference_world_serial gecersiz.") from exc
     result: dict[int, Extrinsic] = {}
     for endpoint in endpoints:
         item = cameras.get(str(endpoint.serial))
@@ -185,7 +211,99 @@ def load_extrinsics(path: Path | None, endpoints: list[InputEndpoint]) -> dict[i
         if not np.isclose(np.linalg.det(rotation), 1.0, atol=0.03):
             raise ValueError(f"ZED {endpoint.serial} rotation matrisi proper rotation degil.")
         result[endpoint.serial] = Extrinsic(rotation, translation)
-    return result
+    if reference_serial not in result:
+        raise ValueError(f"Referans ZED {reference_serial} dort kaynak arasinda yok.")
+    return ExtrinsicSet(reference_serial=reference_serial, cameras=result)
+
+
+def distance_between(value: np.ndarray, first: str, second: str) -> float | None:
+    first_value, second_value = value[IDX[first]], value[IDX[second]]
+    if not (np.isfinite(first_value).all() and np.isfinite(second_value).all()):
+        return None
+    return float(np.linalg.norm(first_value - second_value))
+
+
+def joint_angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float | None:
+    if not (np.isfinite(a).all() and np.isfinite(b).all() and np.isfinite(c).all()):
+        return None
+    ba, bc = a - b, c - b
+    denominator = float(np.linalg.norm(ba) * np.linalg.norm(bc))
+    if denominator < 1.0e-8:
+        return None
+    return math.degrees(math.acos(float(np.clip(np.dot(ba, bc) / denominator, -1.0, 1.0))))
+
+
+def build_g1_features(value: np.ndarray, conf: np.ndarray, threshold: float) -> dict[str, Any]:
+    validity: dict[str, bool] = {}
+    for group_name, joint_names in CRITICAL_GROUPS.items():
+        indexes = [IDX[name] for name in joint_names]
+        validity[group_name] = bool(
+            np.isfinite(value[indexes]).all() and np.all(conf[indexes] >= threshold)
+        )
+    return {
+        "valid_groups": validity,
+        "upper_body_reference_ready": bool(
+            validity["torso"] and validity["left_arm"] and validity["right_arm"]
+        ),
+        "whole_body_reference_ready": bool(all(validity.values())),
+        "anthropometry_m": {
+            "shoulder_width": distance_between(value, "LEFT_SHOULDER", "RIGHT_SHOULDER"),
+            "hip_width": distance_between(value, "LEFT_HIP", "RIGHT_HIP"),
+            "left_upper_arm": distance_between(value, "LEFT_SHOULDER", "LEFT_ELBOW"),
+            "left_forearm": distance_between(value, "LEFT_ELBOW", "LEFT_WRIST"),
+            "right_upper_arm": distance_between(value, "RIGHT_SHOULDER", "RIGHT_ELBOW"),
+            "right_forearm": distance_between(value, "RIGHT_ELBOW", "RIGHT_WRIST"),
+            "left_thigh": distance_between(value, "LEFT_HIP", "LEFT_KNEE"),
+            "left_shank": distance_between(value, "LEFT_KNEE", "LEFT_ANKLE"),
+            "right_thigh": distance_between(value, "RIGHT_HIP", "RIGHT_KNEE"),
+            "right_shank": distance_between(value, "RIGHT_KNEE", "RIGHT_ANKLE"),
+        },
+        "geometric_angles": {
+            "left_elbow_interior_deg": joint_angle_deg(value[IDX["LEFT_SHOULDER"]], value[IDX["LEFT_ELBOW"]], value[IDX["LEFT_WRIST"]]),
+            "right_elbow_interior_deg": joint_angle_deg(value[IDX["RIGHT_SHOULDER"]], value[IDX["RIGHT_ELBOW"]], value[IDX["RIGHT_WRIST"]]),
+            "left_knee_interior_deg": joint_angle_deg(value[IDX["LEFT_HIP"]], value[IDX["LEFT_KNEE"]], value[IDX["LEFT_ANKLE"]]),
+            "right_knee_interior_deg": joint_angle_deg(value[IDX["RIGHT_HIP"]], value[IDX["RIGHT_KNEE"]], value[IDX["RIGHT_ANKLE"]]),
+        },
+        "note": "Fused perception features; robot commands are produced only after retargeting and safety gates.",
+    }
+
+
+def synchronized_samples(
+    histories: dict[int, deque[Sample]],
+    *,
+    now_ns: int,
+    source_timeout_ns: int,
+    maximum_spread_ns: int,
+    minimum_sources: int,
+) -> tuple[list[Sample], float] | None:
+    """Choose the largest, freshest arrival-time-aligned camera bundle.
+
+    Source clocks need not agree for this application fallback: all matching is
+    performed on the main PC's UDP receive clock.  A short history prevents a
+    fast camera's newest frame from continually outrunning a slower source.
+    """
+    fresh = {
+        serial: [sample for sample in history if now_ns - sample.received_ns <= source_timeout_ns]
+        for serial, history in histories.items()
+    }
+    fresh = {serial: samples for serial, samples in fresh.items() if samples}
+    if len(fresh) < minimum_sources:
+        return None
+    anchors = [sample.received_ns for samples in fresh.values() for sample in samples]
+    best: tuple[tuple[int, int, int], list[Sample], float] | None = None
+    for anchor_ns in anchors:
+        selected = [min(samples, key=lambda item: abs(item.received_ns - anchor_ns)) for samples in fresh.values()]
+        selected = [item for item in selected if abs(item.received_ns - anchor_ns) <= maximum_spread_ns]
+        if len(selected) < minimum_sources:
+            continue
+        spread_ns = max(item.received_ns for item in selected) - min(item.received_ns for item in selected)
+        if spread_ns > maximum_spread_ns:
+            continue
+        # Prefer more cameras, then tighter synchronization, then newer data.
+        score = (len(selected), -spread_ns, max(item.received_ns for item in selected))
+        if best is None or score > best[0]:
+            best = (score, selected, spread_ns / 1.0e6)
+    return (best[1], best[2]) if best is not None else None
 
 
 def sample_quality(packet: dict[str, Any], minimum_confidence: float) -> float:
@@ -267,6 +385,8 @@ def make_output_packet(
     minimum_confidence: float,
     maximum_spread_m: float,
     output_sequence: int,
+    reference_serial: int,
+    arrival_spread_ms: float,
 ) -> dict[str, Any]:
     best_sample, best_extrinsic = max(
         views,
@@ -280,6 +400,26 @@ def make_output_packet(
     )
     pelvis = fused[IDX["PELVIS"]]
     source_orientation = quaternion_xyzw_to_matrix(packet.get("global_root_orientation_xyzw"))
+    try:
+        pelvis_local, pelvis_origin, pelvis_rotation = to_pelvis_local(fused, IDX)
+    except ValueError:
+        pelvis_local = np.full_like(fused, np.nan)
+        pelvis_origin = np.full(3, np.nan)
+        pelvis_rotation = np.full((3, 3), np.nan)
+    shoulder_width = distance_between(fused, "LEFT_SHOULDER", "RIGHT_SHOULDER")
+    shoulder_normalized = (
+        pelvis_local / shoulder_width
+        if shoulder_width is not None and shoulder_width > 0.05
+        else np.full_like(fused, np.nan)
+    )
+    fused_features = build_g1_features(fused, fused_confidence, minimum_confidence)
+    calibration = dict(packet.get("calibration") or {})
+    profile = dict(calibration.get("profile") or {})
+    neutral = np.asarray(profile.get("neutral_pelvis_rotation_matrix"), dtype=np.float64)
+    if neutral.shape == (3, 3) and np.isfinite(neutral).all():
+        profile["neutral_pelvis_rotation_matrix"] = (best_extrinsic.rotation @ neutral).tolist()
+    if profile:
+        calibration["profile"] = profile
     packet.update(sanitize({
         "schema": "zed_body38_live/v1",
         "source_serial": 0,
@@ -293,14 +433,34 @@ def make_output_packet(
         "keypoints_3d_raw_m": fused,
         "keypoints_3d_m": fused,
         "keypoint_confidence": fused_confidence,
-        "root_relative_keypoints_m": fused - pelvis if np.isfinite(pelvis).all() else np.full_like(fused, np.nan),
+        "root_relative_keypoints_m": pelvis_local,
+        "shoulder_width_normalized_keypoints": shoulder_normalized,
+        "pelvis_frame": {
+            "coordinate_system": "PELVIS_LOCAL_X_FWD_Y_LEFT_Z_UP",
+            "reference_frame": "FUSION_WORLD",
+            # Keep the legacy keys because the existing GMR consumer uses
+            # them generically even when the parent frame is fusion WORLD.
+            "origin_camera_m": pelvis_origin,
+            "rotation_camera_from_pelvis": pelvis_rotation,
+            "origin_world_m": pelvis_origin,
+            "rotation_world_from_pelvis": pelvis_rotation,
+            "relative_neutral_yaw_rad": None,
+            "keypoints_m": pelvis_local,
+        },
+        "calibration": calibration,
+        "reference_ready": {
+            "upper_body": fused_features["upper_body_reference_ready"],
+            "whole_body": fused_features["whole_body_reference_ready"],
+        },
+        "g1_reference_features": fused_features,
         "fusion": {
             "implementation": "application_level_weighted_body38/v1",
-            "reference_world_serial": None,
+            "reference_world_serial": reference_serial,
             "contributing_serials": [sample.serial for sample, _ in views],
             "best_orientation_serial": best_sample.serial,
             "per_joint_contributions": contributions,
             "maximum_joint_spread_m": maximum_spread_m,
+            "arrival_spread_ms": arrival_spread_ms,
         },
         "latency_trace_ns": {
             "t0_capture_ns": int(best_sample.packet.get("timestamp_ns", 0) or 0),
@@ -321,6 +481,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-max-hz", type=float, default=15.0)
     parser.add_argument("--confidence", type=float, default=45.0)
     parser.add_argument("--max-sync-ms", type=float, default=110.0, help="Ana PC'ye varis zamanina gore azami dortlu paket yayilimi.")
+    parser.add_argument("--source-timeout-ms", type=float, default=750.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
+    parser.add_argument("--minimum-sources", type=int, choices=(2, 3, 4), default=2, help="Calisma aninda cikis icin gereken en az taze kamera.")
     parser.add_argument("--max-joint-spread-m", type=float, default=0.30)
     parser.add_argument("--calibration-record", type=Path, default=None, help="Dortlu senkron ham BODY_38 karelerini JSONL olarak kaydet.")
     parser.add_argument("--calibration-max-hz", type=float, default=12.0)
@@ -334,20 +496,21 @@ def main() -> int:
     if len(endpoints) != 4 or len({item.serial for item in endpoints}) != 4 or len({item.port for item in endpoints}) != 4:
         print("HATA: tam dort farkli SERIAL:PORT kaynagi gerekli.", file=sys.stderr)
         return 2
-    if not 0.0 <= args.confidence <= 100.0 or args.max_sync_ms <= 0.0 or args.max_joint_spread_m <= 0.0:
-        print("HATA: confidence, max-sync-ms ve max-joint-spread-m gecersiz.", file=sys.stderr)
+    if not 0.0 <= args.confidence <= 100.0 or args.max_sync_ms <= 0.0 or args.source_timeout_ms <= 0.0 or args.max_joint_spread_m <= 0.0:
+        print("HATA: confidence, max-sync-ms, source-timeout-ms veya max-joint-spread-m gecersiz.", file=sys.stderr)
         return 2
     try:
         extrinsics = load_extrinsics(args.extrinsics.resolve() if args.extrinsics else None, endpoints)
     except ValueError as exc:
         print(f"HATA: {exc}", file=sys.stderr)
         return 2
-    if not extrinsics:
+    if extrinsics is None:
         print("UYARI: extrinsic yok. Kayit yapilabilir ancak guvenli olarak sadece en iyi tek kamera paketlenecek.")
+    elif args.calibration_record is not None:
+        print("BILGI: Kalibrasyon kaydinda tum 4 kamera zorunludur; --minimum-sources yalniz canli cikisi etkiler.")
 
     selector = selectors.DefaultSelector()
     sockets: list[socket.socket] = []
-    port_to_serial = {endpoint.port: endpoint.serial for endpoint in endpoints}
     try:
         for endpoint in endpoints:
             receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -380,7 +543,12 @@ def main() -> int:
         }), ensure_ascii=False, allow_nan=False) + "\n")
         print(f"HAM KALIBRASYON KAYDI: {path}")
 
-    latest: dict[int, Sample] = {}
+    histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=16) for item in endpoints}
+    last_any_packet_ns: dict[int, int] = {}
+    last_body_packet_ns: dict[int, int] = {}
+    last_source_status: dict[int, str] = {}
+    per_source_input = {item.serial: 0 for item in endpoints}
+    per_source_status = {item.serial: 0 for item in endpoints}
     last_bundle: tuple[tuple[int, int], ...] | None = None
     last_output_at = 0.0
     last_record_at = 0.0
@@ -390,6 +558,8 @@ def main() -> int:
     status_packets = 0
     fused_packets = 0
     raw_records = 0
+    last_fused_serials: list[int] = []
+    last_arrival_spread_ms = math.nan
     started = time.monotonic()
     last_status = started
     try:
@@ -412,12 +582,16 @@ def main() -> int:
                     if not isinstance(document, dict):
                         invalid_packets += 1
                         continue
+                    received_ns = time.time_ns()
+                    last_any_packet_ns[endpoint.serial] = received_ns
                     if document.get("schema") == "zed_body38_live/status/v1":
                         # A strict/monitor source reports frame-integrity state
                         # on the same port.  It is not a body payload and must
                         # never make the receiver's real malformed-packet count
                         # look like a network fault.
                         status_packets += 1
+                        per_source_status[endpoint.serial] += 1
+                        last_source_status[endpoint.serial] = str(document.get("status", "STATUS"))
                         continue
                     if document.get("schema") != "zed_body38_live/v1":
                         invalid_packets += 1
@@ -430,26 +604,33 @@ def main() -> int:
                     if points(document.get("keypoints_3d_m")).shape != (38, 3):
                         invalid_packets += 1
                         continue
-                    latest[endpoint.serial] = Sample(
+                    histories[endpoint.serial].append(Sample(
                         serial=endpoint.serial,
                         packet=document,
-                        received_ns=time.time_ns(),
+                        received_ns=received_ns,
                         sequence=int(document.get("sequence", 0) or 0),
-                    )
+                    ))
+                    last_body_packet_ns[endpoint.serial] = received_ns
+                    last_source_status[endpoint.serial] = "BODY"
+                    per_source_input[endpoint.serial] += 1
                     input_packets += 1
 
-            required = [item.serial for item in endpoints]
-            if all(serial in latest for serial in required):
-                samples = [latest[serial] for serial in required]
-                arrivals = [sample.received_ns for sample in samples]
-                arrival_spread_ms = (max(arrivals) - min(arrivals)) / 1.0e6
+            now_ns = time.time_ns()
+            selection = synchronized_samples(
+                histories,
+                now_ns=now_ns,
+                source_timeout_ns=int(args.source_timeout_ms * 1.0e6),
+                maximum_spread_ns=int(args.max_sync_ms * 1.0e6),
+                minimum_sources=args.minimum_sources,
+            )
+            if selection is not None:
+                samples, arrival_spread_ms = selection
                 marker = tuple(sorted((sample.serial, sample.sequence) for sample in samples))
-                synchronized = arrival_spread_ms <= args.max_sync_ms
                 is_new = marker != last_bundle
                 now = time.monotonic()
-                if synchronized and is_new:
+                if is_new:
                     last_bundle = marker
-                    if record_file is not None and now - last_record_at >= 0.98 / args.calibration_max_hz:
+                    if record_file is not None and len(samples) == len(endpoints) and now - last_record_at >= 0.98 / args.calibration_max_hz:
                         record_file.write(json.dumps(sanitize({
                             "schema": "zed_body38_multihost_calibration_sample/v1",
                             "recorded_unix_ns": time.time_ns(),
@@ -458,19 +639,22 @@ def main() -> int:
                         }), ensure_ascii=False, allow_nan=False) + "\n")
                         raw_records += 1
                         last_record_at = now
-                    if extrinsics and now - last_output_at >= 0.98 / args.output_max_hz:
-                        views = [(sample, extrinsics[sample.serial]) for sample in samples]
+                    if extrinsics is not None and now - last_output_at >= 0.98 / args.output_max_hz:
+                        views = [(sample, extrinsics.cameras[sample.serial]) for sample in samples]
                         packet = make_output_packet(
                             views,
                             minimum_confidence=args.confidence,
                             maximum_spread_m=args.max_joint_spread_m,
                             output_sequence=output_sequence,
+                            reference_serial=extrinsics.reference_serial,
+                            arrival_spread_ms=arrival_spread_ms,
                         )
-                        packet["fusion"]["reference_world_serial"] = min(extrinsics)
                         encoded = json.dumps(packet, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
                         if len(encoded) <= 60000:
                             output_sequence += 1
                             fused_packets += 1
+                            last_fused_serials = sorted(sample.serial for sample in samples)
+                            last_arrival_spread_ms = arrival_spread_ms
                             last_output_at = now
                             if output_socket is not None:
                                 output_socket.sendto(encoded, (args.output_host, args.output_port))
@@ -479,11 +663,21 @@ def main() -> int:
 
             now = time.monotonic()
             if now - last_status >= 1.0:
-                online = ", ".join(str(serial) for serial in sorted(latest)) or "yok"
+                status_now_ns = time.time_ns()
+                timeout_ns = int(args.source_timeout_ms * 1.0e6)
+                online_serials = sorted(serial for serial, stamp in last_any_packet_ns.items() if status_now_ns - stamp <= timeout_ns)
+                body_serials = sorted(serial for serial, stamp in last_body_packet_ns.items() if status_now_ns - stamp <= timeout_ns)
+                details = ", ".join(
+                    f"{item.serial}:{last_source_status.get(item.serial, 'YOK')}/b{per_source_input[item.serial]}/s{per_source_status[item.serial]}"
+                    for item in endpoints
+                )
                 print(
-                    f"DURUM | kaynak={len(latest)}/4 [{online}] | input={input_packets} "
+                    f"DURUM | bagli={len(online_serials)}/4 [{', '.join(map(str, online_serials)) or 'yok'}] "
+                    f"| body_taze={len(body_serials)}/4 [{', '.join(map(str, body_serials)) or 'yok'}] | input={input_packets} "
                     f"| ham_kayit={raw_records} | fusion_cikis={fused_packets} "
-                    f"| durum={status_packets} | gecersiz={invalid_packets}",
+                    f"| son_katki=[{', '.join(map(str, last_fused_serials)) or 'yok'}] "
+                    f"| yayilim_ms={last_arrival_spread_ms:.1f} "
+                    f"| durum={status_packets} | gecersiz={invalid_packets} | {details}",
                     flush=True,
                 )
                 last_status = now

@@ -46,7 +46,81 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence", type=float, default=55.0)
     parser.add_argument("--max-residual-m", type=float, default=0.16)
     parser.add_argument("--max-samples", type=int, default=240)
+    parser.add_argument(
+        "--world-poses-jsonl",
+        type=Path,
+        default=None,
+        help="Kamera-dunya pozlarini satir bazli yaz. Varsayilan: OUTPUT yaninda *_world_poses.jsonl.",
+    )
     return parser.parse_args()
+
+
+def matrix_to_quaternion_xyzw(matrix: np.ndarray) -> list[float]:
+    value = np.asarray(matrix, dtype=np.float64)
+    trace = float(np.trace(value))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quat = np.array([
+            (value[2, 1] - value[1, 2]) / scale,
+            (value[0, 2] - value[2, 0]) / scale,
+            (value[1, 0] - value[0, 1]) / scale,
+            0.25 * scale,
+        ])
+    else:
+        index = int(np.argmax(np.diag(value)))
+        if index == 0:
+            scale = math.sqrt(max(1.0e-12, 1.0 + value[0, 0] - value[1, 1] - value[2, 2])) * 2.0
+            quat = np.array([0.25 * scale, (value[0, 1] + value[1, 0]) / scale,
+                             (value[0, 2] + value[2, 0]) / scale, (value[2, 1] - value[1, 2]) / scale])
+        elif index == 1:
+            scale = math.sqrt(max(1.0e-12, 1.0 + value[1, 1] - value[0, 0] - value[2, 2])) * 2.0
+            quat = np.array([(value[0, 1] + value[1, 0]) / scale, 0.25 * scale,
+                             (value[1, 2] + value[2, 1]) / scale, (value[0, 2] - value[2, 0]) / scale])
+        else:
+            scale = math.sqrt(max(1.0e-12, 1.0 + value[2, 2] - value[0, 0] - value[1, 1])) * 2.0
+            quat = np.array([(value[0, 2] + value[2, 0]) / scale, (value[1, 2] + value[2, 1]) / scale,
+                             0.25 * scale, (value[1, 0] - value[0, 1]) / scale])
+    quat /= max(float(np.linalg.norm(quat)), 1.0e-12)
+    return quat.tolist()
+
+
+def write_world_poses_jsonl(
+    path: Path,
+    *,
+    output: dict[str, Any],
+    source_ports: dict[int, int],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [{
+        "schema": "zed_camera_world_poses_metadata/v1",
+        "created_unix_ns": output["created_unix_ns"],
+        "coordinate_system": output["coordinate_system"],
+        "units": output["units"],
+        "reference_world_serial": output["reference_world_serial"],
+        "source_capture": output["source_capture"],
+        "transform_semantics": "point_world = rotation_camera_to_world @ point_camera + translation_camera_to_world_m",
+    }]
+    for serial_text, camera in output["cameras"].items():
+        serial = int(serial_text)
+        rotation = np.asarray(camera["rotation_camera_to_world"], dtype=np.float64)
+        translation = np.asarray(camera["translation_camera_to_world_m"], dtype=np.float64)
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = translation
+        lines.append({
+            "schema": "zed_camera_world_pose/v1",
+            "serial": serial,
+            "source_udp_port": source_ports.get(serial),
+            "is_reference": serial == int(output["reference_world_serial"]),
+            "camera_optical_origin_world_m": translation.tolist(),
+            "rotation_camera_to_world": rotation.tolist(),
+            "orientation_camera_to_world_xyzw": matrix_to_quaternion_xyzw(rotation),
+            "transform_camera_to_world_4x4": transform.tolist(),
+            "fit": camera.get("fit", {}),
+        })
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for item in lines:
+            handle.write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def read_samples(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -207,6 +281,18 @@ def main() -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     print(f"KALIBRASYON HAZIR: {path}")
+    source_ports = {
+        int(item["serial"]): int(item["port"])
+        for item in metadata.get("sources", [])
+        if isinstance(item, dict) and "serial" in item and "port" in item
+    }
+    poses_path = (
+        args.world_poses_jsonl.expanduser().resolve()
+        if args.world_poses_jsonl is not None
+        else path.with_name(path.stem + "_world_poses.jsonl")
+    )
+    write_world_poses_jsonl(poses_path, output=output, source_ports=source_ports)
+    print(f"DUNYA POZLARI JSONL HAZIR: {poses_path}")
     return 0
 
 

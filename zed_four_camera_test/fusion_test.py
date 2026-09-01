@@ -20,6 +20,12 @@ from typing import Any
 import numpy as np
 import pyzed.sl as sl
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from zed_four_camera_test.fusion_config_io import read_fusion_configuration_file
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Iki hosttan dort ZED BODY_38 Fusion kabul testi")
@@ -119,8 +125,8 @@ def main() -> int:
         print("Yerel/uzak kamera seri numaralari benzersiz olmali.", file=sys.stderr)
         return 2
 
-    configs = sl.read_fusion_configuration_file(
-        str(config_path), sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP, sl.UNIT.METER
+    configs = read_fusion_configuration_file(
+        config_path, sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP, sl.UNIT.METER
     )
     by_serial = {int(conf.serial_number): conf for conf in configs}
     expected = local.union(remote)

@@ -6,7 +6,8 @@ param(
     [Alias("Output")]
     [string]$OutputPath,
     [Parameter(Mandatory = $true)]
-    [long]$ReferenceSerial
+    [long]$ReferenceSerial,
+    [string]$WorldPosesJsonl = ""
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -15,5 +16,15 @@ $calibrator = Join-Path $PSScriptRoot "calibrate_distributed_body38.py"
 if (-not (Test-Path -LiteralPath $python)) {
     throw "ZED sanal ortami bulunamadi: $python"
 }
-& $python $calibrator --input $CapturePath --output $OutputPath --reference-serial $ReferenceSerial
+$arguments = @(
+    $calibrator,
+    "--input", $CapturePath,
+    "--output", $OutputPath,
+    "--reference-serial", "$ReferenceSerial"
+)
+if ($WorldPosesJsonl) {
+    $arguments += "--world-poses-jsonl"
+    $arguments += $WorldPosesJsonl
+}
+& $python @arguments
 exit $LASTEXITCODE

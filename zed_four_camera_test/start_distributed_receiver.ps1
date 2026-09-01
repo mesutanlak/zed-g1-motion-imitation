@@ -7,7 +7,15 @@ param(
     [int]$OutputPort = 15050,
     [string]$CalibrationRecord = "",
     [ValidateRange(1, 60)]
-    [int]$Fps = 15
+    [int]$Fps = 15,
+    [ValidateSet(2, 3, 4)]
+    [int]$MinimumSources = 2,
+    [ValidateRange(20, 1000)]
+    [double]$MaxSyncMs = 110,
+    [ValidateRange(100, 5000)]
+    [double]$SourceTimeoutMs = 750,
+    [ValidateRange(0, 86400)]
+    [double]$Duration = 0
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -25,6 +33,14 @@ foreach ($item in $Source) {
     $arguments += "--source"
     $arguments += $item
 }
+$arguments += "--minimum-sources"
+$arguments += "$MinimumSources"
+$arguments += "--max-sync-ms"
+$arguments += "$MaxSyncMs"
+$arguments += "--source-timeout-ms"
+$arguments += "$SourceTimeoutMs"
+$arguments += "--duration"
+$arguments += "$Duration"
 if ($Extrinsics) {
     $arguments += "--extrinsics"
     $arguments += $Extrinsics
