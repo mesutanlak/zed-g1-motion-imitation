@@ -617,9 +617,16 @@ def detect_torn_frame(frame: np.ndarray) -> tuple[bool, int, float]:
         axis=1,
     )
     baseline = float(np.median(row_delta))
-    threshold = max(18.0, baseline * 4.0)
+    # Normal indoor scenes (tables, shelves, window frames) routinely produce
+    # several 20-30 gray-level full-width row transitions.  Treating those as
+    # USB tearing generated a warning every second even after ZED Diagnostic
+    # reported a clean link.  Actual band-mixed UVC frames have markedly
+    # stronger/repeated discontinuities; keep this heuristic conservative and
+    # let the SDK grab status remain the primary integrity signal.
+    threshold = max(34.0, baseline * 6.0)
     strong_boundaries = int(np.count_nonzero(row_delta > threshold))
-    return strong_boundaries >= 5, strong_boundaries, float(np.max(row_delta))
+    peak = float(np.max(row_delta))
+    return strong_boundaries >= 5 and peak >= 38.0, strong_boundaries, peak
 
 
 def draw_skeleton(

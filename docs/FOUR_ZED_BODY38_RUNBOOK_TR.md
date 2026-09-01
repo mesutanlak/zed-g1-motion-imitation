@@ -81,6 +81,21 @@ Saglikli bir kayitta `bagli=4/4`, `gecersiz=0`, `drop=0`, fusion FPS yaklasik
 14-15 ve mumkun oldugunca cok `fusion_katki=4/4` beklenir. `cross_view_mpjpe_m`
 dusuk olmalidir; 0.10 m uzeri kalibrasyon/ortak gorus kontrolu gerektirir.
 
+Alıcı iki ayrı uyum metriği kaydeder:
+
+- `cross_view_mpjpe_m`: statik extrinsic sonrasındaki **ham** kamera uyumu;
+  kalibrasyon, zamanlama ve yanlış kişi kilidi tanısıdır.
+- `post_alignment_mpjpe_m`: aynı operatöre ait görüşler ortak pelvis merkezine
+  taşındıktan sonraki, gerçekten fusion'a giren iskelet uyumudur. Rerun'daki
+  kamera iskeletleri ve birleşik BODY_38 bu hizalanmış noktaları kullanır.
+
+Pelvis-yerel gövde biçimi uyuşmayan veya ortak pelvise taşınması 1 m'den fazla
+gereken bir görüş farklı kişi/poz adayı sayılır ve o karede fusion dışına
+alınır. Konsolda `fusion_katki` gerçek kabul edilen görüş sayısıdır. Aynı anda
+birden fazla kişi varken dört bağımsız kaynak farklı kişilere kilitlenebilir;
+tek-operatör deneyi için çalışma alanında yalnız hedef kişi bulunsun ve gerekirse
+ölçümden önce dört kaynak penceresinde de `R` ile kilidi yenile.
+
 Kayit bittikten sonra son oturumun sayisal kabul ozetini al:
 
 ```powershell
@@ -89,6 +104,13 @@ Kayit bittikten sonra son oturumun sayisal kabul ozetini al:
 
 Belirli bir dosya icin `-InputPath ".\recordings\four_body38_fusion_....jsonl"`
 verilebilir.
+
+`start_zed_four_sources.ps1` doğrulanmış düzen için kare-bant sezgisini
+varsayılan olarak `off` açar. ZED SDK'nin gerçek `grab` hataları yine kaynak
+penceresinde hata olarak görünür. Tanı amaçlı eski sezgiyi açmak istersen
+`-FrameIntegrityMode monitor`, şüpheli karede süreci durdurmak istersen
+`-FrameIntegrityMode strict` ver. Normal odadaki masa/pencere gibi yatay
+kenarlar artık USB bozulması diye sürekli yazdırılmaz.
 
 ## Tripod hareket ederse yeniden kalibrasyon
 

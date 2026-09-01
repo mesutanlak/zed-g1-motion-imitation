@@ -68,12 +68,22 @@ def main() -> int:
     timestamps = [value for value in timestamps if value > 0]
     duration_s = (max(timestamps) - min(timestamps)) / 1.0e9 if len(timestamps) >= 2 else 0.0
     measured_hz = (len(timestamps) - 1) / duration_s if duration_s > 0.0 else 0.0
+    intervals_s = [
+        (current - previous) / 1.0e9
+        for previous, current in zip(timestamps, timestamps[1:])
+        if current > previous
+    ]
+    active_intervals = [value for value in intervals_s if value < 1.0]
+    active_duration_s = sum(active_intervals)
+    active_hz = len(active_intervals) / active_duration_s if active_duration_s > 0.0 else 0.0
+    segments = 1 + sum(value >= 1.0 for value in intervals_s)
     view_counts: Counter[int] = Counter()
     serial_contributions: Counter[int] = Counter()
     source_fps: dict[int, list[float]] = defaultdict(list)
     sync_ms: list[float] = []
     mpjpe_m: list[float] = []
     p95_error_m: list[float] = []
+    aligned_mpjpe_m: list[float] = []
     capture_send_ms: list[float] = []
     record_drops: list[float] = []
 
@@ -92,6 +102,10 @@ def main() -> int:
         value = finite_number(agreement.get("p95_error_m"))
         if value is not None:
             p95_error_m.append(value)
+        aligned_agreement = multi.get("post_alignment_agreement") or {}
+        value = finite_number(aligned_agreement.get("mpjpe_m"))
+        if value is not None:
+            aligned_mpjpe_m.append(value)
         for serial_text, metric in ((multi.get("fusion_metrics") or {}).get("per_camera") or {}).items():
             value = finite_number((metric or {}).get("body_fps"))
             if value is not None:
@@ -114,7 +128,11 @@ def main() -> int:
         )
     )
     print(f"DOSYA: {path}")
-    print(f"FUSION: kare={total} sure={duration_s:.2f}s gercek_hiz={measured_hz:.2f} fps bozuk_json={invalid}")
+    print(
+        f"FUSION: kare={total} duvar_suresi={duration_s:.2f}s "
+        f"duvar_hizi={measured_hz:.2f} fps aktif_sure={active_duration_s:.2f}s "
+        f"aktif_hiz={active_hz:.2f} fps kesintisiz_parca={segments} bozuk_json={invalid}"
+    )
     for views in (4, 3, 2):
         count = view_counts[views]
         print(f"KATKI {views}/4: {count} kare ({100.0 * count / total:.1f}%)")
@@ -137,6 +155,12 @@ def main() -> int:
         f"MPJPE_p95={format_metric(percentile(mpjpe_m, 0.95), 'm')} "
         f"joint_p95_p50={format_metric(percentile(p95_error_m, 0.50), 'm')}"
     )
+    if aligned_mpjpe_m:
+        print(
+            "HIZALANMIS_FUSION: "
+            f"MPJPE_p50={format_metric(percentile(aligned_mpjpe_m, 0.50), 'm')} "
+            f"MPJPE_p95={format_metric(percentile(aligned_mpjpe_m, 0.95), 'm')}"
+        )
     print(
         "AKTARIM: "
         f"capture_to_send_p50={format_metric(percentile(capture_send_ms, 0.50), 'ms')} "

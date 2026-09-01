@@ -25,7 +25,8 @@ FRAME_FIELDS = (
     "max_keypoint_speed_m_s",
     "fusion_mode", "evidence_views", "selected_single_serial",
     "calibration_agreement_ok", "cross_view_mpjpe_m",
-    "cross_view_p95_m", "core_disagreement_m", "pelvis_disagreement_m",
+    "cross_view_p95_m", "post_alignment_mpjpe_m",
+    "post_alignment_p95_m", "core_disagreement_m", "pelvis_disagreement_m",
     "left_wrist_disagreement_m", "right_wrist_disagreement_m",
     "camera_timestamp_delta_ms", "camera_sync_ok", "fusion_failure_codes",
     "fused_quality_score", "best_single_quality_score",
@@ -70,6 +71,7 @@ IMITATION_FIELDS = (
     "gmr_upper_relative_residual_m", "mirror_rescue_triggered",
     "mirror_rescue_applied", "fusion_mode", "evidence_views",
     "cross_view_mpjpe_m", "cross_view_p95_m",
+    "post_alignment_mpjpe_m", "post_alignment_p95_m",
     "pelvis_disagreement_m", "left_wrist_disagreement_m",
     "right_wrist_disagreement_m", "camera_timestamp_delta_ms",
     "joint_tracking_rmse_rad", "body_tracking_mpjpe_m", "total_control_ms",
@@ -310,6 +312,7 @@ class AnalysisSessionWriter:
         bridge = packet.get("bridge_metrics") or {}
         multi = packet.get("source_multi_camera") or {}
         agreement = multi.get("cross_view_agreement") or {}
+        aligned_agreement = multi.get("post_alignment_agreement") or {}
         reference_motion = packet.get("reference_motion") or {}
         policy_observation = packet.get("policy_observation_v1") or {}
         policy_raw_action = [
@@ -406,6 +409,8 @@ class AnalysisSessionWriter:
             "evidence_views": multi.get("contributing_views"),
             "cross_view_mpjpe_m": agreement.get("mpjpe_m"),
             "cross_view_p95_m": agreement.get("p95_error_m"),
+            "post_alignment_mpjpe_m": aligned_agreement.get("mpjpe_m"),
+            "post_alignment_p95_m": aligned_agreement.get("p95_error_m"),
             "pelvis_disagreement_m": agreement.get("pelvis_error_m"),
             "left_wrist_disagreement_m": agreement.get("left_wrist_error_m"),
             "right_wrist_disagreement_m": agreement.get("right_wrist_error_m"),
@@ -502,7 +507,8 @@ class AnalysisSessionWriter:
             "left_direct_ik_upper_error_deg", "right_direct_ik_upper_error_deg",
             "left_direct_ik_forearm_error_deg", "right_direct_ik_forearm_error_deg",
             "gmr_upper_relative_residual_m", "cross_view_mpjpe_m",
-            "cross_view_p95_m", "pelvis_disagreement_m",
+            "cross_view_p95_m", "post_alignment_mpjpe_m",
+            "post_alignment_p95_m", "pelvis_disagreement_m",
             "left_wrist_disagreement_m", "right_wrist_disagreement_m",
             "camera_timestamp_delta_ms",
             "joint_tracking_rmse_rad", "body_tracking_mpjpe_m",
@@ -574,6 +580,7 @@ class AnalysisSessionWriter:
         multi = source.get("multi_camera") or {}
         human_state = source.get("human_state") or {}
         agreement = multi.get("cross_view_agreement") or {}
+        aligned_agreement = multi.get("post_alignment_agreement") or {}
         fusion_metrics = multi.get("fusion_metrics") or {}
         cameras = list((fusion_metrics.get("per_camera") or {}).values())
         camera_fps = [
@@ -611,6 +618,8 @@ class AnalysisSessionWriter:
             "record_dropped": metrics.get("record_dropped"),
             "raw_filter_rms_m": metrics.get("raw_filtered_rms_m"),
             "cross_view_mpjpe_m": agreement.get("mpjpe_m"),
+            "post_alignment_mpjpe_m": aligned_agreement.get("mpjpe_m"),
+            "post_alignment_p95_m": aligned_agreement.get("p95_error_m"),
             "mean_camera_fused": fusion_metrics.get("mean_camera_fused"),
             "camera_fps_min": min(camera_fps) if camera_fps else None,
             "camera_latency_max_ms": max(camera_latency) if camera_latency else None,
@@ -665,6 +674,8 @@ class AnalysisSessionWriter:
                 ),
                 "cross_view_mpjpe_m": agreement.get("mpjpe_m"),
                 "cross_view_p95_m": agreement.get("p95_error_m"),
+                "post_alignment_mpjpe_m": aligned_agreement.get("mpjpe_m"),
+                "post_alignment_p95_m": aligned_agreement.get("p95_error_m"),
                 "core_disagreement_m": human_state.get("core_disagreement_m"),
                 "pelvis_disagreement_m": agreement.get("pelvis_error_m"),
                 "left_wrist_disagreement_m": agreement.get(

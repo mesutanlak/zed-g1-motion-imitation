@@ -25,6 +25,10 @@ param(
     [double]$MaxSyncMs = 110,
     [ValidateRange(100, 5000)]
     [double]$SourceTimeoutMs = 750,
+    [ValidateRange(0.05, 1.0)]
+    [double]$MaxPoseDisagreementM = 0.22,
+    [ValidateRange(0.25, 3.0)]
+    [double]$MaxAlignmentTranslationM = 1.0,
     [ValidateRange(1, 30)]
     [double]$PreviewHz = 10,
     [string]$OutputDir = "",
@@ -60,6 +64,10 @@ $arguments += "--max-sync-ms"
 $arguments += "$MaxSyncMs"
 $arguments += "--source-timeout-ms"
 $arguments += "$SourceTimeoutMs"
+$arguments += "--max-pose-disagreement-m"
+$arguments += "$MaxPoseDisagreementM"
+$arguments += "--max-alignment-translation-m"
+$arguments += "$MaxAlignmentTranslationM"
 $arguments += "--duration"
 $arguments += "$Duration"
 if ($Extrinsics) {

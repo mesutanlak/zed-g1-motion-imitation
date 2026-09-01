@@ -5,6 +5,8 @@ import json
 
 import numpy as np
 
+from zed_g1_skeleton import detect_torn_frame
+
 from zed_four_camera_test.calibrate_distributed_body38 import write_world_poses_jsonl
 from zed_four_camera_test.distributed_body38_fusion import (
     BODY38_NAMES,
@@ -15,6 +17,7 @@ from zed_four_camera_test.distributed_body38_fusion import (
     compact_live_packet,
     load_extrinsics,
     make_output_packet,
+    prepare_aligned_views,
     synchronized_samples,
 )
 
@@ -41,6 +44,23 @@ def body38_points() -> np.ndarray:
     value[IDX["LEFT_ANKLE"]] = [2.0, 0.13, 0.10]
     value[IDX["RIGHT_ANKLE"]] = [2.0, -0.13, 0.10]
     return value
+
+
+def test_frame_integrity_ignores_moderate_scene_edges_but_detects_band_tearing() -> None:
+    normal = np.zeros((720, 1280, 3), dtype=np.uint8)
+    for row in range(0, 720, 60):
+        normal[row:row + 30] = 28
+    torn, _boundaries, peak = detect_torn_frame(normal)
+    assert torn is False
+    assert peak < 38.0
+
+    corrupted = np.zeros((720, 1280, 3), dtype=np.uint8)
+    for row in range(0, 720, 80):
+        corrupted[row:row + 40] = 255
+    torn, boundaries, peak = detect_torn_frame(corrupted)
+    assert torn is True
+    assert boundaries >= 5
+    assert peak >= 38.0
 
 
 def packet(serial: int, sequence: int, xyz: np.ndarray | None = None) -> dict[str, object]:
@@ -227,6 +247,77 @@ def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -
     assert "camera_pose_fusion_from_local" not in compact["multi_camera"]
     assert all("keypoints_3d_fusion_m" not in view for view in compact["multi_camera"]["per_camera"])
     assert compact["keypoints_3d_m"] == fused["keypoints_3d_m"]
+
+
+def test_dynamic_pelvis_alignment_repairs_translation_biased_extrinsic() -> None:
+    base = body38_points()
+    views = [
+        (Sample(1, packet(1, 1, base), 1_000_000_000, 1), Extrinsic(np.eye(3), np.zeros(3))),
+        (Sample(2, packet(2, 2, base), 1_002_000_000, 2), Extrinsic(np.eye(3), np.array([0.60, -0.20, 0.10]))),
+    ]
+    prepared = prepare_aligned_views(views, minimum_confidence=45.0)
+    assert all(item.accepted for item in prepared)
+    assert np.allclose(prepared[0].aligned_points, prepared[1].aligned_points)
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=2.0,
+    )
+    assert fused["multi_camera"]["post_alignment_agreement"]["mpjpe_m"] < 1.0e-12
+    relative = np.asarray(fused["root_relative_keypoints_m"])
+    assert np.linalg.norm(relative[IDX["LEFT_WRIST"]] - relative[IDX["LEFT_ELBOW"]]) > 0.1
+
+
+def test_cross_person_pose_outlier_is_excluded_from_fusion() -> None:
+    base = body38_points()
+    outlier = base.copy()
+    for name in (
+        "SPINE_3", "NECK", "LEFT_SHOULDER", "RIGHT_SHOULDER",
+        "LEFT_ELBOW", "RIGHT_ELBOW", "LEFT_WRIST", "RIGHT_WRIST",
+        "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "RIGHT_KNEE",
+    ):
+        outlier[IDX[name]] += np.array([0.0, 0.9, 0.4])
+    views = [
+        (Sample(1, packet(1, 1, base), 1_000_000_000, 1), Extrinsic(np.eye(3), np.zeros(3))),
+        (Sample(2, packet(2, 2, base), 1_002_000_000, 2), Extrinsic(np.eye(3), np.zeros(3))),
+        (Sample(3, packet(3, 3, outlier), 1_003_000_000, 3), Extrinsic(np.eye(3), np.zeros(3))),
+    ]
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=3.0,
+    )
+    assert fused["multi_camera"]["contributing_views"] == 2
+    assert fused["multi_camera"]["excluded_pose_serials"] == [3]
+    assert fused["multi_camera"]["failure_codes"] == ["CROSS_PERSON_OR_POSE_OUTLIER"]
+    assert np.allclose(fused["keypoints_3d_m"], base, equal_nan=True)
+
+
+def test_extreme_pelvis_translation_cannot_be_pulled_into_operator_fusion() -> None:
+    base = body38_points()
+    views = [
+        (Sample(1, packet(1, 1, base), 1_000_000_000, 1), Extrinsic(np.eye(3), np.zeros(3))),
+        (Sample(2, packet(2, 2, base), 1_001_000_000, 2), Extrinsic(np.eye(3), np.array([0.05, 0.0, 0.0]))),
+        (Sample(3, packet(3, 3, base), 1_002_000_000, 3), Extrinsic(np.eye(3), np.array([-0.05, 0.0, 0.0]))),
+        (Sample(4, packet(4, 4, base), 1_003_000_000, 4), Extrinsic(np.eye(3), np.array([4.0, 0.0, 0.0]))),
+    ]
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=3.0,
+    )
+    assert fused["multi_camera"]["contributing_views"] == 3
+    assert fused["multi_camera"]["excluded_pose_serials"] == [4]
+    assert np.linalg.norm(np.asarray(fused["root_position_m"]) - base[IDX["PELVIS"]]) < 0.06
 
 
 def test_world_pose_jsonl_contains_metadata_and_one_line_per_camera(tmp_path) -> None:

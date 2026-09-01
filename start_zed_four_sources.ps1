@@ -10,9 +10,9 @@ param(
     [ValidateSet("neural-light", "neural", "performance")]
     [string]$DepthMode = "neural-light",
     [ValidateSet("strict", "monitor", "off")]
-    [string]$FrameIntegrityMode = "monitor",
+    [string]$FrameIntegrityMode = "off",
     [ValidateRange(1, 10)]
-    [double]$PreviewHz = 10,
+    [double]$PreviewHz = 8,
     [switch]$RecordLocal,
     [switch]$RecordSvo2
 )

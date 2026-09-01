@@ -663,6 +663,7 @@ class RerunSkeletonApp:
         perception = source.get("perception_metrics", {})
         multi = source.get("multi_camera") or {}
         agreement = multi.get("cross_view_agreement") or {}
+        aligned_agreement = multi.get("post_alignment_agreement") or {}
         fusion_metrics = multi.get("fusion_metrics") or {}
         rig_refinement = (
             multi.get("rig_extrinsics")
@@ -686,6 +687,8 @@ class RerunSkeletonApp:
             "evidence_views": multi.get("contributing_views"),
             "cross_view_mpjpe_m": agreement.get("mpjpe_m"),
             "cross_view_p95_m": agreement.get("p95_error_m"),
+            "post_alignment_mpjpe_m": aligned_agreement.get("mpjpe_m"),
+            "post_alignment_p95_m": aligned_agreement.get("p95_error_m"),
             "core_disagreement_m": human_state.get("core_disagreement_m"),
             "pelvis_disagreement_m": agreement.get("pelvis_error_m"),
             "left_wrist_disagreement_m": agreement.get("left_wrist_error_m"),

@@ -86,6 +86,19 @@ class ExtrinsicSet:
     cameras: dict[int, Extrinsic]
 
 
+@dataclass
+class PreparedView:
+    sample: Sample
+    extrinsic: Extrinsic
+    raw_points: np.ndarray
+    aligned_points: np.ndarray
+    confidence: np.ndarray
+    quality: float
+    alignment_translation: np.ndarray
+    pose_disagreement_m: float | None
+    accepted: bool
+
+
 CRITICAL_GROUPS = {
     "torso": ("PELVIS", "SPINE_3", "NECK", "LEFT_SHOULDER", "RIGHT_SHOULDER"),
     "left_arm": ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
@@ -341,30 +354,151 @@ def transformed_points(packet: dict[str, Any], extrinsic: Extrinsic) -> np.ndarr
     return result
 
 
-def fuse_keypoints(
+def prepare_aligned_views(
     views: list[tuple[Sample, Extrinsic]],
+    *,
+    minimum_confidence: float,
+    maximum_pose_disagreement_m: float = 0.22,
+    maximum_alignment_translation_m: float = 1.0,
+) -> list[PreparedView]:
+    """Reject cross-person views and correct residual translation drift.
+
+    Static extrinsics remain the source of camera orientation.  A BODY-based
+    calibration can nevertheless leave a sizeable translation bias when the
+    person was not perfectly still.  Translation does not change articulation,
+    so each accepted view is shifted to the robust pelvis consensus before
+    per-joint fusion.  Root-relative torso/limb shape guards against aligning
+    and mixing two different people merely because both have a valid pelvis.
+    """
+    raw: list[tuple[Sample, Extrinsic, np.ndarray, np.ndarray, float]] = []
+    for sample, extrinsic in views:
+        raw.append((
+            sample,
+            extrinsic,
+            transformed_points(sample.packet, extrinsic),
+            confidence(sample.packet.get("keypoint_confidence")),
+            sample_quality(sample.packet, minimum_confidence),
+        ))
+    if not raw:
+        return []
+
+    core_names = {
+        name for group in CRITICAL_GROUPS.values() for name in group
+    } | {"SPINE_1", "SPINE_2", "LEFT_HIP", "RIGHT_HIP"}
+    core_indexes = np.asarray([IDX[name] for name in sorted(core_names)], dtype=int)
+    pair_errors = np.full((len(raw), len(raw)), np.nan, dtype=np.float64)
+    np.fill_diagonal(pair_errors, 0.0)
+    for first in range(len(raw)):
+        first_xyz, first_conf = raw[first][2], raw[first][3]
+        if not np.isfinite(first_xyz[IDX["PELVIS"]]).all():
+            continue
+        first_relative = first_xyz - first_xyz[IDX["PELVIS"]]
+        for second in range(first + 1, len(raw)):
+            second_xyz, second_conf = raw[second][2], raw[second][3]
+            if not np.isfinite(second_xyz[IDX["PELVIS"]]).all():
+                continue
+            second_relative = second_xyz - second_xyz[IDX["PELVIS"]]
+            valid = (
+                np.isfinite(first_relative[core_indexes]).all(axis=1)
+                & np.isfinite(second_relative[core_indexes]).all(axis=1)
+                & (first_conf[core_indexes] >= minimum_confidence)
+                & (second_conf[core_indexes] >= minimum_confidence)
+            )
+            if np.count_nonzero(valid) < 5:
+                continue
+            error = float(np.mean(np.linalg.norm(
+                first_relative[core_indexes][valid]
+                - second_relative[core_indexes][valid],
+                axis=1,
+            )))
+            pair_errors[first, second] = pair_errors[second, first] = error
+
+    medoid_scores = []
+    for index in range(len(raw)):
+        finite = pair_errors[index][np.isfinite(pair_errors[index])]
+        medoid_scores.append(float(np.median(finite)) if finite.size > 1 else math.inf)
+    medoid = int(np.argmin(medoid_scores)) if any(math.isfinite(value) for value in medoid_scores) else int(np.argmax([item[4] for item in raw]))
+    accepted: list[bool] = []
+    disagreement: list[float | None] = []
+    for index in range(len(raw)):
+        value = pair_errors[medoid, index]
+        finite_value = float(value) if math.isfinite(float(value)) else None
+        disagreement.append(finite_value)
+        accepted.append(index == medoid or (finite_value is not None and finite_value <= maximum_pose_disagreement_m))
+
+    accepted_pelvis = [
+        item[2][IDX["PELVIS"]]
+        for index, item in enumerate(raw)
+        if accepted[index] and np.isfinite(item[2][IDX["PELVIS"]]).all()
+    ]
+    pelvis_consensus = (
+        np.median(np.asarray(accepted_pelvis), axis=0)
+        if accepted_pelvis
+        else np.full(3, np.nan, dtype=np.float64)
+    )
+    if np.isfinite(pelvis_consensus).all():
+        for index, item in enumerate(raw):
+            pelvis = item[2][IDX["PELVIS"]]
+            if (
+                accepted[index]
+                and np.isfinite(pelvis).all()
+                and float(np.linalg.norm(pelvis_consensus - pelvis))
+                > maximum_alignment_translation_m
+            ):
+                accepted[index] = False
+        # A badly split calibration (or two simultaneous operators) can put
+        # the coordinate-wise median farther than the safety gate from every
+        # view.  Always preserve the pose medoid as a safe single-view
+        # fallback so the emitted skeleton cannot collapse to all-NaN values.
+        if not any(accepted):
+            accepted[medoid] = True
+        accepted_pelvis = [
+            item[2][IDX["PELVIS"]]
+            for index, item in enumerate(raw)
+            if accepted[index] and np.isfinite(item[2][IDX["PELVIS"]]).all()
+        ]
+        if accepted_pelvis:
+            pelvis_consensus = np.median(np.asarray(accepted_pelvis), axis=0)
+    result: list[PreparedView] = []
+    for index, (sample, extrinsic, xyz, conf, quality) in enumerate(raw):
+        pelvis = xyz[IDX["PELVIS"]]
+        correction = (
+            pelvis_consensus - pelvis
+            if accepted[index] and np.isfinite(pelvis_consensus).all() and np.isfinite(pelvis).all()
+            else np.zeros(3, dtype=np.float64)
+        )
+        aligned = xyz.copy()
+        valid = np.isfinite(aligned).all(axis=1)
+        aligned[valid] += correction
+        result.append(PreparedView(
+            sample=sample,
+            extrinsic=extrinsic,
+            raw_points=xyz,
+            aligned_points=aligned,
+            confidence=conf,
+            quality=quality,
+            alignment_translation=correction,
+            pose_disagreement_m=disagreement[index],
+            accepted=accepted[index],
+        ))
+    return result
+
+
+def fuse_prepared_keypoints(
+    prepared: list[PreparedView],
     *,
     minimum_confidence: float,
     maximum_spread_m: float,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    """Robustly average joints after static camera-to-world transforms.
-
-    Per-joint medians remove a single bad/occluded view before confidence
-    weighting.  A joint visible in only one calibrated camera is retained,
-    which is important for wrists and the BODY_38 hand proxy joints.
-    """
     result = np.full((38, 3), np.nan, dtype=np.float64)
     result_confidence = np.zeros(38, dtype=np.float64)
     contribution_count: list[int] = []
-    prepared = []
-    for sample, extrinsic in views:
-        packet_conf = confidence(sample.packet.get("keypoint_confidence"))
-        prepared.append((transformed_points(sample.packet, extrinsic), packet_conf, sample_quality(sample.packet, minimum_confidence)))
+    accepted = [item for item in prepared if item.accepted]
     for joint in range(38):
         candidates: list[tuple[np.ndarray, float, float]] = []
-        for xyz, conf, quality in prepared:
-            if np.isfinite(xyz[joint]).all() and conf[joint] >= minimum_confidence:
-                candidates.append((xyz[joint], float(conf[joint]), quality))
+        for item in accepted:
+            if np.isfinite(item.aligned_points[joint]).all() and item.confidence[joint] >= minimum_confidence:
+                candidates.append((item.aligned_points[joint], float(item.confidence[joint]), item.quality))
         if not candidates:
             contribution_count.append(0)
             continue
@@ -378,6 +512,29 @@ def fuse_keypoints(
         result_confidence[joint] = float(np.average(np.asarray([item[1] for item in inliers]), weights=weights))
         contribution_count.append(len(inliers))
     return result, result_confidence, contribution_count
+
+
+def fuse_keypoints(
+    views: list[tuple[Sample, Extrinsic]],
+    *,
+    minimum_confidence: float,
+    maximum_spread_m: float,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """Robustly average joints after static camera-to-world transforms.
+
+    Per-joint medians remove a single bad/occluded view before confidence
+    weighting.  A joint visible in only one calibrated camera is retained,
+    which is important for wrists and the BODY_38 hand proxy joints.
+    """
+    prepared = prepare_aligned_views(
+        views,
+        minimum_confidence=minimum_confidence,
+    )
+    return fuse_prepared_keypoints(
+        prepared,
+        minimum_confidence=minimum_confidence,
+        maximum_spread_m=maximum_spread_m,
+    )
 
 
 def compact_sample(sample: Sample) -> dict[str, Any]:
@@ -508,14 +665,23 @@ def make_output_packet(
     effective_output_hz: float = 0.0,
     record_queue_depth: int = 0,
     record_dropped: int = 0,
+    maximum_pose_disagreement_m: float = 0.22,
+    maximum_alignment_translation_m: float = 1.0,
 ) -> dict[str, Any]:
-    best_sample, best_extrinsic = max(
+    prepared = prepare_aligned_views(
         views,
-        key=lambda item: sample_quality(item[0].packet, minimum_confidence),
+        minimum_confidence=minimum_confidence,
+        maximum_pose_disagreement_m=maximum_pose_disagreement_m,
+        maximum_alignment_translation_m=maximum_alignment_translation_m,
     )
+    accepted = [item for item in prepared if item.accepted]
+    if not accepted:
+        accepted = prepared
+    best_view = max(accepted, key=lambda item: item.quality)
+    best_sample, best_extrinsic = best_view.sample, best_view.extrinsic
     packet = dict(best_sample.packet)
-    fused, fused_confidence, contributions = fuse_keypoints(
-        views,
+    fused, fused_confidence, contributions = fuse_prepared_keypoints(
+        prepared,
         minimum_confidence=minimum_confidence,
         maximum_spread_m=maximum_spread_m,
     )
@@ -534,37 +700,46 @@ def make_output_packet(
         else np.full_like(fused, np.nan)
     )
     fused_features = build_g1_features(fused, fused_confidence, minimum_confidence)
-    prepared_views = [
-        (
-            sample.serial,
-            transformed_points(sample.packet, extrinsic),
-            confidence(sample.packet.get("keypoint_confidence")),
-        )
-        for sample, extrinsic in views
+    raw_agreement_views = [
+        (item.sample.serial, item.raw_points, item.confidence)
+        for item in prepared
     ]
+    aligned_agreement_views = [
+        (item.sample.serial, item.aligned_points, item.confidence)
+        for item in accepted
+    ]
+    accepted_serials = [item.sample.serial for item in accepted]
+    excluded_serials = [item.sample.serial for item in prepared if not item.accepted]
     metrics = source_metrics or {}
     view_descriptions = []
     camera_poses: dict[str, Any] = {}
     now_ns = time.time_ns()
-    for (sample, extrinsic), (_serial, world_points, source_confidence) in zip(views, prepared_views):
+    for item in prepared:
+        sample, extrinsic = item.sample, item.extrinsic
         source_metric = metrics.get(sample.serial, {})
         view_descriptions.append(sanitize({
             "serial_number": sample.serial,
+            "body_id": sample.packet.get("body_id"),
+            "unique_object_id": sample.packet.get("unique_object_id"),
             "sequence": sample.sequence,
             "body_confidence": sample.packet.get("body_confidence", 0.0),
             "source_timestamp_ns": int(sample.packet.get("timestamp_ns", 0) or 0),
             "receiver_timestamp_ns": sample.received_ns,
             "receiver_age_ms": (now_ns - sample.received_ns) / 1.0e6,
-            "quality_score": sample_quality(sample.packet, minimum_confidence),
-            "keypoints_3d_fusion_m": world_points,
-            "keypoint_confidence": source_confidence,
+            "quality_score": item.quality,
+            "accepted_for_fusion": item.accepted,
+            "pose_disagreement_to_medoid_m": item.pose_disagreement_m,
+            "dynamic_alignment_translation_m": item.alignment_translation,
+            "keypoints_3d_fusion_m": item.aligned_points,
+            "keypoint_confidence": item.confidence,
             "source_metrics": source_metric,
         }))
         camera_poses[str(sample.serial)] = sanitize({
             "rotation_camera_to_world": extrinsic.rotation,
             "translation_camera_to_world_m": extrinsic.translation,
         })
-    agreement = cross_view_agreement(prepared_views, fused, minimum_confidence)
+    agreement = cross_view_agreement(raw_agreement_views, fused, minimum_confidence)
+    aligned_agreement = cross_view_agreement(aligned_agreement_views, fused, minimum_confidence)
     calibration = dict(packet.get("calibration") or {})
     profile = dict(calibration.get("profile") or {})
     neutral = np.asarray(profile.get("neutral_pelvis_rotation_matrix"), dtype=np.float64)
@@ -608,16 +783,18 @@ def make_output_packet(
         "fusion": {
             "implementation": "application_level_weighted_body38/v1",
             "reference_world_serial": reference_serial,
-            "contributing_serials": [sample.serial for sample, _ in views],
+            "contributing_serials": accepted_serials,
+            "excluded_pose_serials": excluded_serials,
             "best_orientation_serial": best_sample.serial,
             "per_joint_contributions": contributions,
             "maximum_joint_spread_m": maximum_spread_m,
             "arrival_spread_ms": arrival_spread_ms,
         },
         "multi_camera": {
-            "mode": "FOUR_FUSED" if len(views) == 4 else "PARTIAL_FUSED",
-            "contributing_views": len(views),
-            "contributing_serials": [sample.serial for sample, _ in views],
+            "mode": "FOUR_FUSED" if len(accepted) == 4 else "PARTIAL_FUSED",
+            "contributing_views": len(accepted),
+            "contributing_serials": accepted_serials,
+            "excluded_pose_serials": excluded_serials,
             "connected_serials": connected_serials or [sample.serial for sample, _ in views],
             "configured_serials": sorted(metrics) if metrics else [sample.serial for sample, _ in views],
             "camera_timestamp_delta_ms": arrival_spread_ms,
@@ -625,6 +802,7 @@ def make_output_packet(
             "fused_quality_score": float(np.mean(fused_confidence) / 100.0),
             "best_single_quality_score": sample_quality(best_sample.packet, minimum_confidence),
             "cross_view_agreement": agreement,
+            "post_alignment_agreement": aligned_agreement,
             "fusion_metrics": {
                 "mean_camera_fused": float(np.mean(contributions)),
                 "mean_stdev_between_camera_s": arrival_spread_ms / 1000.0,
@@ -632,7 +810,7 @@ def make_output_packet(
             },
             "per_camera": view_descriptions,
             "camera_pose_fusion_from_local": camera_poses,
-            "failure_codes": [] if len(views) == 4 else ["PARTIAL_CAMERA_SET"],
+            "failure_codes": [] if len(accepted) == 4 else (["CROSS_PERSON_OR_POSE_OUTLIER"] if excluded_serials else ["PARTIAL_CAMERA_SET"]),
         },
         "transport_metrics": {
             "source_interval_ms": 1000.0 / effective_output_hz if effective_output_hz > 0.0 else None,
@@ -671,6 +849,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-timeout-ms", type=float, default=750.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
     parser.add_argument("--minimum-sources", type=int, choices=(2, 3, 4), default=2, help="Calisma aninda cikis icin gereken en az taze kamera.")
     parser.add_argument("--max-joint-spread-m", type=float, default=0.30)
+    parser.add_argument("--max-pose-disagreement-m", type=float, default=0.22, help="Farkli kisi/poz gorunumunu dislamak icin pelvis-yerel govde MPJPE esigi.")
+    parser.add_argument("--max-alignment-translation-m", type=float, default=1.0, help="Dinamik pelvis hizalamasinda farkli kisiyi elemek icin azami ceviri.")
     parser.add_argument("--calibration-record", type=Path, default=None, help="Dortlu senkron ham BODY_38 karelerini JSONL olarak kaydet.")
     parser.add_argument("--calibration-max-hz", type=float, default=12.0)
     parser.add_argument("--record", action="store_true", help="Fusion JSONL kaydini baslangicta ac.")
@@ -704,6 +884,8 @@ def main() -> int:
         or args.max_sync_ms <= 0.0
         or args.source_timeout_ms <= 0.0
         or args.max_joint_spread_m <= 0.0
+        or args.max_pose_disagreement_m <= 0.0
+        or args.max_alignment_translation_m <= 0.0
         or args.output_max_hz <= 0.0
         or args.monitor_max_hz <= 0.0
         or args.ros_max_hz <= 0.0
@@ -870,6 +1052,25 @@ def main() -> int:
             events = selector.select(timeout=0.20)
             for key, _ in events:
                 kind, endpoint = key.data
+                if kind == "preview":
+                    # JPEG preview is presentation-only.  If decoding falls
+                    # behind, drain the socket and decode just the newest
+                    # datagram instead of spending fusion time on stale video.
+                    latest_preview: bytes | None = None
+                    while True:
+                        try:
+                            latest_preview, _sender = key.fileobj.recvfrom(65535)
+                        except BlockingIOError:
+                            break
+                        except OSError:
+                            break
+                    if cv2 is not None and latest_preview is not None:
+                        encoded_image = np.frombuffer(latest_preview, dtype=np.uint8)
+                        decoded = cv2.imdecode(encoded_image, cv2.IMREAD_COLOR)
+                        if decoded is not None:
+                            preview_frames[endpoint.serial] = decoded
+                            preview_received_ns[endpoint.serial] = time.time_ns()
+                    continue
                 while True:
                     try:
                         payload, _sender = key.fileobj.recvfrom(65535)
@@ -877,14 +1078,6 @@ def main() -> int:
                         break
                     except OSError:
                         break
-                    if kind == "preview":
-                        if cv2 is not None:
-                            encoded_image = np.frombuffer(payload, dtype=np.uint8)
-                            decoded = cv2.imdecode(encoded_image, cv2.IMREAD_COLOR)
-                            if decoded is not None:
-                                preview_frames[endpoint.serial] = decoded
-                                preview_received_ns[endpoint.serial] = time.time_ns()
-                        continue
                     try:
                         document = json.loads(payload.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -983,6 +1176,8 @@ def main() -> int:
                             effective_output_hz=effective_hz,
                             record_queue_depth=record_queue.qsize(),
                             record_dropped=record_dropped,
+                            maximum_pose_disagreement_m=args.max_pose_disagreement_m,
+                            maximum_alignment_translation_m=args.max_alignment_translation_m,
                         )
                         compact = compact_live_packet(packet)
                         compact_encoded = json.dumps(compact, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
@@ -1008,7 +1203,7 @@ def main() -> int:
                             output_sequence += 1
                             fused_packets += 1
                             output_events.append(now)
-                            last_fused_serials = sorted(sample.serial for sample in samples)
+                            last_fused_serials = sorted(int(value) for value in (packet.get("fusion") or {}).get("contributing_serials", []))
                             last_arrival_spread_ms = arrival_spread_ms
                             last_output_at = now
                             if recording:

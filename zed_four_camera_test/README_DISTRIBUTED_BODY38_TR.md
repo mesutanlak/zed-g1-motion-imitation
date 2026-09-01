@@ -168,12 +168,14 @@ başlatma.
   porta bağlayıp ZED Diagnostic ile doğrula. ZED360/UDP kodu bozuk görüntüyü
   düzeltemez.
 
-ZED Diagnostic temiz olduğu halde uygulamanın satır-süreksizliği tanısı yanlış
-pozitif verirse, yalnız ham kalibrasyon/fusion kabul testi için kaynak komutuna
-`-FrameIntegrityMode monitor` eklenebilir. Bu mod şüpheli kareleri UDP durum
-paketi olarak işaretler fakat BODY_38 testini kesmez. Bu modda G1'e `OutputHost`
-ile veri yönlendirmeyin; önce alıcıdaki dört-kamera ve kalibrasyon sonuçlarını
-doğrulayın.
+ZED Diagnostic temiz olduğu halde eski satır-süreksizliği sezgisi masa,
+pencere veya raf gibi yatay kenarlarda yanlış pozitif verebilir. Dört-kamera
+otomatik başlatıcısı bu nedenle varsayılan olarak `-FrameIntegrityMode off`
+kullanır; SDK'nin gerçek `grab` hataları yine yakalanır. Ek tanı gerekirse
+kaynak komutuna `-FrameIntegrityMode monitor` eklenebilir. Bu mod şüpheli
+kareleri UDP durum paketi olarak işaretler fakat BODY_38 testini kesmez. Bu
+modda G1'e `OutputHost` ile veri yönlendirmeyin; önce alıcıdaki dört-kamera ve
+kalibrasyon sonuçlarını doğrulayın.
 
 Bu mod gerekirse dört kaynak komutunun tamamına uygulanmalıdır. Alıcıdaki
 `durum=...` sayısı yalnız bu tanı paketlerini sayar; `gecersiz=0` ise UDP BODY_38
