@@ -45,7 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-serial", type=int, required=True)
     parser.add_argument("--confidence", type=float, default=55.0)
     parser.add_argument("--max-residual-m", type=float, default=0.16)
-    parser.add_argument("--max-samples", type=int, default=240)
+    parser.add_argument("--max-samples", type=int, default=900)
+    parser.add_argument("--min-inlier-ratio", type=float, default=0.25)
+    parser.add_argument("--min-inlier-points", type=int, default=300)
+    parser.add_argument("--min-capture-samples", type=int, default=60)
+    parser.add_argument("--max-pelvis-p95-m", type=float, default=0.25)
     parser.add_argument(
         "--world-poses-jsonl",
         type=Path,
@@ -161,10 +165,11 @@ def collect_correspondences(
     target_serial: int,
     threshold: float,
     maximum_samples: int,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     source_rows: list[np.ndarray] = []
     target_rows: list[np.ndarray] = []
     used_samples = 0
+    pelvis_pairs: list[np.ndarray] = []
     for sample in samples[:maximum_samples]:
         sources = sample.get("sources", {})
         if not isinstance(sources, dict):
@@ -201,15 +206,36 @@ def collect_correspondences(
             continue
         source_rows.extend(target_points[keep])
         target_rows.extend(reference_points[keep])
+        pelvis_index = indices.get("PELVIS")
+        if (
+            pelvis_index is not None
+            and np.isfinite(reference_points[pelvis_index]).all()
+            and np.isfinite(target_points[pelvis_index]).all()
+            and reference_confidence[pelvis_index] >= threshold
+            and target_confidence[pelvis_index] >= threshold
+        ):
+            pelvis_pairs.append(np.stack((
+                target_points[pelvis_index], reference_points[pelvis_index]
+            )))
         used_samples += 1
     if not source_rows:
-        return np.empty((0, 3)), np.empty((0, 3)), used_samples
-    return np.asarray(source_rows), np.asarray(target_rows), used_samples
+        return np.empty((0, 3)), np.empty((0, 3)), used_samples, np.empty((0, 2, 3))
+    return (
+        np.asarray(source_rows), np.asarray(target_rows), used_samples,
+        np.asarray(pelvis_pairs, dtype=np.float64).reshape((-1, 2, 3)),
+    )
 
 
 def main() -> int:
     args = parse_args()
-    if not 0.0 <= args.confidence <= 100.0 or args.max_residual_m <= 0.0:
+    if (
+        not 0.0 <= args.confidence <= 100.0
+        or args.max_residual_m <= 0.0
+        or not 0.0 < args.min_inlier_ratio <= 1.0
+        or args.min_inlier_points < 12
+        or args.min_capture_samples < 1
+        or args.max_pelvis_p95_m <= 0.0
+    ):
         print("HATA: confidence veya max-residual-m gecersiz.", file=sys.stderr)
         return 2
     try:
@@ -236,7 +262,7 @@ def main() -> int:
     for serial in serials:
         if serial == args.reference_serial:
             continue
-        source, target, used_samples = collect_correspondences(
+        source, target, used_samples, pelvis_pairs = collect_correspondences(
             samples,
             reference_serial=args.reference_serial,
             target_serial=serial,
@@ -249,18 +275,57 @@ def main() -> int:
             failures += 1
             continue
         rotation, translation, metrics = fit
+        candidate_points = int(len(source))
+        inlier_ratio = (
+            float(metrics["paired_keypoints"]) / candidate_points
+            if candidate_points else 0.0
+        )
+        pelvis_errors = (
+            np.linalg.norm(
+                pelvis_pairs[:, 0] @ rotation.T + translation - pelvis_pairs[:, 1],
+                axis=1,
+            )
+            if len(pelvis_pairs)
+            else np.empty(0, dtype=np.float64)
+        )
+        pelvis_median_m = float(np.median(pelvis_errors)) if pelvis_errors.size else math.inf
+        pelvis_p95_m = float(np.percentile(pelvis_errors, 95)) if pelvis_errors.size else math.inf
+        quality_ok = bool(
+            used_samples >= args.min_capture_samples
+            and int(metrics["paired_keypoints"]) >= args.min_inlier_points
+            and inlier_ratio >= args.min_inlier_ratio
+            and float(metrics["rms_m"]) <= args.max_residual_m
+            and pelvis_p95_m <= args.max_pelvis_p95_m
+        )
+        fit_metrics = {
+            "capture_samples": used_samples,
+            "candidate_keypoints": candidate_points,
+            "inlier_ratio": inlier_ratio,
+            "pelvis_frames": int(pelvis_errors.size),
+            "pelvis_median_m": pelvis_median_m,
+            "pelvis_p95_m": pelvis_p95_m,
+            "quality_gate_passed": quality_ok,
+            **metrics,
+        }
         cameras[str(serial)] = {
             "rotation_camera_to_world": rotation.tolist(),
             "translation_camera_to_world_m": translation.tolist(),
-            "fit": {"capture_samples": used_samples, **metrics},
+            "fit": fit_metrics,
         }
         print(
             f"ZED {serial} -> {args.reference_serial} | kare={used_samples} "
-            f"nokta={metrics['paired_keypoints']} | rms={metrics['rms_m']:.3f}m "
-            f"p95={metrics['p95_m']:.3f}m"
+            f"nokta={metrics['paired_keypoints']}/{candidate_points} "
+            f"({100.0 * inlier_ratio:.1f}%) | rms={metrics['rms_m']:.3f}m "
+            f"p95={metrics['p95_m']:.3f}m | pelvis_p95={pelvis_p95_m:.3f}m"
         )
-        if float(metrics["rms_m"]) > args.max_residual_m:
-            print(f"UYARI: ZED {serial} RMS esigi asti; tripod/ortak gorus ve T-poz kaydini tekrarlayin.", file=sys.stderr)
+        if not quality_ok:
+            print(
+                f"HATA: ZED {serial} kalibrasyon kalite kapisini gecemedi "
+                f"(en az {args.min_capture_samples} kare, {args.min_inlier_points} nokta, "
+                f"%{100.0 * args.min_inlier_ratio:.0f} inlier, pelvis p95 <= "
+                f"{args.max_pelvis_p95_m:.2f} m gerekli).",
+                file=sys.stderr,
+            )
             failures += 1
     if failures or len(cameras) != 4:
         print("Kalibrasyon dosyasi yazilmadi; once tum kameralar icin dusuk hatali fit gerekli.", file=sys.stderr)

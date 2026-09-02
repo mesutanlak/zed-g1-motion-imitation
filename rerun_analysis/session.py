@@ -29,10 +29,17 @@ FRAME_FIELDS = (
     "post_alignment_p95_m", "core_disagreement_m", "pelvis_disagreement_m",
     "left_wrist_disagreement_m", "right_wrist_disagreement_m",
     "camera_timestamp_delta_ms", "camera_sync_ok", "fusion_failure_codes",
+    "selection_timestamp_delta_ms", "workspace_excluded_views",
+    "workspace_excluded_serials",
     "fused_quality_score", "best_single_quality_score",
     "mean_camera_fused", "camera_fps_min", "camera_fps_max",
-    "camera_latency_max_ms", "fusion_timestamp_stdev_ms",
+    "camera_latency_max_ms", "camera_network_queue_max_ms",
+    "camera_clock_offset_span_ms", "temporal_prediction_max_ms",
+    "fusion_timestamp_stdev_ms",
     "left_arm_supporting_views", "right_arm_supporting_views",
+    "left_arm_clear_views", "right_arm_clear_views",
+    "left_arm_selected_serials", "right_arm_selected_serials",
+    "left_arm_orientation_source", "right_arm_orientation_source",
     "rig_refinement_state", "rig_refinement_rms_m",
     "rig_refinement_updates",
     "pelvis_quality", "torso_quality", "left_arm_quality",
@@ -595,7 +602,28 @@ class AnalysisSessionWriter:
             if isinstance(item.get("received_latency_ms"), (int, float))
             and math.isfinite(float(item["received_latency_ms"]))
         ]
+        camera_network_queue = [
+            float(item["network_queue_ms"])
+            for item in cameras
+            if isinstance(item.get("network_queue_ms"), (int, float))
+            and math.isfinite(float(item["network_queue_ms"]))
+        ]
+        camera_clock_offsets = [
+            float(item["clock_offset_estimate_ms"])
+            for item in cameras
+            if isinstance(item.get("clock_offset_estimate_ms"), (int, float))
+            and math.isfinite(float(item["clock_offset_estimate_ms"]))
+        ]
+        temporal_predictions = [
+            float(item["temporal_prediction_ms"])
+            for item in cameras
+            if isinstance(item.get("temporal_prediction_ms"), (int, float))
+            and math.isfinite(float(item["temporal_prediction_ms"]))
+        ]
         arm_evidence = multi.get("arm_evidence") or {}
+        fusion_detail = source.get("fusion") or {}
+        workspace_excluded = list(multi.get("workspace_excluded_serials") or [])
+        arm_orientation_sources = fusion_detail.get("arm_orientation_sources") or {}
         rig_refinement = (
             multi.get("rig_extrinsics")
             or multi.get("online_rig_refinement")
@@ -623,6 +651,12 @@ class AnalysisSessionWriter:
             "mean_camera_fused": fusion_metrics.get("mean_camera_fused"),
             "camera_fps_min": min(camera_fps) if camera_fps else None,
             "camera_latency_max_ms": max(camera_latency) if camera_latency else None,
+            "camera_network_queue_max_ms": max(camera_network_queue) if camera_network_queue else None,
+            "camera_clock_offset_span_ms": (
+                max(camera_clock_offsets) - min(camera_clock_offsets)
+                if camera_clock_offsets else None
+            ),
+            "temporal_prediction_max_ms": max(temporal_predictions) if temporal_predictions else None,
             "fusion_timestamp_stdev_ms": (
                 1000.0 * fusion_metrics["mean_stdev_between_camera_s"]
                 if isinstance(fusion_metrics.get("mean_stdev_between_camera_s"), (int, float))
@@ -635,6 +669,10 @@ class AnalysisSessionWriter:
             "camera_timestamp_delta_ms": multi.get(
                 "camera_timestamp_delta_ms"
             ),
+            "selection_timestamp_delta_ms": fusion_detail.get(
+                "selection_capture_spread_ms"
+            ),
+            "workspace_excluded_views": len(workspace_excluded),
         }.items():
             self._sample_quality(key, value)
         self._frame_writer.writerow(
@@ -688,6 +726,11 @@ class AnalysisSessionWriter:
                     "camera_timestamp_delta_ms"
                 ),
                 "camera_sync_ok": multi.get("camera_sync_ok"),
+                "selection_timestamp_delta_ms": fusion_detail.get(
+                    "selection_capture_spread_ms"
+                ),
+                "workspace_excluded_views": len(workspace_excluded),
+                "workspace_excluded_serials": json.dumps(workspace_excluded),
                 "fusion_failure_codes": json.dumps(
                     multi.get("failure_codes") or [], ensure_ascii=False
                 ),
@@ -700,6 +743,16 @@ class AnalysisSessionWriter:
                 "camera_fps_max": max(camera_fps) if camera_fps else None,
                 "camera_latency_max_ms": (
                     max(camera_latency) if camera_latency else None
+                ),
+                "camera_network_queue_max_ms": (
+                    max(camera_network_queue) if camera_network_queue else None
+                ),
+                "camera_clock_offset_span_ms": (
+                    max(camera_clock_offsets) - min(camera_clock_offsets)
+                    if camera_clock_offsets else None
+                ),
+                "temporal_prediction_max_ms": (
+                    max(temporal_predictions) if temporal_predictions else None
                 ),
                 "fusion_timestamp_stdev_ms": (
                     1000.0 * fusion_metrics["mean_stdev_between_camera_s"]
@@ -715,6 +768,20 @@ class AnalysisSessionWriter:
                 "right_arm_supporting_views": (
                     arm_evidence.get("right") or {}
                 ).get("supporting_views"),
+                "left_arm_clear_views": (
+                    arm_evidence.get("left") or {}
+                ).get("reliable_clear_views"),
+                "right_arm_clear_views": (
+                    arm_evidence.get("right") or {}
+                ).get("reliable_clear_views"),
+                "left_arm_selected_serials": json.dumps(
+                    (arm_evidence.get("left") or {}).get("selected_serials") or []
+                ),
+                "right_arm_selected_serials": json.dumps(
+                    (arm_evidence.get("right") or {}).get("selected_serials") or []
+                ),
+                "left_arm_orientation_source": arm_orientation_sources.get("left"),
+                "right_arm_orientation_source": arm_orientation_sources.get("right"),
                 "rig_refinement_state": rig_refinement.get("state"),
                 "rig_refinement_rms_m": rig_refinement.get("rms_m"),
                 "rig_refinement_updates": rig_refinement.get(

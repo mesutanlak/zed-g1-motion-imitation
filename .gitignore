@@ -58,3 +58,7 @@ policies/g1_reference_upper_body/
 
 # Accidental nested/empty copy
 ZED_G1_Projesi/
+
+# Rig-specific four-camera calibration and generated runtime poses stay local.
+four json/*.json
+config/zed_four/

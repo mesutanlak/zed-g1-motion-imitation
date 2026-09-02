@@ -134,7 +134,10 @@ def main() -> int:
         completed = subprocess.run(
             [
                 sys.executable, "-m", "rerun_analysis.app", "--demo",
-                "--no-viewer", "--headless", "--seconds", "0.25",
+                # Rerun 0.26 startup can consume most of 250 ms on Windows,
+                # leaving only one demo frame and making this smoke test
+                # timing-dependent.  Keep it short but allow three frames.
+                "--no-viewer", "--headless", "--seconds", "0.75",
                 "--output-dir", str(output),
             ],
             cwd=project,
@@ -174,6 +177,10 @@ def main() -> int:
         for field in (
             "fusion_mode", "evidence_views", "cross_view_mpjpe_m",
             "mean_camera_fused", "camera_latency_max_ms",
+            "camera_network_queue_max_ms", "camera_clock_offset_span_ms",
+            "selection_timestamp_delta_ms", "workspace_excluded_serials",
+            "left_arm_clear_views", "left_arm_selected_serials",
+            "left_arm_orientation_source",
         ):
             if field not in frame_fields:
                 raise AssertionError((field, frame_fields))

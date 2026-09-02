@@ -287,6 +287,32 @@ def finite_vector(value: Any, expected: int | None = None) -> np.ndarray | None:
     return vector
 
 
+def body_in_distance_gate(
+    position: Any,
+    minimum_m: float,
+    maximum_m: float,
+    *,
+    retain_locked: bool = False,
+) -> bool:
+    """Return whether a camera-local body root belongs to the operator zone.
+
+    Acquisition uses the requested hard interval.  A previously locked
+    operator gets a small 20 cm Schmitt margin so depth noise at exactly 2 or
+    4 metres cannot make the safety lock chatter.  A person around 6 m is
+    rejected in both states.
+    """
+    value = finite_vector(position, 3)
+    if value is None or value[0] <= 0.0:
+        return False
+    margin_m = 0.20 if retain_locked else 0.0
+    distance_m = float(np.linalg.norm(value))
+    return bool(
+        max(0.0, float(minimum_m) - margin_m)
+        <= distance_m
+        <= float(maximum_m) + margin_m
+    )
+
+
 def quaternion_xyzw_to_matrix(quaternion: Any) -> np.ndarray:
     q = finite_vector(quaternion, 4)
     if q is None:
@@ -536,6 +562,9 @@ def build_record(
     local_orientations = np.asarray(
         body.local_orientation_per_joint, dtype=np.float64
     )
+    keypoints_covariance = zed_value(
+        getattr(body, "keypoints_covariance", None)
+    )
 
     pelvis = filtered_points[IDX["PELVIS"]]
     root_rotation = quaternion_xyzw_to_matrix(root_q)
@@ -577,6 +606,7 @@ def build_record(
             "keypoints_3d_raw_m": raw_points,
             "keypoints_3d_filtered_m": filtered_points,
             "keypoint_confidence": confidence,
+            "keypoints_covariance": keypoints_covariance,
             "local_position_per_joint_m": local_positions,
             "local_orientation_per_joint_xyzw": local_orientations,
             "root_relative_keypoints_m": root_relative,
@@ -1006,6 +1036,15 @@ def parse_args() -> argparse.Namespace:
         help="Ekrandaki önerilen en uzak 3B insan mesafesi, metre",
     )
     parser.add_argument(
+        "--enforce-distance-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Operatör seçimini --distance-min/--distance-max kamera mesafesine "
+            "zorla. Dört kameralı çalışma alanında uzaktaki kişiye kilitlenmeyi engeller."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "recordings",
@@ -1033,6 +1072,11 @@ def parse_args() -> argparse.Namespace:
         "--stream-host",
         default=None,
         help="BODY_38 canlı UDP hedefi; örnek: WSL IP adresi",
+    )
+    parser.add_argument(
+        "--source-host-id",
+        default=socket.gethostname(),
+        help="Coklu-PC saat-ofseti grubu; ayni bilgisayardaki kameralar ayni degeri kullanmali.",
     )
     parser.add_argument(
         "--stream-port",
@@ -1304,7 +1348,13 @@ def main() -> int:
     }[args.depth_mode]
     init.coordinate_units = sl.UNIT.METER
     init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
-    init.depth_maximum_distance = 8.0
+    if args.enforce_distance_gate and hasattr(init, "depth_minimum_distance"):
+        # The SDK depth interval is slightly wider than the acquisition gate;
+        # this preserves an already locked operator during boundary noise.
+        init.depth_minimum_distance = max(0.0, args.distance_min - 0.20)
+    init.depth_maximum_distance = (
+        args.distance_max + 0.20 if args.enforce_distance_gate else 8.0
+    )
     init.sdk_verbose = 1
     if args.svo_input is None and int(args.serial) > 0:
         # Without an explicit serial, two independent extractor processes can
@@ -1354,7 +1404,9 @@ def main() -> int:
     body_parameters.enable_tracking = True
     body_parameters.enable_body_fitting = True
     body_parameters.enable_segmentation = False
-    body_parameters.max_range = 8.0
+    body_parameters.max_range = (
+        args.distance_max + 0.20 if args.enforce_distance_gate else 8.0
+    )
     body_parameters.allow_reduced_precision_inference = bool(args.reduced_precision)
     body_parameters.prediction_timeout_s = max(
         0.0, min(float(args.prediction_timeout), 1.0)
@@ -1629,12 +1681,16 @@ def main() -> int:
 
             zed.retrieve_image(left_image, sl.VIEW.LEFT)
             # sl.Mat owns a reusable SDK buffer.  Copy it immediately: the
-            # following body inference and GUI work must never observe storage
-            # that the SDK may reuse asynchronously.
+            # following body inference and GUI/preview work must never observe
+            # storage that the SDK may reuse asynchronously.  The custom tear
+            # detector scans a full image and is intentionally skipped in
+            # normal four-camera operation (``off``); ZED Diagnostic remains
+            # the authoritative USB integrity test.
             frame = np.array(left_image.get_data(), copy=True)
-            torn, torn_boundaries, torn_peak = detect_torn_frame(frame)
             if args.frame_integrity_mode == "off":
-                torn = False
+                torn, torn_boundaries, torn_peak = False, 0, 0.0
+            else:
+                torn, torn_boundaries, torn_peak = detect_torn_frame(frame)
             if torn:
                 corrupt_consecutive += 1
                 corrupt_total += 1
@@ -1758,6 +1814,18 @@ def main() -> int:
                 valid=lambda body: (
                     body.tracking_state == sl.OBJECT_TRACKING_STATE.OK
                     and float(body.confidence) >= args.confidence
+                    and (
+                        not args.enforce_distance_gate
+                        or body_in_distance_gate(
+                            body.position,
+                            args.distance_min,
+                            args.distance_max,
+                            retain_locked=(
+                                operator_selector.locked_id is not None
+                                and int(body.id) == operator_selector.locked_id
+                            ),
+                        )
+                    )
                 ),
                 distance=lambda body: (
                     float(np.linalg.norm(position))
@@ -1843,6 +1911,12 @@ def main() -> int:
                     "acquisition_frames": selection.acquisition_frames,
                     "reason": selection.reason,
                     "automatic_handover": False,
+                    "distance_gate": {
+                        "enabled": bool(args.enforce_distance_gate),
+                        "acquire_min_m": args.distance_min,
+                        "acquire_max_m": args.distance_max,
+                        "locked_hysteresis_m": 0.20,
+                    },
                 }
                 record["calibration"] = {
                     "state": calibration.state,
@@ -1944,6 +2018,7 @@ def main() -> int:
                         {
                             "schema": "zed_body38_live/v1",
                             "source_serial": source_serial,
+                            "source_host_id": str(args.source_host_id),
                             "sequence": frame_index,
                             "timestamp_ns": timestamp_ns,
                             "coordinate_system": record["coordinate_system"],
@@ -1965,6 +2040,9 @@ def main() -> int:
                             "keypoint_confidence": record[
                                 "keypoint_confidence"
                             ],
+                            "keypoints_covariance": record.get(
+                                "keypoints_covariance"
+                            ),
                             "local_orientation_per_joint_xyzw": record[
                                 "local_orientation_per_joint_xyzw"
                             ],

@@ -5,20 +5,28 @@ import json
 
 import numpy as np
 
-from zed_g1_skeleton import detect_torn_frame
+from zed_g1_skeleton import body_in_distance_gate, detect_torn_frame
 
 from zed_four_camera_test.calibrate_distributed_body38 import write_world_poses_jsonl
+from zed_four_camera_test.extrinsic_geometry import rebase_camera_transforms
+from zed_four_camera_test.validate_distributed_extrinsics import validate_document
 from zed_four_camera_test.distributed_body38_fusion import (
     BODY38_NAMES,
     IDX,
+    ClockOffsetEstimator,
     Extrinsic,
     InputEndpoint,
     Sample,
     compact_live_packet,
+    covariance_weight,
     load_extrinsics,
     make_output_packet,
     prepare_aligned_views,
     synchronized_samples,
+    temporal_compensate_samples,
+    valid_body38_payload,
+    world_forward_in_workspace,
+    workspace_membership_with_hysteresis,
 )
 
 
@@ -75,10 +83,115 @@ def packet(serial: int, sequence: int, xyz: np.ndarray | None = None) -> dict[st
         "keypoint_names": list(BODY38_NAMES),
         "keypoints_3d_m": points.tolist(),
         "keypoint_confidence": np.full(38, 90.0).tolist(),
+        "local_orientation_per_joint_xyzw": (
+            np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (38, 1)).tolist()
+        ),
+        "operator_selection": {
+            "state": "LOCKED",
+            "locked_body_id": sequence,
+            "acquisition_frames": 10,
+            "missing_frames": 0,
+        },
         "calibration": {
             "profile": {"neutral_pelvis_rotation_matrix": np.eye(3).tolist()}
         },
     }
+
+
+def test_operator_distance_gate_rejects_background_and_keeps_locked_boundary() -> None:
+    assert body_in_distance_gate([3.0, 0.0, 0.0], 2.0, 4.0)
+    assert not body_in_distance_gate([6.0, 0.0, 0.0], 2.0, 4.0)
+    assert not body_in_distance_gate([1.9, 0.0, 0.0], 2.0, 4.0)
+    assert body_in_distance_gate([1.9, 0.0, 0.0], 2.0, 4.0, retain_locked=True)
+    assert not body_in_distance_gate([-3.0, 0.0, 0.0], 2.0, 4.0)
+
+
+def test_calibrated_world_workspace_rejects_six_meter_background_person() -> None:
+    foreground = Sample(1, packet(1, 1, body38_points()), 1_000_000_000, 1)
+    background_points = body38_points().copy()
+    background_points[:, 0] += 4.3
+    background = Sample(1, packet(1, 2, background_points), 1_000_000_001, 2)
+    extrinsic = Extrinsic(np.eye(3), np.zeros(3))
+
+    assert world_forward_in_workspace(foreground, extrinsic, 2.0, 4.0) == (True, 2.0)
+    assert world_forward_in_workspace(background, extrinsic, 2.0, 4.0) == (False, 6.3)
+
+
+def test_workspace_hysteresis_prevents_boundary_flapping() -> None:
+    assert workspace_membership_with_hysteresis(
+        2.0, was_inside=False, minimum_x_m=2.0, maximum_x_m=4.0,
+        hysteresis_m=0.15,
+    )
+    assert workspace_membership_with_hysteresis(
+        1.90, was_inside=True, minimum_x_m=2.0, maximum_x_m=4.0,
+        hysteresis_m=0.15,
+    )
+    assert not workspace_membership_with_hysteresis(
+        1.80, was_inside=True, minimum_x_m=2.0, maximum_x_m=4.0,
+        hysteresis_m=0.15,
+    )
+    assert not workspace_membership_with_hysteresis(
+        6.0, was_inside=True, minimum_x_m=2.0, maximum_x_m=4.0,
+        hysteresis_m=0.15,
+    )
+
+
+def test_body38_payload_validation_checks_raw_shape_and_joint_names() -> None:
+    document = packet(1, 1)
+    assert valid_body38_payload(document)
+    document["keypoints_3d_m"] = [[1.0, 2.0, 3.0]]
+    assert not valid_body38_payload(document)
+    document = packet(1, 1)
+    document["keypoint_names"] = list(BODY38_NAMES[:-1])
+    assert not valid_body38_payload(document)
+
+
+def test_clock_offset_estimator_turns_negative_cross_host_latency_positive() -> None:
+    estimator = ClockOffsetEstimator(window=30)
+    document = packet(1, 1)
+    document["timestamp_ns"] = 1_085_000_000
+    document["latency_trace_ns"] = {
+        "t0_capture_ns": 1_085_000_000,
+        "t2_windows_udp_send_ns": 1_100_000_000,
+    }
+    corrected_ns, offset_ns, metrics = estimator.update(
+        "Laptop", document, 1_003_000_000
+    )
+    assert offset_ns == -97_000_000
+    assert corrected_ns == 988_000_000
+    assert metrics["raw_clock_mixed_capture_to_receive_ms"] == -82.0
+    assert metrics["corrected_capture_to_receive_ms"] == 15.0
+    assert metrics["network_queue_ms"] == 0.0
+
+
+def test_zero_sdk_covariance_is_missing_data_not_perfect_certainty() -> None:
+    document = packet(1, 1)
+    document["keypoints_covariance"] = np.zeros((38, 6)).tolist()
+    assert covariance_weight(document, IDX["LEFT_WRIST"]) == 0.25
+
+
+def test_temporal_compensation_predicts_only_to_bounded_common_capture_time() -> None:
+    previous_xyz = body38_points()
+    current_xyz = previous_xyz.copy()
+    current_xyz[IDX["LEFT_WRIST"], 1] += 0.10
+    target_xyz = body38_points()
+    previous_packet = packet(1, 1, previous_xyz)
+    current_packet = packet(1, 2, current_xyz)
+    target_packet = packet(2, 2, target_xyz)
+    previous_packet["body_id"] = current_packet["body_id"] = 7
+    target_packet["body_id"] = 7
+    previous = Sample(1, previous_packet, 1_000_000_000, 1, 1_000_000_000, 0, "Laptop")
+    current = Sample(1, current_packet, 1_050_000_000, 2, 1_050_000_000, 0, "Laptop")
+    target = Sample(2, target_packet, 1_100_000_000, 2, 1_100_000_000, 0, "MainPc")
+    compensated = temporal_compensate_samples(
+        [current, target],
+        {1: deque([previous, current], maxlen=32), 2: deque([target], maxlen=32)},
+        minimum_confidence=45.0,
+        maximum_prediction_ms=70.0,
+    )
+    wrist = np.asarray(compensated[0].packet["keypoints_3d_m"])[IDX["LEFT_WRIST"]]
+    assert np.isclose(wrist[1], previous_xyz[IDX["LEFT_WRIST"], 1] + 0.20)
+    assert compensated[0].packet["_fusion_temporal_prediction_ms"] == 50.0
 
 
 def test_synchronized_samples_prefers_four_fresh_sources_and_ignores_stale() -> None:
@@ -128,6 +241,91 @@ def test_synchronized_samples_advances_past_an_older_tighter_bundle() -> None:
     assert spread_ms == 6.0
 
 
+def test_synchronized_samples_prefers_fresh_three_views_over_stale_four() -> None:
+    now = 1_000_000_000
+    histories = {
+        serial: deque([
+            Sample(serial, packet(serial, 1), 800_000_000, 1),
+            Sample(serial, packet(serial, 2), 995_000_000 + serial, 2),
+        ], maxlen=16)
+        for serial in (1, 2, 3)
+    }
+    histories[4] = deque([
+        Sample(4, packet(4, 1), 800_000_000, 1),
+    ], maxlen=16)
+
+    selected = synchronized_samples(
+        histories,
+        now_ns=now,
+        source_timeout_ns=250_000_000,
+        maximum_spread_ns=80_000_000,
+        minimum_sources=3,
+    )
+
+    assert selected is not None
+    samples, spread_ms = selected
+    assert {sample.serial for sample in samples} == {1, 2, 3}
+    assert {sample.sequence for sample in samples} == {2}
+    assert spread_ms < 0.001
+
+
+def test_synchronized_samples_waits_for_new_common_cycle_instead_of_smearing() -> None:
+    old_ns = 934_000_000
+    histories = {
+        serial: deque(
+            [Sample(serial, packet(serial, 1), old_ns, 1, old_ns)],
+            maxlen=16,
+        )
+        for serial in (1, 2, 3, 4)
+    }
+    histories[1].append(
+        Sample(1, packet(1, 2), 1_000_000_000, 2, 1_000_000_000)
+    )
+
+    selected = synchronized_samples(
+        histories,
+        now_ns=1_005_000_000,
+        source_timeout_ns=250_000_000,
+        maximum_spread_ns=80_000_000,
+        minimum_sources=3,
+    )
+
+    assert selected is not None
+    samples, spread_ms = selected
+    assert {sample.sequence for sample in samples} == {1}
+    assert spread_ms == 0.0
+
+
+def test_synchronized_samples_emits_three_new_views_without_old_fourth() -> None:
+    old_ns = 934_000_000
+    histories = {
+        serial: deque(
+            [Sample(serial, packet(serial, 1), old_ns, 1, old_ns)],
+            maxlen=16,
+        )
+        for serial in (1, 2, 3, 4)
+    }
+    for serial, jitter_ns in ((1, 0), (2, 2_000_000), (3, 4_000_000)):
+        capture_ns = 1_000_000_000 + jitter_ns
+        histories[serial].append(
+            Sample(serial, packet(serial, 2), capture_ns, 2, capture_ns)
+        )
+
+    selected = synchronized_samples(
+        histories,
+        now_ns=1_010_000_000,
+        source_timeout_ns=250_000_000,
+        maximum_spread_ns=80_000_000,
+        minimum_sources=3,
+    )
+
+    assert selected is not None
+    samples, spread_ms = selected
+    assert {sample.serial for sample in samples} == {1, 2, 3}
+    assert {sample.sequence for sample in samples} == {2}
+    assert spread_ms == 4.0
+
+
 def test_synchronized_samples_keeps_up_with_four_15_hz_sources() -> None:
     histories = {serial: deque(maxlen=16) for serial in (1, 2, 3, 4)}
     selected_markers = []
@@ -167,6 +365,7 @@ def test_load_extrinsics_preserves_explicit_reference_serial(tmp_path) -> None:
     path.write_text(json.dumps({
         "schema": "zed_body38_distributed_extrinsics/v1",
         "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+        "units": "meter",
         "reference_world_serial": 33773329,
         "cameras": {
             str(serial): {
@@ -183,6 +382,94 @@ def test_load_extrinsics_preserves_explicit_reference_serial(tmp_path) -> None:
     assert loaded is not None
     assert loaded.reference_serial == 33773329
     assert set(loaded.cameras) == {39504762, 31571870, 33773329, 34760587}
+
+
+def test_zed360_transforms_are_rebased_to_selected_reference_camera() -> None:
+    world_from_reference = np.eye(4)
+    world_from_reference[:3, 3] = [4.0, -2.0, 0.5]
+    reference_from_second = np.eye(4)
+    reference_from_second[:3, 3] = [1.2, 0.4, -0.1]
+    world_from_second = world_from_reference @ reference_from_second
+
+    rebased = rebase_camera_transforms(
+        {10: world_from_reference, 20: world_from_second},
+        reference_serial=10,
+    )
+
+    assert np.allclose(rebased[10], np.eye(4))
+    assert np.allclose(rebased[20], reference_from_second)
+
+
+def test_runtime_validator_accepts_zed360_and_rejects_false_string_gate() -> None:
+    serials = {1, 2, 3, 4}
+    document = {
+        "schema": "zed_body38_distributed_extrinsics/v1",
+        "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+        "units": "meter",
+        "reference_world_serial": 1,
+        "method": "zed_sdk_read_fusion_configuration_file_from_zed360",
+        "cameras": {
+            str(serial): {
+                "rotation_camera_to_world": np.eye(3).tolist(),
+                "translation_camera_to_world_m": (
+                    [0.0, 0.0, 0.0] if serial == 1 else [float(serial), 0.0, 0.0]
+                ),
+                "fit": {
+                    "source": "zed360_sdk_configuration",
+                    "quality_gate_passed": True,
+                },
+            }
+            for serial in serials
+        },
+    }
+    validate_document(document, expected_serials=serials, reference_serial=1)
+    document["cameras"]["2"]["fit"]["quality_gate_passed"] = "false"
+    try:
+        validate_document(document, expected_serials=serials, reference_serial=1)
+    except ValueError as exc:
+        assert "kalite" in str(exc)
+    else:
+        raise AssertionError("JSON string 'false' must not pass the Boolean gate")
+
+
+def test_runtime_validator_recomputes_body38_quality_thresholds() -> None:
+    serials = {1, 2, 3, 4}
+    document = {
+        "schema": "zed_body38_distributed_extrinsics/v1",
+        "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+        "units": "meter",
+        "reference_world_serial": 1,
+        "method": "trimmed_kabsch_from_synchronized_body38_core_joints",
+        "cameras": {},
+    }
+    for serial in serials:
+        document["cameras"][str(serial)] = {
+            "rotation_camera_to_world": np.eye(3).tolist(),
+            "translation_camera_to_world_m": (
+                [0.0, 0.0, 0.0] if serial == 1 else [float(serial), 0.0, 0.0]
+            ),
+            "fit": (
+                {"reference": True}
+                if serial == 1
+                else {
+                    "capture_samples": 100,
+                    "candidate_keypoints": 1000,
+                    "paired_keypoints": 600,
+                    "inlier_ratio": 0.6,
+                    "rms_m": 0.08,
+                    "pelvis_p95_m": 0.12,
+                    "quality_gate_passed": True,
+                }
+            ),
+        }
+    validate_document(document, expected_serials=serials, reference_serial=1)
+    document["cameras"]["3"]["fit"]["capture_samples"] = 20
+    try:
+        validate_document(document, expected_serials=serials, reference_serial=1)
+    except ValueError as exc:
+        assert "yetersiz" in str(exc)
+    else:
+        raise AssertionError("Relaxed producer thresholds must not bypass runtime policy")
 
 
 def test_fused_packet_rebuilds_world_and_g1_reference_features() -> None:
@@ -247,6 +534,58 @@ def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -
     assert "camera_pose_fusion_from_local" not in compact["multi_camera"]
     assert all("keypoints_3d_fusion_m" not in view for view in compact["multi_camera"]["per_camera"])
     assert compact["keypoints_3d_m"] == fused["keypoints_3d_m"]
+
+
+def test_arm_fusion_prefers_two_clear_views_over_two_torso_occluded_views() -> None:
+    base = body38_points()
+    bad = base.copy()
+    bad[IDX["LEFT_ELBOW"]] += np.array([0.0, 0.20, 0.0])
+    bad[IDX["LEFT_WRIST"]] += np.array([0.0, 0.25, 0.0])
+    views = []
+    for serial, xyz, overlap in (
+        (1, base, False),
+        (2, base, False),
+        (3, bad, True),
+        (4, bad, True),
+    ):
+        document = packet(serial, serial, xyz)
+        document["occlusion_analysis"] = {
+            "arm_torso_overlap": {"left": overlap, "right": False},
+            "arm_chain_recovered": {"left": overlap, "right": False},
+        }
+        if overlap:
+            document["local_orientation_per_joint_xyzw"][IDX["LEFT_WRIST"]] = [
+                1.0, 0.0, 0.0, 0.0
+            ]
+        views.append((
+            Sample(serial, document, 1_000_000_000 + serial, serial),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        ))
+
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=1.0,
+    )
+
+    assert np.allclose(
+        np.asarray(fused["keypoints_3d_m"])[IDX["LEFT_WRIST"]],
+        base[IDX["LEFT_WRIST"]],
+    )
+    assert fused["fusion"]["per_joint_contributing_serials"][IDX["LEFT_WRIST"]] == [1, 2]
+    assert fused["multi_camera"]["arm_evidence"]["left"]["reliable_clear_views"] == 2
+    assert fused["occlusion_analysis"]["arm_torso_overlap"]["left"] is False
+    assert np.allclose(
+        fused["local_orientation_per_joint_xyzw"][IDX["LEFT_WRIST"]],
+        [0.0, 0.0, 0.0, 1.0],
+    )
+    assert fused["fusion"]["per_joint_orientation_serials"][IDX["LEFT_WRIST"]] in (1, 2)
+    assert fused["operator_selection"]["state"] == "LOCKED"
+    assert fused["timestamp_ns"] == fused["latency_trace_ns"]["t0_capture_ns"]
+    assert fused["latency_trace_ns"]["t2_windows_udp_send_ns"] >= fused["timestamp_ns"]
 
 
 def test_dynamic_pelvis_alignment_repairs_translation_biased_extrinsic() -> None:

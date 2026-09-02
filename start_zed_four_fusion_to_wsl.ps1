@@ -10,56 +10,136 @@ param(
     [int]$FusionHz = 15,
     [ValidateRange(1, 15)]
     [int]$PreviewHz = 10,
+    [ValidateRange(0.0, 20.0)]
+    [double]$WorkspaceXMinM = 2.0,
+    [ValidateRange(0.1, 30.0)]
+    [double]$WorkspaceXMaxM = 4.0,
+    [ValidateRange(0.0, 1.0)]
+    [double]$WorkspaceHysteresisM = 0.15,
     [string]$Extrinsics = "",
+    [string]$FusionConfig = "",
+    [long]$ReferenceSerial = 33773329,
     [string]$AnalysisHost = "127.0.0.1",
     [switch]$ValidateCalibrationOnly
 )
 
 $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ($WorkspaceXMaxM -le $WorkspaceXMinM) {
+    throw "WorkspaceXMaxM, WorkspaceXMinM degerinden buyuk olmali."
+}
 $expectedSerials = @("31571870", "33773329", "34760587", "39504762")
-$activeExtrinsics = Join-Path $project "config\zed_four\active_distributed_body38_extrinsics.json"
+$calibrationOrigin = ""
 if (-not $Extrinsics) {
-    if (Test-Path -LiteralPath $activeExtrinsics) {
-        $Extrinsics = $activeExtrinsics
+    $calibrationInbox = Join-Path $project "four json"
+    if (-not (Test-Path -LiteralPath $calibrationInbox -PathType Container)) {
+        New-Item -ItemType Directory -Path $calibrationInbox -Force | Out-Null
+    }
+
+    if (-not $FusionConfig) {
+        $fusionFiles = @(
+            Get-ChildItem -LiteralPath $calibrationInbox -File -Filter "*.json" |
+                Sort-Object -Property Name
+        )
+        if ($fusionFiles.Count -eq 0) {
+            throw "Kalibrasyon bulunamadi. '$calibrationInbox' klasorune ZED360 Finish Calibration ile kaydedilen tam olarak bir fourkamera JSON dosyasi koyun. Alternatif: -Extrinsics ile dogrulanmis uygulama kalibrasyonu verin."
+        }
+        if ($fusionFiles.Count -gt 1) {
+            $names = ($fusionFiles.Name -join ", ")
+            throw "Birden fazla four kalibrasyonu bulundu ($names). Yanlis poz secilmemesi icin '$calibrationInbox' klasorunde yalnizca bir JSON birakin."
+        }
+        $FusionConfig = $fusionFiles[0].FullName
+    }
+
+    if (-not (Test-Path -LiteralPath $FusionConfig -PathType Leaf)) {
+        throw "ZED360 four kamera JSON dosyasi bulunamadi: $FusionConfig"
+    }
+    $FusionConfig = (Resolve-Path -LiteralPath $FusionConfig).Path
+    $calibrationOrigin = $FusionConfig
+    Write-Host "Four ZED kalibrasyonu 'four json' akisindan secildi: $FusionConfig"
+    try {
+        $candidateDocument = Get-Content -LiteralPath $FusionConfig -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "'four json' kalibrasyon JSON dosyasi okunamadi: $FusionConfig`n$($_.Exception.Message)"
+    }
+    if ([string]$candidateDocument.schema -eq "zed_body38_distributed_extrinsics/v1") {
+        # The BODY_38 fallback calibrator already emits the runtime schema.
+        # It still passes the same independent quality validator below.
+        $Extrinsics = $FusionConfig
+        Write-Host "Four JSON tipi: dogrudan BODY_38 uygulama extrinsic"
     }
     else {
-        $candidates = @(Get-ChildItem -LiteralPath (Join-Path $project "config\zed_four") -File -Filter "distributed_body38_extrinsics*.json" -ErrorAction SilentlyContinue)
-        if ($candidates.Count -ne 1) {
-            throw "Aktif kalibrasyon yok. -Extrinsics ile tek dosya verin veya start_distributed_calibration.ps1 ... -Activate calistirin. Aday sayisi: $($candidates.Count)"
+        # The ZED SDK configuration reader is unreliable with non-ASCII
+        # Windows paths. Preserve the source but convert an ASCII-only copy.
+        $fusionCache = "C:\g1il\cache\zed_four"
+        New-Item -ItemType Directory -Force -Path $fusionCache | Out-Null
+        $sdkFusionConfig = Join-Path $fusionCache "four_camera_zed360.json"
+        Copy-Item -LiteralPath $FusionConfig -Destination $sdkFusionConfig -Force
+
+        $convertedExtrinsics = Join-Path $project "config\zed_four\active_zed360_body38_extrinsics.json"
+        $worldPoses = Join-Path $project "config\zed_four\active_zed360_camera_world_poses.jsonl"
+        $converter = Join-Path $project "zed_four_camera_test\convert_zed360_extrinsics.ps1"
+        & $converter `
+            -InputConfig $sdkFusionConfig `
+            -OutputExtrinsics $convertedExtrinsics `
+            -WorldPosesJsonl $worldPoses `
+            -ReferenceSerial $ReferenceSerial
+        if ($LASTEXITCODE -ne 0) {
+            throw "ZED360 fourkamera JSON, BODY_38 ortak dunya extrinsic dosyasina donusturulemedi. Cikis kodu: $LASTEXITCODE"
         }
-        $Extrinsics = $candidates[0].FullName
-        Write-Warning "Aktif dosya bulunmadigi icin tek kalibrasyon adayi kullaniliyor: $Extrinsics"
+        $Extrinsics = $convertedExtrinsics
+        Write-Host "Fourkamera ZED360 JSON -> BODY_38 extrinsic: $Extrinsics"
+        Write-Host "Fourkamera dunya pozlari: $worldPoses"
     }
 }
 if (-not (Test-Path -LiteralPath $Extrinsics -PathType Leaf)) {
     throw "4-ZED extrinsic dosyasi bulunamadi: $Extrinsics"
 }
 $Extrinsics = (Resolve-Path -LiteralPath $Extrinsics).Path
+$calibrationSource = $Extrinsics
+if (-not $calibrationOrigin) {
+    $calibrationOrigin = $calibrationSource
+}
+$fusionCache = "C:\g1il\cache\zed_four"
+New-Item -ItemType Directory -Force -Path $fusionCache | Out-Null
+$activeExtrinsics = Join-Path $fusionCache "active_body38_extrinsics.json"
+if ([string]::Compare($Extrinsics, $activeExtrinsics, $true) -ne 0) {
+    Copy-Item -LiteralPath $Extrinsics -Destination $activeExtrinsics -Force
+}
+$Extrinsics = $activeExtrinsics
+$python = Join-Path $project ".venv-zed\Scripts\python.exe"
+$validator = Join-Path $project "zed_four_camera_test\validate_distributed_extrinsics.py"
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    throw "ZED Python ortami bulunamadi: $python"
+}
+& $python $validator `
+    --input $Extrinsics `
+    --expected-serials ($expectedSerials -join ",") `
+    --reference-serial $ReferenceSerial
+if ($LASTEXITCODE -ne 0) {
+    throw "4-ZED kalibrasyon kalite kapisini gecemedi. Yukaridaki HATA satirini duzeltin."
+}
 try {
-    $calibration = Get-Content -LiteralPath $Extrinsics -Raw | ConvertFrom-Json
+    $calibrationBytes = [System.IO.File]::ReadAllBytes($Extrinsics)
+    $calibrationText = [System.Text.Encoding]::UTF8.GetString($calibrationBytes)
+    $calibration = $calibrationText | ConvertFrom-Json
 }
 catch {
-    throw "4-ZED extrinsic JSON okunamadi: $Extrinsics`n$($_.Exception.Message)"
+    throw "Dogrulanan 4-ZED extrinsic JSON tekrar okunamadi: $Extrinsics`n$($_.Exception.Message)"
 }
-if ([string]$calibration.schema -ne "zed_body38_distributed_extrinsics/v1") {
-    throw "Yanlis kalibrasyon semasi: $($calibration.schema)"
+$calibrationItem = Get-Item -LiteralPath $calibrationOrigin
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $calibrationHash = ([System.BitConverter]::ToString($sha256.ComputeHash($calibrationBytes))).Replace("-", "")
 }
-if ([string]$calibration.coordinate_system -ne "RIGHT_HANDED_Z_UP_X_FWD") {
-    throw "Kalibrasyon koordinat sistemi RIGHT_HANDED_Z_UP_X_FWD olmali."
+finally {
+    $sha256.Dispose()
 }
-$actualSerials = @($calibration.cameras.PSObject.Properties.Name | Sort-Object)
-if (($actualSerials -join ',') -ne (($expectedSerials | Sort-Object) -join ',')) {
-    throw "Kalibrasyon seri seti yanlis. Beklenen=$($expectedSerials -join ',') Gelen=$($actualSerials -join ',')"
-}
-foreach ($serial in $expectedSerials) {
-    $camera = $calibration.cameras.$serial
-    if (@($camera.rotation_camera_to_world).Count -ne 3 -or @($camera.translation_camera_to_world_m).Count -ne 3) {
-        throw "ZED $serial icin rotation/translation eksik."
-    }
-}
-Write-Host "4-ZED kalibrasyon dogrulandi: $Extrinsics"
+Write-Host "4-ZED kalibrasyon dogrulandi ve sabit runtime kopyasi olusturuldu: $Extrinsics"
+Write-Host "Kalibrasyon kaynak dosyasi: $calibrationOrigin"
 Write-Host "Referans kamera: $($calibration.reference_world_serial)"
+Write-Host "Kaynak dosya zamani: $($calibrationItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) | runtime SHA256=$calibrationHash"
 if ($ValidateCalibrationOnly) {
     exit 0
 }
@@ -86,8 +166,13 @@ $receiverArguments = @{
     OutputPort = 15050
     Fps = $FusionHz
     MinimumSources = $MinimumSources
-    MaxSyncMs = 110
-    SourceTimeoutMs = 750
+    MaxSyncMs = 80
+    SourceTimeoutMs = 250
+    MaxTemporalPredictionMs = 70
+    MaxAlignmentTranslationM = 0.25
+    WorkspaceXMinM = $WorkspaceXMinM
+    WorkspaceXMaxM = $WorkspaceXMaxM
+    WorkspaceHysteresisM = $WorkspaceHysteresisM
     PreviewHz = $PreviewHz
     RecordStem = "four_body38_fusion"
 }
@@ -109,6 +194,7 @@ if ($Headless) { $receiverArguments.Headless = $true }
 
 Write-Host "GMR/Isaac: ${wslAddress}:15050 | Rerun: ${AnalysisHost}:15052 | ROS: ${wslAddress}:15054"
 Write-Host "Fusion: en az $MinimumSources/4 taze kamera, azami ${FusionHz}Hz | arayuz=${PreviewHz}Hz"
+Write-Host "Operator ortak-dunya kapisi: referans kamera X=${WorkspaceXMinM}-${WorkspaceXMaxM} m | cikis toleransi=${WorkspaceHysteresisM}m"
 Write-Host "JSONL klasoru: $(Join-Path $project 'recordings')"
 Set-Location -LiteralPath $project
 & $receiver @receiverArguments

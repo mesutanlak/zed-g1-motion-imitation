@@ -1,6 +1,6 @@
 # 4× ZED 2i: ZED360 kalibrasyonu, BODY_38 Fusion ve G1/Isaac akışı
 
-Tarih: 2026-09-01  
+Güncelleme: 2026-09-02
 Ana PC: `192.168.50.10` — ZED `33773329`, `31571870`  
 Laptop: `192.168.50.11` — ZED `39504762`, `34760587`
 
@@ -23,6 +23,11 @@ seçilmemeleri için silinmeden şuraya arşivlenmiştir:
 
 Önceki fit sonuçlarının iyi olması yeni pozlara taşınamaz. Bugünkü düzen için
 ZED360 veya Bölüm 5 ile yeni kalibrasyon zorunludur.
+
+2026-09-02 tarihli `four_body38_static_calibration_NEW.jsonl` de geçerli kabul
+edilmemiştir: iki kaynak arka plandaki 6–7 m kişiyi izlediği için bazı kamera
+eşleşmeleri yalnız %4–6 inlier üretmiştir. Yeni kalite kapısı bu dosyanın
+runtime'da sessizce kullanılmasına izin vermez.
 
 ## 1. İki bilgisayarı ve Ethernet'i doğrula
 
@@ -249,175 +254,180 @@ göndermez:
 `body_frames>0` ve terminalde `WRONG BODY FORMAT` yok. BODY_38 ağ Fusion burada
 da format hatası verirse Bölüm 5 kesin yoldur.
 
-## 4. ZED360 pozlarını BODY_38/G1 dünya dosyasına çevir
+## 4. ZED360 `fourkamera.json` dosyasını otomatik kullan
 
-Bu bölüm yalnız Bölüm 2 başarılı ve `zed360_calibrated_4cam.json` gerçekten
-oluştuysa çalıştırılır. Seed dosyasını verirseniz dönüştürücü kasıtlı olarak
-reddeder.
+Bu bölüm yalnız Bölüm 2 başarılı ve ZED360 içinde **Finish Calibration** ile
+kaydedilmiş dosya gerçekten oluştuysa kullanılır. Proje kökündeki `four json`
+klasörü dual sistemdeki `dual json` ile aynı mantıktadır: içine yalnız bir
+`.json` bırakın. Örnek:
 
 ```powershell
-.\zed_four_camera_test\convert_zed360_extrinsics.ps1 `
-  -InputConfig ".\config\zed_four\zed360_calibrated_4cam.json" `
-  -OutputExtrinsics ".\config\zed_four\zed360_body38_extrinsics.json" `
-  -WorldPosesJsonl ".\config\zed_four\zed360_four_camera_world_poses.jsonl" `
+Copy-Item -LiteralPath "C:\Program Files (x86)\ZED SDK\tools\fourkamera.json" `
+  -Destination ".\four json\fourkamera.json"
+.\start_zed_four_fusion_to_wsl.ps1 -ValidateCalibrationOnly `
   -ReferenceSerial 33773329
 ```
 
-SDK dosyayı `RIGHT_HANDED_Z_UP_X_FWD` ve metre birimine çevirir. JSONL'nin ilk
-satırı metadata, sonraki dört satırı her kameranın seri numarası, optik merkez
-dünya konumu, quaternion ve 4×4 camera-to-world matrisidir.
+Başlatıcı dosyayı otomatik seçer. ZED360 JSON ise SDK pozu
+`RIGHT_HANDED_Z_UP_X_FWD` ve metre biriminde okunur, seçilen referans kamera
+identity olacak şekilde bütün pozlar yeniden tabanlanır ve şu iki runtime
+dosyası üretilir:
+
+- `config\zed_four\active_zed360_body38_extrinsics.json`
+- `config\zed_four\active_zed360_camera_world_poses.jsonl`
+
+Seed veya bütün pozları sıfır olan dosya kasıtlı olarak reddedilir. Klasörde
+birden fazla JSON varsa yanlış kalibrasyon seçilmemesi için komut durur.
+ZED360 ağ kalibrasyonu çalışmazsa Bölüm 5.3'te kalite kapısını geçen BODY_38
+extrinsic JSON'u da `four json` klasöründeki tek JSON olarak doğrudan
+kullanılabilir; başlatıcı dosya tipini otomatik algılar.
 
 ## 5. ZED360 olmazsa sağlam BODY_38 uygulama Fusion'u
 
 Bu yol `sl.Fusion` ağ format hatasını atlar; her ZED yine Stereolabs BODY_38
-çıkarımını yapar. Ana PC ağ paketlerini kendi varış saatine göre hizalar,
-extrinsic ile ortak dünyaya taşır ve güven ağırlıklı/aykırı-değer dayanıklı
-joint Fusion uygular.
+çıkarımını yapar. İki bilgisayarın saat farkı ana PC'de host bazında ölçülür,
+kareler düzeltilmiş capture zamanına göre eşleştirilir ve en fazla 70 ms
+zamansal telafi uygulanır. Kol görünümü kamera bazında değil eklem bazında
+seçilir: gövdeyle örtüşmeyen ön/arka/yan görüş otomatik ağırlık kazanır.
 
-### 5.1 Ana PC alıcısını kayıt modunda önce aç
+### 5.1 Yeni kalibrasyon için kaynakları aç
+
+Kalibrasyon sırasında odada yalnız operatör bulunmalıdır. Eski ZED/receiver
+pencerelerinin tamamını kapatın. Laptopta:
+
+```powershell
+cd "C:\Users\MSI\Desktop\zed-g1-motion-imitation"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\start_zed_four_sources.ps1 -Role Laptop -MainPcHost 192.168.50.10 `
+  -Fps 15 -Model medium -DepthMode neural-light -CalibrationMode
+```
+
+Ana PC'de:
 
 ```powershell
 cd "C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\start_zed_four_sources.ps1 -Role MainPc `
+  -Fps 15 -Model medium -DepthMode neural-light -CalibrationMode
+```
 
+`-CalibrationMode`, henüz extrinsic yokken kamera-yerel kaba alan kapısını
+geçici kapatır. Dört kaynak penceresinin her birinde doğru tek kişinin BODY_38
+iskeleti görünmelidir.
+
+### 5.2 Ham kalibrasyon kaydı
+
+Ana PC'de üçüncü pencerede:
+
+```powershell
 .\zed_four_camera_test\start_distributed_receiver.ps1 `
   -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
-  -CalibrationRecord ".\recordings\four_body38_static_calibration_20260901.jsonl" `
-  -Fps 15 -MinimumSources 4 -MaxSyncMs 110 -SourceTimeoutMs 750
+  -CalibrationRecord ".\recordings\four_body38_static_calibration_v2.jsonl" `
+  -Fps 15 -MinimumSources 4 -MaxSyncMs 80 -SourceTimeoutMs 250
 ```
 
-### 5.2 Dört kaynağı ayrı PowerShell pencerelerinde aç
+45–60 saniye boyunca ortak çalışma hacminin tamamında yavaş yürüyün. Birkaç
+grid noktasında 1–2 saniye A-pozu, T-pozu, kollar önde ve dirsekler bükülü
+pozlarda durun; yüzünüzü yavaşça farklı kameralara çevirin. Bütün kameralarda
+aynı anda aynı kişi ve mümkün olduğunca tam beden görünmelidir. `ham_kayit`
+tercihen 400'ü geçince alıcıyı ve dört kaynak sürecini `Ctrl+C` ile kapatın.
 
-Laptop pencere 1:
-
-```powershell
-cd "C:\Users\MSI\Desktop\zed-g1-motion-imitation"
-.\zed_four_camera_test\start_distributed_source.ps1 `
-  -Serial 39504762 -TargetHost 192.168.50.10 -TargetPort 16000 `
-  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
-```
-
-Laptop pencere 2:
-
-```powershell
-cd "C:\Users\MSI\Desktop\zed-g1-motion-imitation"
-.\zed_four_camera_test\start_distributed_source.ps1 `
-  -Serial 34760587 -TargetHost 192.168.50.10 -TargetPort 16006 `
-  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
-```
-
-Ana PC pencere 2:
-
-```powershell
-.\zed_four_camera_test\start_distributed_source.ps1 `
-  -Serial 33773329 -TargetHost 127.0.0.1 -TargetPort 16004 `
-  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
-```
-
-Ana PC pencere 3:
-
-```powershell
-.\zed_four_camera_test\start_distributed_source.ps1 `
-  -Serial 31571870 -TargetHost 127.0.0.1 -TargetPort 16002 `
-  -Fps 15 -Model medium -DepthMode neural-light -FrameIntegrityMode off
-```
-
-Tanılar bugün temiz olduğu için yanlış-pozitif piksel uyarısı üreten ek
-heuristic kapalıdır. Gerçek görüntü yırtılması görürseniz testi durdurup ZED
-Diagnostic'e dönün.
-
-Ana alıcıda yeni durum satırı şöyle olmalı:
-
-```text
-bagli=4/4 [...] | body_taze=4/4 [...] | ham_kayit=... | gecersiz=0
-```
-
-`bagli`, status dahil paket geldiğini; `body_taze`, gerçekten güncel iskelet
-geldiğini gösterir. Kalibrasyon sırasında dört kameranın hepsinde aynı tek kişi
-görünmelidir.
-
-### 5.3 Yeni statik extrinsic kaydı al
-
-Tripodlar sabitken ortak alanda tam beden görünecek şekilde:
-
-1. 8 saniye rahat A-pozunda sabit durun.
-2. 8 saniye kolları öne uzatıp sabit durun.
-3. 8 saniye T-pozunda sabit durun.
-4. Pozlar arasında yavaş geçin; yeri değiştirmeyin.
-
-`ham_kayit` en az 150 olunca ana alıcıda `Ctrl+C`. Dört kaynak açık kalsın.
-
-### 5.4 Extrinsic ve dünya-konumu JSONL üret
+### 5.3 Extrinsic üret, kalite kapısından geçir ve etkinleştir
 
 ```powershell
 .\zed_four_camera_test\start_distributed_calibration.ps1 `
-  -CapturePath ".\recordings\four_body38_static_calibration_20260901.jsonl" `
-  -OutputPath ".\config\zed_four\distributed_body38_extrinsics_20260901.json" `
-  -WorldPosesJsonl ".\config\zed_four\four_camera_world_poses_20260901.jsonl" `
-  -ReferenceSerial 33773329
+  -CapturePath ".\recordings\four_body38_static_calibration_v2.jsonl" `
+  -OutputPath ".\config\zed_four\distributed_body38_extrinsics_v2.json" `
+  -ReferenceSerial 33773329 -Activate
 ```
 
-**Kabul:** her kamera için RMS `<=0.08 m`, p95 `<=0.12 m`. Daha yüksekse ortak
-görüşü ve ayak/kol görünürlüğünü düzeltip kaydı tekrarlayın. Kamera hareket
-ederse dosya artık geçersizdir.
+Kalibratör her kamera için en az 60 eşzamanlı örnek, 300 inlier nokta, %25
+inlier oranı ve pelvis p95 `<=0.25 m` ister; herhangi biri geçmezse dosya
+yazılmaz/etkinleştirilmez. Çıktının yanında dünya-pozu JSONL'si de üretilir.
+Tripodlardan biri oynarsa bu adımların tamamını tekrarlayın.
 
-### 5.5 Dört-kamera canlı Fusion kabulü
+BODY_38 tabanlı alternatif etkin dosyayı bağımsız doğrulayın (ZED360 JSON yolunu
+kullanıyorsanız bu komut yerine Bölüm 4'teki doğrulama komutunu kullanın):
+
+```powershell
+.\start_zed_four_fusion_to_wsl.ps1 -ValidateCalibrationOnly `
+  -Extrinsics ".\config\zed_four\active_distributed_body38_extrinsics.json"
+```
+
+### 5.4 Runtime kaynaklarını yeniden aç
+
+Bu kez `-CalibrationMode` kullanmayın. Laptopta:
+
+```powershell
+.\start_zed_four_sources.ps1 -Role Laptop -MainPcHost 192.168.50.10 `
+  -Fps 15 -Model medium -DepthMode neural-light
+```
+
+Ana PC'de:
+
+```powershell
+.\start_zed_four_sources.ps1 -Role MainPc `
+  -Fps 15 -Model medium -DepthMode neural-light
+```
+
+Kaynaklardaki 1–5.25 m kapı yalnız kaba kamera-yerel korumadır. Kesin operatör
+alanı, kalibre edilmiş referans kamera dünya X ekseninde 2–4 m olarak Fusion
+alıcısında uygulanır; 6–7 m arka plan kişisi çıkışa giremez.
+
+### 5.5 Dört-kamera canlı kabul testi
 
 ```powershell
 .\zed_four_camera_test\start_distributed_receiver.ps1 `
   -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
-  -Extrinsics ".\config\zed_four\distributed_body38_extrinsics_20260901.json" `
-  -Fps 15 -MinimumSources 4 -MaxSyncMs 110 -SourceTimeoutMs 750 `
-  -Duration 120
+  -PreviewSource "39504762:16100","31571870:16102","33773329:16104","34760587:16106" `
+  -Extrinsics ".\config\zed_four\active_distributed_body38_extrinsics.json" `
+  -Fps 15 -MinimumSources 4 -MaxSyncMs 80 -SourceTimeoutMs 250 `
+  -MaxAlignmentTranslationM 0.25 -WorkspaceXMinM 2 -WorkspaceXMaxM 4 `
+  -Duration 120 -Record
 ```
 
-**Kabul:** `body_taze=4/4`; `fusion_cikis` yaklaşık saniyede 15 artar;
-`son_katki` dört seri içerir; `yayilim_ms<=110`; `gecersiz=0`. Ortada dönüp
-kolları sırayla farklı kameralardan saklayın; Fusion kesilmemeli.
+**Kabul:** `body_taze=4/4`, `son_katki` dört seri, `fusion_fps` yaklaşık
+14–15, düzeltilmiş `yayilim_ms<=80`, `gecersiz=0`, kayıt drop=0. Kolları gövde
+önünde çaprazlayın ve sonra arkaya alın; arayüz/Rerun içindeki sol-sağ
+`reliable_clear_views` en az bir görüşü korumalıdır.
 
-## 6. G1/Isaac simülasyonuna BODY_38 bağla
+## 6. G1/Isaac ve Rerun'a BODY_38 bağla
 
-Önce dört kaynak açık kalsın; Bölüm 5.5 alıcısını kapatın. Isaac/GMR'yi ana
-PC'de ayrı PowerShell'de başlatın:
+Kabul alıcısını kapatıp ana PC'de üç ayrı PowerShell penceresi kullanın.
+
+Pencere 1 — Rerun:
 
 ```powershell
-cd "C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation"
-.\start_g1_isaaclab_live.ps1 `
-  -Mode upper_body -ImitationMode kinematic_debug `
-  -InputFps 15 -AcceptNvidiaEula
+.\start_g1_rerun_analysis.ps1 -Mode live -LiveMaxHz 15 -GmrLogMaxHz 15
 ```
 
-Komut açıldıktan sonra WSL IP'sini bulun:
+Pencere 2 — Isaac/GMR:
 
 ```powershell
-$wslIp = ((wsl.exe -d Ubuntu-22.04 -- hostname -I).Trim() -split "\s+")[0]
-$wslIp
+.\start_g1_isaaclab_live.ps1 -Mode upper_body `
+  -ImitationMode kinematic_debug -InputFps 15 -AcceptNvidiaEula
 ```
 
-Yeni ana-PC PowerShell'de BODY_38 Fusion'u bu IP'ye gönderin. Aşağıdaki
-`$wslIp` aynı pencere içinde hesaplanmalıdır:
+Pencere 3 — dört-kamera arayüzü, kayıt ve üç çıkış:
 
 ```powershell
-cd "C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation"
-$wslIp = ((wsl.exe -d Ubuntu-22.04 -- hostname -I).Trim() -split "\s+")[0]
-
-.\zed_four_camera_test\start_distributed_receiver.ps1 `
-  -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
-  -Extrinsics ".\config\zed_four\distributed_body38_extrinsics_20260901.json" `
-  -OutputHost $wslIp -OutputPort 15050 `
-  -Fps 15 -MinimumSources 3 -MaxSyncMs 110 -SourceTimeoutMs 750
+.\start_zed_four_fusion_to_wsl.ps1 -Record -MinimumSources 3 `
+  -FusionHz 15 -PreviewHz 8 -WorkspaceXMinM 2 -WorkspaceXMaxM 4
 ```
 
-İlk simülasyon için `kinematic_debug`, `upper_body` ve `MinimumSources 3`
-kullanın; fiziksel robota bağlanmayın. Akış kararlı olduktan sonra deney
-protokolünde 4/4 kabul testi, kamera-örtülme testi, gecikme ve eklem sürekliliği
-ayrı kaydedilmelidir.
+Bu son komut `four json` klasöründeki tek ZED360 dosyasını seçer, BODY_38
+extrinsic/dünya-pozu dosyasına dönüştürür ve kullanılan kalibrasyonun yolunu,
+tarihini ve SHA256 değerini yazdırır;
+GMR/Isaac `15050`, Rerun `15052`, ROS `15054` ve `/recordings` JSONL akışını
+tek noktadan başlatır. İlk test yalnız simülasyondur; fiziksel robot çıkışı
+yetkilendirilmez.
 
 ## 7. Hangi dosya ne işe yarıyor?
 
 - `zed360_hybrid_calibration_seed.json`: yalnız ZED360'a dört kaynağı tanıtan
   sıfır-poz başlangıcı; runtime extrinsic değildir.
 - `zed360_calibrated_4cam.json`: ZED360 başarılıysa esas Stereolabs kalibrasyonu.
+- `four json\fourkamera.json`: runtime'ın otomatik seçtiği tek ZED360 kalibrasyonu.
 - `zed360_four_camera_world_poses.jsonl`: ZED360 sonucunun SDK ile Z-up dünyaya
   çevrilmiş satır-bazlı kamera pozları.
 - `four_body38_static_calibration_20260901.jsonl`: custom kalibrasyonda ham,

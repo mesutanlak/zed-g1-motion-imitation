@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass
+from itertools import combinations
 import json
 import math
 from pathlib import Path
@@ -72,6 +73,9 @@ class Sample:
     packet: dict[str, Any]
     received_ns: int
     sequence: int
+    capture_timeline_ns: int | None = None
+    source_clock_offset_ns: int | None = None
+    source_host_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,7 @@ class PreparedView:
     alignment_translation: np.ndarray
     pose_disagreement_m: float | None
     accepted: bool
+    rejection_reason: str | None = None
 
 
 CRITICAL_GROUPS = {
@@ -106,6 +111,81 @@ CRITICAL_GROUPS = {
     "left_leg": ("LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"),
     "right_leg": ("RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"),
 }
+
+# Identity association must not reject a useful camera merely because an arm
+# is hidden by the torso.  Limbs are fused joint-by-joint below; only stable
+# torso landmarks decide whether two views belong to the same pose/person.
+ASSOCIATION_BODY_NAMES = (
+    "PELVIS", "SPINE_1", "SPINE_2", "SPINE_3", "NECK",
+    "LEFT_CLAVICLE", "RIGHT_CLAVICLE", "LEFT_SHOULDER", "RIGHT_SHOULDER",
+    "LEFT_HIP", "RIGHT_HIP",
+)
+ARM_CHAIN_NAMES = {
+    "left": ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
+    "right": ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
+}
+ARM_JOINT_NAMES = {
+    "left": (
+        "LEFT_CLAVICLE", "LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST",
+        "LEFT_HAND_THUMB_4", "LEFT_HAND_INDEX_1", "LEFT_HAND_MIDDLE_4",
+        "LEFT_HAND_PINKY_1",
+    ),
+    "right": (
+        "RIGHT_CLAVICLE", "RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST",
+        "RIGHT_HAND_THUMB_4", "RIGHT_HAND_INDEX_1", "RIGHT_HAND_MIDDLE_4",
+        "RIGHT_HAND_PINKY_1",
+    ),
+}
+ARM_SIDE_BY_INDEX = {
+    IDX[name]: side
+    for side, names in ARM_JOINT_NAMES.items()
+    for name in names
+}
+
+
+class ClockOffsetEstimator:
+    """Map independent sender wall clocks onto the receiver timeline.
+
+    Windows hosts can differ by tens of milliseconds even after ``w32tm``.
+    The lower envelope of ``receive - send`` contains host clock offset plus
+    minimum network transit; subtracting it yields a stable, non-negative
+    application latency and comparable capture timestamps without pretending
+    that NTP provides hardware synchronization.
+    """
+
+    def __init__(self, window: int = 300, quantile: float = 0.05) -> None:
+        self.window = max(20, int(window))
+        self.quantile = float(np.clip(quantile, 0.0, 0.25))
+        self._deltas: dict[str, deque[int]] = {}
+
+    def update(
+        self,
+        source_host_id: str,
+        packet: dict[str, Any],
+        received_ns: int,
+    ) -> tuple[int | None, int | None, dict[str, float | None]]:
+        trace = packet.get("latency_trace_ns") or {}
+        capture_ns = int(trace.get("t0_capture_ns", packet.get("timestamp_ns", 0)) or 0)
+        send_ns = int(trace.get("t2_windows_udp_send_ns", 0) or 0)
+        if capture_ns <= 0 or send_ns <= 0 or send_ns < capture_ns:
+            return None, None, {
+                "raw_clock_mixed_capture_to_receive_ms": None,
+                "clock_offset_estimate_ms": None,
+                "corrected_capture_to_receive_ms": None,
+                "network_queue_ms": None,
+            }
+        history = self._deltas.setdefault(str(source_host_id), deque(maxlen=self.window))
+        history.append(int(received_ns) - send_ns)
+        ordered = np.sort(np.asarray(history, dtype=np.int64))
+        index = int(round((len(ordered) - 1) * self.quantile))
+        offset_ns = int(ordered[index])
+        corrected_capture_ns = capture_ns + offset_ns
+        return corrected_capture_ns, offset_ns, {
+            "raw_clock_mixed_capture_to_receive_ms": (received_ns - capture_ns) / 1.0e6,
+            "clock_offset_estimate_ms": offset_ns / 1.0e6,
+            "corrected_capture_to_receive_ms": max(0.0, (received_ns - corrected_capture_ns) / 1.0e6),
+            "network_queue_ms": max(0.0, (received_ns - (send_ns + offset_ns)) / 1.0e6),
+        }
 
 
 def sanitize(value: Any) -> Any:
@@ -165,6 +245,27 @@ def confidence(value: Any) -> np.ndarray:
     return np.zeros(38, dtype=np.float64)
 
 
+def valid_body38_payload(document: dict[str, Any]) -> bool:
+    """Reject malformed/non-BODY_38 datagrams before they enter histories."""
+    if document.get("schema") != "zed_body38_live/v1":
+        return False
+    if tuple(document.get("keypoint_names") or ()) != BODY38_NAMES:
+        return False
+    try:
+        raw_points = np.asarray(document.get("keypoints_3d_m"), dtype=np.float64)
+        raw_confidence = np.asarray(
+            document.get("keypoint_confidence"), dtype=np.float64
+        )
+    except (TypeError, ValueError):
+        return False
+    if raw_points.shape != (38, 3) or raw_confidence.shape != (38,):
+        return False
+    finite_joints = np.isfinite(raw_points).all(axis=1)
+    # A body datagram needs a finite pelvis and enough torso/limb evidence to
+    # be meaningful.  Individual occluded joints may legitimately be null.
+    return bool(finite_joints[IDX["PELVIS"]] and np.count_nonzero(finite_joints) >= 5)
+
+
 def quaternion_xyzw_to_matrix(value: Any) -> np.ndarray:
     x, y, z, w = vector(value, 4)
     norm = float(math.sqrt(x * x + y * y + z * z + w * w))
@@ -217,6 +318,8 @@ def load_extrinsics(path: Path | None, endpoints: list[InputEndpoint]) -> Extrin
         raise ValueError("Extrinsic schema zed_body38_distributed_extrinsics/v1 olmali.")
     if document.get("coordinate_system") != "RIGHT_HANDED_Z_UP_X_FWD":
         raise ValueError("Extrinsic koordinat sistemi RIGHT_HANDED_Z_UP_X_FWD olmali.")
+    if document.get("units") != "meter":
+        raise ValueError("Extrinsic birimi meter olmali.")
     cameras = document.get("cameras")
     if not isinstance(cameras, dict):
         raise ValueError("Extrinsic dosyasinda cameras nesnesi yok.")
@@ -233,11 +336,23 @@ def load_extrinsics(path: Path | None, endpoints: list[InputEndpoint]) -> Extrin
         translation = np.asarray(item.get("translation_camera_to_world_m"), dtype=np.float64)
         if rotation.shape != (3, 3) or translation.shape != (3,) or not np.isfinite(rotation).all() or not np.isfinite(translation).all():
             raise ValueError(f"ZED {endpoint.serial} extrinsic matrisi gecersiz.")
-        if not np.isclose(np.linalg.det(rotation), 1.0, atol=0.03):
+        if (
+            not np.isclose(np.linalg.det(rotation), 1.0, atol=0.03)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=0.03)
+        ):
             raise ValueError(f"ZED {endpoint.serial} rotation matrisi proper rotation degil.")
         result[endpoint.serial] = Extrinsic(rotation, translation)
     if reference_serial not in result:
         raise ValueError(f"Referans ZED {reference_serial} dort kaynak arasinda yok.")
+    reference = result[reference_serial]
+    if not (
+        np.allclose(reference.rotation, np.eye(3), atol=0.03)
+        and np.allclose(reference.translation, np.zeros(3), atol=0.03)
+    ):
+        raise ValueError(
+            "Referans ZED pozu identity degil. ZED360 pozlarini secilen "
+            "reference camera frame'ine rebase ederek yeniden donusturun."
+        )
     return ExtrinsicSet(reference_serial=reference_serial, cameras=result)
 
 
@@ -293,6 +408,139 @@ def build_g1_features(value: np.ndarray, conf: np.ndarray, threshold: float) -> 
     }
 
 
+def sample_timeline_ns(sample: Sample) -> int:
+    """Comparable capture time, falling back to the receiver clock."""
+    return int(sample.capture_timeline_ns or sample.received_ns)
+
+
+def world_forward_in_workspace(
+    sample: Sample,
+    extrinsic: Extrinsic,
+    minimum_x_m: float,
+    maximum_x_m: float,
+) -> tuple[bool, float | None]:
+    """Check the pelvis in the calibrated reference camera's X-forward frame.
+
+    Camera-local range cannot describe a four-corner rig: the same operator
+    may be 2.7 m from one ZED and 4.8 m from the opposite ZED.  The calibrated
+    world frame makes the project's 2--4 m operator volume unambiguous and
+    rejects the background person near X=6.5 m.
+    """
+    xyz = transformed_points(sample.packet, extrinsic)
+    pelvis = xyz[IDX["PELVIS"]]
+    if not np.isfinite(pelvis).all():
+        return False, None
+    forward_x_m = float(pelvis[0])
+    return bool(minimum_x_m <= forward_x_m <= maximum_x_m), forward_x_m
+
+
+def workspace_membership_with_hysteresis(
+    forward_x_m: float | None,
+    *,
+    was_inside: bool,
+    minimum_x_m: float,
+    maximum_x_m: float,
+    hysteresis_m: float,
+) -> bool:
+    """Use expanded exit bounds so boundary noise does not flap contributors."""
+    if forward_x_m is None or not math.isfinite(float(forward_x_m)):
+        return False
+    margin = max(0.0, float(hysteresis_m)) if was_inside else 0.0
+    return bool(
+        minimum_x_m - margin
+        <= float(forward_x_m)
+        <= maximum_x_m + margin
+    )
+
+
+def temporal_compensate_samples(
+    selected: list[Sample],
+    histories: dict[int, deque[Sample]],
+    *,
+    minimum_confidence: float,
+    maximum_prediction_ms: float = 70.0,
+    maximum_joint_speed_m_s: float = 5.0,
+    maximum_displacement_m: float = 0.25,
+) -> list[Sample]:
+    """Predict older views to the newest common capture instant.
+
+    ZED 2i USB cameras are not hardware triggered.  At 15 fps, otherwise
+    valid views can describe an arm almost one frame apart.  This bounded
+    constant-velocity correction is applied only where two consecutive,
+    confident observations of the same locked BODY id exist.  It therefore
+    reduces phase smear without manufacturing long drop-out trajectories.
+    """
+    if not selected:
+        return []
+    target_ns = max(sample_timeline_ns(sample) for sample in selected)
+    maximum_prediction_ns = int(max(0.0, maximum_prediction_ms) * 1.0e6)
+    result: list[Sample] = []
+    for sample in selected:
+        current_ns = sample_timeline_ns(sample)
+        lag_ns = max(0, min(target_ns - current_ns, maximum_prediction_ns))
+        packet = dict(sample.packet)
+        predicted_ms = 0.0
+        predicted_joints = 0
+        if lag_ns > 0:
+            previous_candidates = [
+                item for item in histories.get(sample.serial, ())
+                if item.sequence != sample.sequence
+                and sample_timeline_ns(item) < current_ns
+                and item.packet.get("body_id") == sample.packet.get("body_id")
+            ]
+            if previous_candidates:
+                previous = max(previous_candidates, key=sample_timeline_ns)
+                delta_ns = current_ns - sample_timeline_ns(previous)
+                if 10_000_000 <= delta_ns <= 250_000_000:
+                    current_points = points(sample.packet.get("keypoints_3d_m"))
+                    previous_points = points(previous.packet.get("keypoints_3d_m"))
+                    current_conf = confidence(sample.packet.get("keypoint_confidence"))
+                    previous_conf = confidence(previous.packet.get("keypoint_confidence"))
+                    valid = (
+                        np.isfinite(current_points).all(axis=1)
+                        & np.isfinite(previous_points).all(axis=1)
+                        & (current_conf >= minimum_confidence)
+                        & (previous_conf >= minimum_confidence)
+                    )
+                    velocity = (current_points - previous_points) / (delta_ns / 1.0e9)
+                    speed = np.linalg.norm(velocity, axis=1)
+                    scale = np.ones(38, dtype=np.float64)
+                    too_fast = speed > maximum_joint_speed_m_s
+                    scale[too_fast] = maximum_joint_speed_m_s / np.maximum(speed[too_fast], 1.0e-9)
+                    displacement = velocity * scale[:, None] * (lag_ns / 1.0e9)
+                    displacement_norm = np.linalg.norm(displacement, axis=1)
+                    too_far = displacement_norm > maximum_displacement_m
+                    displacement[too_far] *= (
+                        maximum_displacement_m
+                        / np.maximum(displacement_norm[too_far], 1.0e-9)
+                    )[:, None]
+                    predicted = current_points.copy()
+                    predicted[valid] += displacement[valid]
+                    packet["keypoints_3d_m"] = predicted.tolist()
+                    packet["_fusion_temporal_prediction_ms"] = lag_ns / 1.0e6
+                    packet["_fusion_temporal_prediction_joints"] = int(np.count_nonzero(valid))
+                    predicted_ms = lag_ns / 1.0e6
+                    predicted_joints = int(np.count_nonzero(valid))
+        if predicted_ms == 0.0:
+            packet["_fusion_temporal_prediction_ms"] = 0.0
+            packet["_fusion_temporal_prediction_joints"] = predicted_joints
+        # Every returned pose describes this common instant, even when a
+        # particular source needed no prediction.  Keeping the target private
+        # until make_output_packet() prevents the fused packet from inheriting
+        # the timestamp of whichever camera happened to have the best score.
+        packet["_fusion_target_capture_ns"] = target_ns
+        result.append(Sample(
+            serial=sample.serial,
+            packet=packet,
+            received_ns=sample.received_ns,
+            sequence=sample.sequence,
+            capture_timeline_ns=sample.capture_timeline_ns,
+            source_clock_offset_ns=sample.source_clock_offset_ns,
+            source_host_id=sample.source_host_id,
+        ))
+    return result
+
+
 def synchronized_samples(
     histories: dict[int, deque[Sample]],
     *,
@@ -301,12 +549,7 @@ def synchronized_samples(
     maximum_spread_ns: int,
     minimum_sources: int,
 ) -> tuple[list[Sample], float] | None:
-    """Choose the largest, freshest arrival-time-aligned camera bundle.
-
-    Source clocks need not agree for this application fallback: all matching is
-    performed on the main PC's UDP receive clock.  A short history prevents a
-    fast camera's newest frame from continually outrunning a slower source.
-    """
+    """Choose the largest, freshest clock-normalized capture-time bundle."""
     fresh = {
         serial: [sample for sample in history if now_ns - sample.received_ns <= source_timeout_ns]
         for serial, history in histories.items()
@@ -314,23 +557,36 @@ def synchronized_samples(
     fresh = {serial: samples for serial, samples in fresh.items() if samples}
     if len(fresh) < minimum_sources:
         return None
-    anchors = [sample.received_ns for samples in fresh.values() for sample in samples]
-    best: tuple[tuple[int, int, int], list[Sample], float] | None = None
+    anchors = [sample_timeline_ns(sample) for samples in fresh.values() for sample in samples]
+    best: tuple[tuple[int, int, int, int], list[Sample], float] | None = None
     for anchor_ns in anchors:
-        selected = [min(samples, key=lambda item: abs(item.received_ns - anchor_ns)) for samples in fresh.values()]
-        selected = [item for item in selected if abs(item.received_ns - anchor_ns) <= maximum_spread_ns]
-        if len(selected) < minimum_sources:
+        candidates = [min(samples, key=lambda item: abs(sample_timeline_ns(item) - anchor_ns)) for samples in fresh.values()]
+        candidates = [item for item in candidates if abs(sample_timeline_ns(item) - anchor_ns) <= maximum_spread_ns]
+        if len(candidates) < minimum_sources:
             continue
-        spread_ns = max(item.received_ns for item in selected) - min(item.received_ns for item in selected)
-        if spread_ns > maximum_spread_ns:
-            continue
-        # Prefer more cameras, then the newest valid bundle.  Using spread as
-        # the second key can pin the selector to an older, unusually tight
-        # bundle until it ages out of source_timeout_ns, throttling a 15 Hz
-        # input to only a few fused packets per second.
-        score = (len(selected), max(item.received_ns for item in selected), -spread_ns)
-        if best is None or score > best[0]:
-            best = (score, selected, spread_ns / 1.0e6)
+        # Four cameras make exhaustive subsets cheap (at most 11 candidates).
+        # This matters when three cameras have entered the new 15 Hz cycle but
+        # the fourth still has a previous-cycle frame only 66 ms behind: the
+        # fresh 3-view bundle must beat that smeared 4-view bundle.
+        for count in range(minimum_sources, len(candidates) + 1):
+            for subset in combinations(candidates, count):
+                selected = list(subset)
+                spread_ns = (
+                    max(sample_timeline_ns(item) for item in selected)
+                    - min(sample_timeline_ns(item) for item in selected)
+                )
+                if spread_ns > maximum_spread_ns:
+                    continue
+                # Advance on the newest *common* instant (the oldest member of
+                # the bundle), then prefer more cameras and a tighter spread.
+                score = (
+                    min(sample_timeline_ns(item) for item in selected),
+                    len(selected),
+                    -spread_ns,
+                    max(sample_timeline_ns(item) for item in selected),
+                )
+                if best is None or score > best[0]:
+                    best = (score, selected, spread_ns / 1.0e6)
     return (best[1], best[2]) if best is not None else None
 
 
@@ -382,10 +638,9 @@ def prepare_aligned_views(
     if not raw:
         return []
 
-    core_names = {
-        name for group in CRITICAL_GROUPS.values() for name in group
-    } | {"SPINE_1", "SPINE_2", "LEFT_HIP", "RIGHT_HIP"}
-    core_indexes = np.asarray([IDX[name] for name in sorted(core_names)], dtype=int)
+    core_indexes = np.asarray(
+        [IDX[name] for name in ASSOCIATION_BODY_NAMES], dtype=int
+    )
     pair_errors = np.full((len(raw), len(raw)), np.nan, dtype=np.float64)
     np.fill_diagonal(pair_errors, 0.0)
     for first in range(len(raw)):
@@ -480,8 +735,298 @@ def prepare_aligned_views(
             alignment_translation=correction,
             pose_disagreement_m=disagreement[index],
             accepted=accepted[index],
+            rejection_reason=(
+                None
+                if accepted[index]
+                else (
+                    "CALIBRATION_DRIFT"
+                    if disagreement[index] is not None
+                    and disagreement[index] <= maximum_pose_disagreement_m
+                    else "CROSS_PERSON_OR_POSE_OUTLIER"
+                )
+            ),
         ))
     return result
+
+
+def covariance_weight(packet: dict[str, Any], joint: int) -> float:
+    """Convert optional SDK BODY_38 covariance to a bounded reliability."""
+    try:
+        values = np.asarray(packet.get("keypoints_covariance"), dtype=np.float64)
+    except (TypeError, ValueError):
+        return 1.0
+    if values.ndim != 2 or values.shape[0] != 38 or joint >= values.shape[0]:
+        return 1.0
+    row = values[joint]
+    if row.size >= 6:
+        diagonal = row[[0, 3, 5]]
+    elif row.size >= 3:
+        diagonal = row[:3]
+    else:
+        return 1.0
+    if not np.isfinite(diagonal).all():
+        return 1.0
+    mean_variance = max(0.0, float(np.mean(diagonal)))
+    # ZED reports an all-zero covariance for keypoints with missing depth or
+    # outside the image.  It means "unavailable", not perfect certainty.
+    if mean_variance <= 1.0e-12:
+        return 0.25
+    standard_deviation_m = math.sqrt(mean_variance)
+    return float(np.clip(1.0 / (1.0 + (standard_deviation_m / 0.06) ** 2), 0.05, 1.0))
+
+
+def normalized_quaternion_xyzw(value: Any) -> np.ndarray | None:
+    candidate = vector(value, 4)
+    if not np.isfinite(candidate).all():
+        return None
+    norm = float(np.linalg.norm(candidate))
+    if norm < 1.0e-8:
+        return None
+    return candidate / norm
+
+
+def weighted_quaternion_average_xyzw(
+    values: list[np.ndarray],
+    weights: list[float],
+) -> np.ndarray:
+    """Average quaternions after resolving the q/-q hemisphere ambiguity."""
+    if not values:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    reference_index = int(np.argmax(np.asarray(weights, dtype=np.float64)))
+    reference = values[reference_index]
+    aligned = np.asarray([
+        -value if float(np.dot(value, reference)) < 0.0 else value
+        for value in values
+    ])
+    averaged = np.average(
+        aligned,
+        axis=0,
+        weights=np.maximum(np.asarray(weights, dtype=np.float64), 1.0e-6),
+    )
+    norm = float(np.linalg.norm(averaged))
+    return averaged / norm if norm >= 1.0e-8 else reference.copy()
+
+
+def fuse_body_orientations(
+    accepted: list[PreparedView],
+    contribution_serials: list[list[int]],
+    *,
+    minimum_confidence: float,
+) -> tuple[np.ndarray, np.ndarray, list[int | None], dict[str, int | None]]:
+    """Fuse BODY_38 rotations from the same views selected for each joint.
+
+    ZED local joint rotations are relative to the BODY_38 parent, so they are
+    camera-independent and can be averaged directly.  The global root is first
+    transformed into the calibrated world.  This keeps a torso-occluded camera
+    from supplying arm rotations after clear front/rear views supplied the arm
+    positions.
+    """
+    by_serial = {item.sample.serial: item for item in accepted}
+    local_output = np.tile(
+        np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64), (38, 1)
+    )
+    orientation_serials: list[int | None] = []
+    root_values: list[np.ndarray] = []
+    root_weights: list[float] = []
+    root_serials: list[int] = []
+
+    for joint in range(38):
+        side = ARM_SIDE_BY_INDEX.get(joint)
+        values: list[np.ndarray] = []
+        weights: list[float] = []
+        serials: list[int] = []
+        for serial in contribution_serials[joint]:
+            item = by_serial.get(serial)
+            if item is None:
+                continue
+            raw_orientations = item.sample.packet.get(
+                "local_orientation_per_joint_xyzw"
+            ) or []
+            if joint >= len(raw_orientations):
+                continue
+            value = normalized_quaternion_xyzw(raw_orientations[joint])
+            if value is None:
+                continue
+            visibility_weight = 1.0
+            if side:
+                state = arm_view_state(item, side, minimum_confidence)
+                if not state["clear"]:
+                    visibility_weight = 0.12 if state["overlap"] else 0.25
+                    if state["recovered"]:
+                        visibility_weight *= 0.60
+            weight = (
+                max(float(item.confidence[joint]), 0.0) / 100.0
+            ) ** 2 * max(item.quality, 0.05) * visibility_weight * covariance_weight(
+                item.sample.packet, joint
+            )
+            values.append(value)
+            weights.append(max(weight, 1.0e-6))
+            serials.append(serial)
+        if values:
+            local_output[joint] = weighted_quaternion_average_xyzw(values, weights)
+            orientation_serials.append(serials[int(np.argmax(weights))])
+        else:
+            orientation_serials.append(None)
+
+        if joint == IDX["PELVIS"]:
+            for value, weight, serial in zip(values, weights, serials):
+                item = by_serial[serial]
+                source_root = quaternion_xyzw_to_matrix(
+                    item.sample.packet.get("global_root_orientation_xyzw")
+                )
+                root_values.append(
+                    matrix_to_quaternion_xyzw(item.extrinsic.rotation @ source_root)
+                )
+                root_weights.append(weight)
+                root_serials.append(serial)
+
+    global_root = weighted_quaternion_average_xyzw(root_values, root_weights)
+    arm_sources = {
+        side: next(
+            (
+                orientation_serials[IDX[name]]
+                for name in reversed(ARM_CHAIN_NAMES[side])
+                if orientation_serials[IDX[name]] is not None
+            ),
+            None,
+        )
+        for side in ARM_CHAIN_NAMES
+    }
+    if root_serials:
+        arm_sources["root"] = root_serials[int(np.argmax(root_weights))]
+    else:
+        arm_sources["root"] = None
+    return local_output, global_root, orientation_serials, arm_sources
+
+
+def arm_view_state(
+    item: PreparedView,
+    side: str,
+    minimum_confidence: float,
+) -> dict[str, Any]:
+    chain = [IDX[name] for name in ARM_CHAIN_NAMES[side]]
+    complete = bool(
+        np.isfinite(item.aligned_points[chain]).all()
+        and np.all(item.confidence[chain] >= minimum_confidence)
+    )
+    analysis = item.sample.packet.get("occlusion_analysis") or {}
+    overlap_map = analysis.get("arm_torso_overlap") or {}
+    recovered_map = analysis.get("arm_chain_recovered") or {}
+    overlap = bool(overlap_map.get(side, overlap_map.get(side.upper(), False)))
+    recovered = bool(recovered_map.get(side, recovered_map.get(side.upper(), False)))
+    return {
+        "complete": complete,
+        "overlap": overlap,
+        "recovered": recovered,
+        "clear": bool(complete and not overlap and not recovered),
+        "chain_min_confidence": float(np.min(item.confidence[chain])) if complete else 0.0,
+    }
+
+
+def _fuse_prepared_keypoints(
+    prepared: list[PreparedView],
+    *,
+    minimum_confidence: float,
+    maximum_spread_m: float,
+) -> tuple[np.ndarray, np.ndarray, list[int], list[list[int]], dict[str, Any]]:
+    result = np.full((38, 3), np.nan, dtype=np.float64)
+    result_confidence = np.zeros(38, dtype=np.float64)
+    contribution_count: list[int] = []
+    contribution_serials: list[list[int]] = []
+    accepted = [item for item in prepared if item.accepted]
+    arm_states = {
+        side: {
+            item.sample.serial: arm_view_state(item, side, minimum_confidence)
+            for item in accepted
+        }
+        for side in ARM_CHAIN_NAMES
+    }
+    for joint in range(38):
+        candidates: list[dict[str, Any]] = []
+        side = ARM_SIDE_BY_INDEX.get(joint)
+        for item in accepted:
+            if np.isfinite(item.aligned_points[joint]).all() and item.confidence[joint] >= minimum_confidence:
+                state = arm_states[side][item.sample.serial] if side else None
+                visibility_weight = 1.0
+                if state is not None and not state["clear"]:
+                    # A recovered/torso-overlapped chain remains available as
+                    # a bounded fallback, but it cannot outvote a clear rear
+                    # or front camera for this anatomical arm.
+                    visibility_weight = 0.12 if state["overlap"] else 0.25
+                    if state["recovered"]:
+                        visibility_weight *= 0.60
+                candidates.append({
+                    "point": item.aligned_points[joint],
+                    "confidence": float(item.confidence[joint]),
+                    "quality": item.quality,
+                    "serial": item.sample.serial,
+                    "clear": bool(state["clear"]) if state is not None else True,
+                    "visibility_weight": visibility_weight,
+                    "covariance_weight": covariance_weight(item.sample.packet, joint),
+                })
+        if not candidates:
+            contribution_count.append(0)
+            contribution_serials.append([])
+            continue
+        clear = [item for item in candidates if item["clear"]] if side else []
+        if len(clear) >= 2:
+            # Two independent clear views are enough to suppress front/back
+            # torso-occluded estimates completely.
+            pool = clear
+            center = np.median(np.asarray([item["point"] for item in clear]), axis=0)
+        elif len(clear) == 1:
+            pool = candidates
+            center = clear[0]["point"]
+        else:
+            pool = candidates
+            center = np.median(np.asarray([item["point"] for item in candidates]), axis=0)
+        inliers = [
+            item for item in pool
+            if float(np.linalg.norm(item["point"] - center)) <= maximum_spread_m
+        ]
+        if not inliers:
+            inliers = [max(
+                pool,
+                key=lambda item: (
+                    item["confidence"] * item["quality"]
+                    * item["visibility_weight"] * item["covariance_weight"]
+                ),
+            )]
+        weights = np.asarray([
+            max(
+                1.0e-4,
+                (item["confidence"] / 100.0) ** 2
+                * max(item["quality"], 0.05)
+                * item["visibility_weight"]
+                * item["covariance_weight"],
+            )
+            for item in inliers
+        ])
+        joint_values = np.asarray([item["point"] for item in inliers])
+        result[joint] = np.average(joint_values, axis=0, weights=weights)
+        result_confidence[joint] = float(np.average(
+            np.asarray([item["confidence"] for item in inliers]), weights=weights
+        ))
+        contribution_count.append(len(inliers))
+        contribution_serials.append(sorted(int(item["serial"]) for item in inliers))
+
+    evidence: dict[str, Any] = {}
+    for side, states in arm_states.items():
+        selected = {
+            serial
+            for name in ARM_JOINT_NAMES[side]
+            for serial in contribution_serials[IDX[name]]
+        }
+        evidence[side] = {
+            "supporting_views": sum(bool(state["complete"]) for state in states.values()),
+            "reliable_clear_views": sum(bool(state["clear"]) for state in states.values()),
+            "supporting_serials": sorted(serial for serial, state in states.items() if state["complete"]),
+            "clear_serials": sorted(serial for serial, state in states.items() if state["clear"]),
+            "overlapped_serials": sorted(serial for serial, state in states.items() if state["overlap"]),
+            "recovered_serials": sorted(serial for serial, state in states.items() if state["recovered"]),
+            "selected_serials": sorted(selected),
+        }
+    return result, result_confidence, contribution_count, contribution_serials, evidence
 
 
 def fuse_prepared_keypoints(
@@ -490,28 +1035,12 @@ def fuse_prepared_keypoints(
     minimum_confidence: float,
     maximum_spread_m: float,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    result = np.full((38, 3), np.nan, dtype=np.float64)
-    result_confidence = np.zeros(38, dtype=np.float64)
-    contribution_count: list[int] = []
-    accepted = [item for item in prepared if item.accepted]
-    for joint in range(38):
-        candidates: list[tuple[np.ndarray, float, float]] = []
-        for item in accepted:
-            if np.isfinite(item.aligned_points[joint]).all() and item.confidence[joint] >= minimum_confidence:
-                candidates.append((item.aligned_points[joint], float(item.confidence[joint]), item.quality))
-        if not candidates:
-            contribution_count.append(0)
-            continue
-        median = np.median(np.asarray([item[0] for item in candidates]), axis=0)
-        inliers = [item for item in candidates if float(np.linalg.norm(item[0] - median)) <= maximum_spread_m]
-        if not inliers:
-            inliers = [max(candidates, key=lambda item: item[1] * item[2])]
-        weights = np.asarray([max(1.0e-4, (item[1] / 100.0) ** 2 * max(item[2], 0.05)) for item in inliers])
-        joint_values = np.asarray([item[0] for item in inliers])
-        result[joint] = np.average(joint_values, axis=0, weights=weights)
-        result_confidence[joint] = float(np.average(np.asarray([item[1] for item in inliers]), weights=weights))
-        contribution_count.append(len(inliers))
-    return result, result_confidence, contribution_count
+    fused, fused_confidence, counts, _serials, _evidence = _fuse_prepared_keypoints(
+        prepared,
+        minimum_confidence=minimum_confidence,
+        maximum_spread_m=maximum_spread_m,
+    )
+    return fused, fused_confidence, counts
 
 
 def fuse_keypoints(
@@ -542,12 +1071,22 @@ def compact_sample(sample: Sample) -> dict[str, Any]:
     return sanitize({
         "serial": sample.serial,
         "source_timestamp_ns": int(packet.get("timestamp_ns", 0) or 0),
+        "normalized_capture_timestamp_ns": sample_timeline_ns(sample),
+        "source_clock_offset_ns": sample.source_clock_offset_ns,
+        "source_host_id": sample.source_host_id,
         "receiver_timestamp_ns": sample.received_ns,
         "sequence": sample.sequence,
+        "body_id": packet.get("body_id"),
+        "unique_object_id": packet.get("unique_object_id"),
         "body_confidence": packet.get("body_confidence", 0.0),
         "keypoint_names": packet.get("keypoint_names", BODY38_NAMES),
         "keypoints_3d_m": packet.get("keypoints_3d_m"),
         "keypoint_confidence": packet.get("keypoint_confidence"),
+        "keypoints_covariance": packet.get("keypoints_covariance"),
+        "operator_selection": packet.get("operator_selection"),
+        "distance_quality": packet.get("distance_quality"),
+        "euclidean_distance_m": packet.get("euclidean_distance_m"),
+        "occlusion_analysis": packet.get("occlusion_analysis"),
     })
 
 
@@ -558,6 +1097,12 @@ def event_rate(events: deque[float], now: float, window_s: float = 2.0) -> float
         return 0.0
     elapsed = events[-1] - events[0]
     return (len(events) - 1) / elapsed if elapsed > 1.0e-6 else 0.0
+
+
+def metric_text(value: Any, suffix: str = "", precision: int = 1) -> str:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return f"{float(value):.{precision}f}{suffix}"
+    return "n/a"
 
 
 def cross_view_agreement(
@@ -635,12 +1180,17 @@ def draw_four_preview(
         age_ms = (now_ns - int(metric.get("last_body_ns", 0))) / 1.0e6 if metric.get("last_body_ns") else math.inf
         body_fps = float(metric.get("body_fps", 0.0))
         rx_fps = float(metric.get("rx_fps", 0.0))
-        capture_ms = metric.get("capture_to_receive_ms")
+        capture_ms = metric.get("corrected_capture_to_receive_ms", metric.get("capture_to_receive_ms"))
         capture_text = f"{float(capture_ms):.1f}ms" if isinstance(capture_ms, (int, float)) and math.isfinite(float(capture_ms)) else "n/a"
+        queue_ms = metric.get("network_queue_ms")
+        queue_text = f"{float(queue_ms):.1f}ms" if isinstance(queue_ms, (int, float)) and math.isfinite(float(queue_ms)) else "n/a"
+        world_x = metric.get("world_forward_x_m")
+        world_x_text = f"{float(world_x):.2f}m" if isinstance(world_x, (int, float)) and math.isfinite(float(world_x)) else "n/a"
+        workspace_state = str(metric.get("workspace_state", "BEKLE"))
         color = (40, 220, 80) if endpoint.serial in body_fresh else (0, 165, 255)
         cv2.rectangle(tile, (0, 0), (tile_width, 62), (18, 18, 18), -1)
         cv2.putText(tile, f"ZED {endpoint.serial}  BODY {body_fps:.1f} fps  RX {rx_fps:.1f} fps", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, color, 2, cv2.LINE_AA)
-        cv2.putText(tile, f"durum={metric.get('status', 'YOK')}  gecikme={capture_text}  body_yasi={age_ms:.0f}ms", (12, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 235), 1, cv2.LINE_AA)
+        cv2.putText(tile, f"durum={metric.get('status', 'YOK')}  X={world_x_text}/{workspace_state}  gecikme={capture_text}  ag={queue_text}", (12, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (235, 235, 235), 1, cv2.LINE_AA)
         tiles.append(tile)
     while len(tiles) < 4:
         tiles.append(np.zeros((tile_height, tile_width, 3), dtype=np.uint8))
@@ -667,6 +1217,10 @@ def make_output_packet(
     record_dropped: int = 0,
     maximum_pose_disagreement_m: float = 0.22,
     maximum_alignment_translation_m: float = 1.0,
+    maximum_capture_spread_ms: float = 80.0,
+    workspace_excluded_serials: list[int] | None = None,
+    workspace_x_min_m: float = 2.0,
+    workspace_x_max_m: float = 4.0,
 ) -> dict[str, Any]:
     prepared = prepare_aligned_views(
         views,
@@ -678,15 +1232,20 @@ def make_output_packet(
     if not accepted:
         accepted = prepared
     best_view = max(accepted, key=lambda item: item.quality)
-    best_sample, best_extrinsic = best_view.sample, best_view.extrinsic
+    best_sample = best_view.sample
     packet = dict(best_sample.packet)
-    fused, fused_confidence, contributions = fuse_prepared_keypoints(
+    # A source covariance describes that camera's estimate, not the fused
+    # joint.  Do not mislabel the best camera covariance as fused covariance.
+    packet.pop("keypoints_covariance", None)
+    packet.pop("_fusion_temporal_prediction_ms", None)
+    packet.pop("_fusion_temporal_prediction_joints", None)
+    packet.pop("_fusion_target_capture_ns", None)
+    fused, fused_confidence, contributions, contribution_serials, arm_evidence = _fuse_prepared_keypoints(
         prepared,
         minimum_confidence=minimum_confidence,
         maximum_spread_m=maximum_spread_m,
     )
     pelvis = fused[IDX["PELVIS"]]
-    source_orientation = quaternion_xyzw_to_matrix(packet.get("global_root_orientation_xyzw"))
     try:
         pelvis_local, pelvis_origin, pelvis_rotation = to_pelvis_local(fused, IDX)
     except ValueError:
@@ -710,6 +1269,16 @@ def make_output_packet(
     ]
     accepted_serials = [item.sample.serial for item in accepted]
     excluded_serials = [item.sample.serial for item in prepared if not item.accepted]
+    rejection_codes = sorted({
+        str(item.rejection_reason)
+        for item in prepared
+        if not item.accepted and item.rejection_reason
+    })
+    workspace_excluded_serials = sorted(
+        int(value) for value in (workspace_excluded_serials or [])
+    )
+    if workspace_excluded_serials:
+        rejection_codes.append("OUTSIDE_OPERATOR_WORKSPACE")
     metrics = source_metrics or {}
     view_descriptions = []
     camera_poses: dict[str, Any] = {}
@@ -724,15 +1293,27 @@ def make_output_packet(
             "sequence": sample.sequence,
             "body_confidence": sample.packet.get("body_confidence", 0.0),
             "source_timestamp_ns": int(sample.packet.get("timestamp_ns", 0) or 0),
+            "normalized_capture_timestamp_ns": sample_timeline_ns(sample),
+            "source_clock_offset_ns": sample.source_clock_offset_ns,
+            "source_host_id": sample.source_host_id,
             "receiver_timestamp_ns": sample.received_ns,
             "receiver_age_ms": (now_ns - sample.received_ns) / 1.0e6,
             "quality_score": item.quality,
             "accepted_for_fusion": item.accepted,
+            "rejection_reason": item.rejection_reason,
             "pose_disagreement_to_medoid_m": item.pose_disagreement_m,
             "dynamic_alignment_translation_m": item.alignment_translation,
             "keypoints_3d_fusion_m": item.aligned_points,
             "keypoint_confidence": item.confidence,
+            "keypoints_covariance": sample.packet.get("keypoints_covariance"),
+            "occlusion_analysis": sample.packet.get("occlusion_analysis"),
+            "distance_quality": sample.packet.get("distance_quality"),
+            "euclidean_distance_m": sample.packet.get("euclidean_distance_m"),
+            "operator_selection": sample.packet.get("operator_selection"),
+            "temporal_prediction_ms": sample.packet.get("_fusion_temporal_prediction_ms", 0.0),
+            "temporal_prediction_joints": sample.packet.get("_fusion_temporal_prediction_joints", 0),
             "source_metrics": source_metric,
+            "source_latency_trace_ns": sample.packet.get("latency_trace_ns"),
         }))
         camera_poses[str(sample.serial)] = sanitize({
             "rotation_camera_to_world": extrinsic.rotation,
@@ -740,27 +1321,171 @@ def make_output_packet(
         })
     agreement = cross_view_agreement(raw_agreement_views, fused, minimum_confidence)
     aligned_agreement = cross_view_agreement(aligned_agreement_views, fused, minimum_confidence)
-    calibration = dict(packet.get("calibration") or {})
+    # Use a stable calibration/profile source.  Prefer the reference camera
+    # once it is READY; otherwise keep the most mature READY contributing
+    # camera.  This prevents the human scaling profile from changing merely
+    # because a different view wins one frame's overall quality score.
+    metadata_view = max(
+        accepted,
+        key=lambda item: (
+            (item.sample.packet.get("calibration") or {}).get("state") == "READY",
+            item.sample.serial == reference_serial,
+            int((item.sample.packet.get("calibration") or {}).get("sample_count", 0) or 0),
+            item.quality,
+        ),
+    )
+    metadata_sample = metadata_view.sample
+    metadata_extrinsic = metadata_view.extrinsic
+    calibration = dict(metadata_sample.packet.get("calibration") or {})
     profile = dict(calibration.get("profile") or {})
     neutral = np.asarray(profile.get("neutral_pelvis_rotation_matrix"), dtype=np.float64)
     if neutral.shape == (3, 3) and np.isfinite(neutral).all():
-        profile["neutral_pelvis_rotation_matrix"] = (best_extrinsic.rotation @ neutral).tolist()
+        profile["neutral_pelvis_rotation_matrix"] = (metadata_extrinsic.rotation @ neutral).tolist()
     if profile:
         calibration["profile"] = profile
+    calibration["profile_source_serial"] = metadata_sample.serial
+    calibration_states = {
+        str(item.sample.serial): (item.sample.packet.get("calibration") or {}).get(
+            "state", "MISSING"
+        )
+        for item in accepted
+    }
+    calibration["source_states"] = calibration_states
+    calibration["ready_source_serials"] = sorted(
+        int(serial)
+        for serial, state in calibration_states.items()
+        if state == "READY"
+    )
+    if not accepted or any(state != "READY" for state in calibration_states.values()):
+        calibration["state"] = "ACQUIRING"
+        calibration["progress"] = min(
+            [
+                float((item.sample.packet.get("calibration") or {}).get("progress", 0.0) or 0.0)
+                for item in accepted
+            ]
+            or [0.0]
+        )
+    else:
+        calibration["state"] = "READY"
+        calibration["progress"] = 1.0
+    operator_sources = {
+        str(item.sample.serial): dict(
+            item.sample.packet.get("operator_selection") or {}
+        )
+        for item in accepted
+    }
+    locked_sources = sorted(
+        int(serial)
+        for serial, selection in operator_sources.items()
+        if selection.get("state") == "LOCKED"
+    )
+    operator_selection = {
+        "state": (
+            "LOCKED"
+            if accepted and len(locked_sources) == len(accepted)
+            else "ACQUIRING"
+        ),
+        "locked_body_id": 0,
+        "locked_unique_object_id": "four-camera-fused-operator",
+        "missing_frames": max(
+            [int(value.get("missing_frames", 0) or 0) for value in operator_sources.values()]
+            or [0]
+        ),
+        "acquisition_frames": min(
+            [int(value.get("acquisition_frames", 0) or 0) for value in operator_sources.values()]
+            or [0]
+        ),
+        "reason": "calibrated_world_workspace_multiview_lock",
+        "automatic_handover": False,
+        "locked_source_serials": locked_sources,
+        "source_states": {
+            serial: selection.get("state", "MISSING")
+            for serial, selection in operator_sources.items()
+        },
+    }
+    fused_occlusion = dict(metadata_sample.packet.get("occlusion_analysis") or {})
+    fused_occlusion.update({
+        "arm_torso_overlap": {
+            side: int(details["reliable_clear_views"]) == 0
+            for side, details in arm_evidence.items()
+        },
+        "arm_chain_recovered": {
+            side: bool(
+                int(details["reliable_clear_views"]) == 0
+                and details["recovered_serials"]
+            )
+            for side, details in arm_evidence.items()
+        },
+        "multiview_arm_evidence": arm_evidence,
+        "fusion_rule": "per_joint_clear_view_then_confidence_covariance_weighted",
+    })
+    local_orientations, global_root_orientation, orientation_serials, orientation_sources = (
+        fuse_body_orientations(
+            accepted,
+            contribution_serials,
+            minimum_confidence=minimum_confidence,
+        )
+    )
+    # temporal_compensate_samples writes the common target into every view.
+    # Direct unit tests and old recordings lack it, so fall back to the newest
+    # accepted normalized capture timestamp.
+    corrected_capture_ns = max(
+        int(
+            item.sample.packet.get(
+                "_fusion_target_capture_ns", sample_timeline_ns(item.sample)
+            )
+            or sample_timeline_ns(item.sample)
+        )
+        for item in accepted
+    )
+    contributor_capture_times = [
+        sample_timeline_ns(item.sample) for item in accepted
+    ]
+    contributor_spread_ms = (
+        (max(contributor_capture_times) - min(contributor_capture_times)) / 1.0e6
+        if contributor_capture_times
+        else float(arrival_spread_ms)
+    )
+    contributor_stdev_ms = (
+        float(np.std(np.asarray(contributor_capture_times, dtype=np.float64)))
+        / 1.0e6
+        if contributor_capture_times
+        else None
+    )
+    fused_at_ns = time.time_ns()
+    body_confidence = float(np.average(
+        np.asarray([
+            float(item.sample.packet.get("body_confidence", 0.0) or 0.0)
+            for item in accepted
+        ]),
+        weights=np.maximum(
+            np.asarray([item.quality for item in accepted], dtype=np.float64),
+            0.05,
+        ),
+    ))
     packet.update(sanitize({
         "schema": "zed_body38_live/v1",
         "source_serial": 0,
+        "source_host_id": "fusion_receiver",
         "sequence": output_sequence,
-        "timestamp_ns": time.time_ns(),
+        "timestamp_ns": corrected_capture_ns,
         "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
         "units": "meter",
         "root_position_m": pelvis,
-        "global_root_orientation_xyzw": matrix_to_quaternion_xyzw(best_extrinsic.rotation @ source_orientation),
+        "global_root_orientation_xyzw": global_root_orientation,
+        "local_orientation_per_joint_xyzw": local_orientations,
+        "body_confidence": body_confidence,
+        "body_id": 0,
+        "tracking_state": "OK",
         "keypoint_names": BODY38_NAMES,
         "keypoints_3d_raw_m": fused,
         "keypoints_3d_m": fused,
         "keypoint_confidence": fused_confidence,
         "root_relative_keypoints_m": pelvis_local,
+        # ZED local-position and 2D arrays belong to one physical camera and
+        # are not meaningful after world-space per-joint fusion.
+        "local_position_per_joint_m": None,
+        "keypoints_2d_px": None,
         "shoulder_width_normalized_keypoints": shoulder_normalized,
         "pelvis_frame": {
             "coordinate_system": "PELVIS_LOCAL_X_FWD_Y_LEFT_Z_UP",
@@ -775,6 +1500,24 @@ def make_output_packet(
             "keypoints_m": pelvis_local,
         },
         "calibration": calibration,
+        "operator_selection": operator_selection,
+        "perception_metrics": metadata_sample.packet.get("perception_metrics"),
+        "control_mode_request": metadata_sample.packet.get("control_mode_request"),
+        "action_state": metadata_sample.packet.get("action_state"),
+        "imu": None,
+        "distance_quality": {
+            "recommended_min_m": workspace_x_min_m,
+            "recommended_max_m": workspace_x_max_m,
+            "inside_recommended_range": bool(
+                np.isfinite(pelvis).all()
+                and workspace_x_min_m <= float(pelvis[0]) <= workspace_x_max_m
+            ),
+            "basis": "CALIBRATED_REFERENCE_WORLD_X",
+        },
+        "euclidean_distance_m": (
+            float(np.linalg.norm(pelvis)) if np.isfinite(pelvis).all() else None
+        ),
+        "occlusion_analysis": fused_occlusion,
         "reference_ready": {
             "upper_body": fused_features["upper_body_reference_ready"],
             "whole_body": fused_features["whole_body_reference_ready"],
@@ -785,45 +1528,75 @@ def make_output_packet(
             "reference_world_serial": reference_serial,
             "contributing_serials": accepted_serials,
             "excluded_pose_serials": excluded_serials,
-            "best_orientation_serial": best_sample.serial,
+            "workspace_excluded_serials": workspace_excluded_serials,
+            "best_orientation_serial": orientation_sources.get("root"),
+            "metadata_source_serial": metadata_sample.serial,
+            "per_joint_orientation_serials": orientation_serials,
+            "arm_orientation_sources": {
+                side: orientation_sources.get(side) for side in ARM_CHAIN_NAMES
+            },
             "per_joint_contributions": contributions,
+            "per_joint_contributing_serials": contribution_serials,
+            "arm_evidence": arm_evidence,
             "maximum_joint_spread_m": maximum_spread_m,
-            "arrival_spread_ms": arrival_spread_ms,
+            "capture_spread_ms": contributor_spread_ms,
+            "capture_stdev_ms": contributor_stdev_ms,
+            "selection_capture_spread_ms": arrival_spread_ms,
+            # Backward-compatible name used by existing Rerun summaries.  In
+            # v2 it is the clock-normalized capture spread, not socket arrival.
+            "arrival_spread_ms": contributor_spread_ms,
         },
         "multi_camera": {
             "mode": "FOUR_FUSED" if len(accepted) == 4 else "PARTIAL_FUSED",
             "contributing_views": len(accepted),
             "contributing_serials": accepted_serials,
             "excluded_pose_serials": excluded_serials,
+            "workspace_excluded_serials": workspace_excluded_serials,
             "connected_serials": connected_serials or [sample.serial for sample, _ in views],
             "configured_serials": sorted(metrics) if metrics else [sample.serial for sample, _ in views],
-            "camera_timestamp_delta_ms": arrival_spread_ms,
-            "camera_sync_ok": bool(arrival_spread_ms <= 110.0),
+            "camera_timestamp_delta_ms": contributor_spread_ms,
+            "timestamp_basis": "clock_offset_corrected_capture_time",
+            "camera_sync_ok": bool(contributor_spread_ms <= maximum_capture_spread_ms),
             "fused_quality_score": float(np.mean(fused_confidence) / 100.0),
             "best_single_quality_score": sample_quality(best_sample.packet, minimum_confidence),
             "cross_view_agreement": agreement,
             "post_alignment_agreement": aligned_agreement,
             "fusion_metrics": {
                 "mean_camera_fused": float(np.mean(contributions)),
-                "mean_stdev_between_camera_s": arrival_spread_ms / 1000.0,
+                "mean_stdev_between_camera_s": (
+                    contributor_stdev_ms / 1000.0
+                    if contributor_stdev_ms is not None else None
+                ),
+                "capture_range_between_camera_ms": contributor_spread_ms,
                 "per_camera": metrics,
             },
             "per_camera": view_descriptions,
+            "source_operator_selections": operator_sources,
+            "arm_evidence": arm_evidence,
             "camera_pose_fusion_from_local": camera_poses,
-            "failure_codes": [] if len(accepted) == 4 else (["CROSS_PERSON_OR_POSE_OUTLIER"] if excluded_serials else ["PARTIAL_CAMERA_SET"]),
+            "failure_codes": sorted(set(
+                rejection_codes
+                if rejection_codes
+                else ([] if len(accepted) == 4 else ["PARTIAL_CAMERA_SET"])
+            )),
         },
         "transport_metrics": {
             "source_interval_ms": 1000.0 / effective_output_hz if effective_output_hz > 0.0 else None,
             "effective_output_hz": effective_output_hz,
-            "capture_to_send_ms": (now_ns - int(best_sample.packet.get("timestamp_ns", 0) or now_ns)) / 1.0e6,
+            "capture_to_send_ms": max(0.0, (fused_at_ns - corrected_capture_ns) / 1.0e6),
             "record_queue_depth": record_queue_depth,
             "record_dropped": record_dropped,
             "source_mode": "distributed_four_zed_body38",
         },
         "latency_trace_ns": {
-            "t0_capture_ns": int(best_sample.packet.get("timestamp_ns", 0) or 0),
-            "t2_windows_udp_receive_ns": best_sample.received_ns,
-            "t3_application_fused_ns": time.time_ns(),
+            "t0_capture_ns": corrected_capture_ns,
+            "t2_windows_udp_receive_ns": max(
+                item.sample.received_ns for item in accepted
+            ),
+            "t3_application_fused_ns": fused_at_ns,
+            # Replaced immediately before serialization/socket send in main;
+            # this value keeps direct callers and offline tests well formed.
+            "t2_windows_udp_send_ns": fused_at_ns,
         },
     }))
     return packet
@@ -845,12 +1618,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ros-port", type=int, default=15054)
     parser.add_argument("--ros-max-hz", type=float, default=15.0)
     parser.add_argument("--confidence", type=float, default=45.0)
-    parser.add_argument("--max-sync-ms", type=float, default=110.0, help="Ana PC'ye varis zamanina gore azami dortlu paket yayilimi.")
-    parser.add_argument("--source-timeout-ms", type=float, default=750.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
+    parser.add_argument("--max-sync-ms", type=float, default=80.0, help="Saat-ofseti duzeltilmis capture zamanina gore azami paket yayilimi.")
+    parser.add_argument("--source-timeout-ms", type=float, default=250.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
     parser.add_argument("--minimum-sources", type=int, choices=(2, 3, 4), default=2, help="Calisma aninda cikis icin gereken en az taze kamera.")
     parser.add_argument("--max-joint-spread-m", type=float, default=0.30)
     parser.add_argument("--max-pose-disagreement-m", type=float, default=0.22, help="Farkli kisi/poz gorunumunu dislamak icin pelvis-yerel govde MPJPE esigi.")
-    parser.add_argument("--max-alignment-translation-m", type=float, default=1.0, help="Dinamik pelvis hizalamasinda farkli kisiyi elemek icin azami ceviri.")
+    parser.add_argument("--max-alignment-translation-m", type=float, default=0.25, help="Iyi kalibrasyonda izin verilen azami dinamik pelvis cevirisi; asilirsa gorus dislanir.")
+    parser.add_argument("--max-temporal-prediction-ms", type=float, default=70.0, help="Eski kamera gorusunu son capture anina tasimak icin azami tahmin (ms).")
+    parser.add_argument("--workspace-x-min-m", type=float, default=2.0, help="Referans ZED dunya X ekseninde operator hacminin baslangici (m).")
+    parser.add_argument("--workspace-x-max-m", type=float, default=4.0, help="Referans ZED dunya X ekseninde operator hacminin sonu (m).")
+    parser.add_argument("--workspace-hysteresis-m", type=float, default=0.15, help="Iceride kilitli operator icin calisma alani cikis toleransi (m).")
     parser.add_argument("--calibration-record", type=Path, default=None, help="Dortlu senkron ham BODY_38 karelerini JSONL olarak kaydet.")
     parser.add_argument("--calibration-max-hz", type=float, default=12.0)
     parser.add_argument("--record", action="store_true", help="Fusion JSONL kaydini baslangicta ac.")
@@ -886,6 +1663,10 @@ def main() -> int:
         or args.max_joint_spread_m <= 0.0
         or args.max_pose_disagreement_m <= 0.0
         or args.max_alignment_translation_m <= 0.0
+        or args.max_temporal_prediction_ms < 0.0
+        or args.workspace_x_min_m < 0.0
+        or args.workspace_x_max_m <= args.workspace_x_min_m
+        or not 0.0 <= args.workspace_hysteresis_m <= 1.0
         or args.output_max_hz <= 0.0
         or args.monitor_max_hz <= 0.0
         or args.ros_max_hz <= 0.0
@@ -949,8 +1730,12 @@ def main() -> int:
             "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
             "units": "meter",
             "sources": [{"serial": item.serial, "port": item.port} for item in endpoints],
-            "maximum_arrival_spread_ms": args.max_sync_ms,
-            "instruction": "Tripodlar sabitken ortak gorus alaninda 20-30 saniye T-pozda sakin durun.",
+            "maximum_capture_spread_ms": args.max_sync_ms,
+            "timestamp_basis": "clock_offset_corrected_capture_time",
+            "instruction": (
+                "Ortamda tek kisi olsun. Tum ortak calisma hacmini yavasca dolasin; "
+                "grid noktalarinda T/A ve bukulu-dirsek pozlarinda 1-2 saniye durun."
+            ),
         }), ensure_ascii=False, allow_nan=False) + "\n")
         print(f"HAM KALIBRASYON KAYDI: {path}")
 
@@ -1004,6 +1789,12 @@ def main() -> int:
                 "preview_sources": [{"serial": item.serial, "port": item.port} for item in preview_endpoints],
                 "extrinsics_path": str(resolved_extrinsics) if resolved_extrinsics else None,
                 "extrinsics": extrinsic_document,
+                "operator_workspace": {
+                    "frame": "REFERENCE_CAMERA_WORLD_X_FWD",
+                    "x_min_m": args.workspace_x_min_m,
+                    "x_max_m": args.workspace_x_max_m,
+                    "hysteresis_m": args.workspace_hysteresis_m,
+                },
                 "safety": "Perception only; contains no physical robot motor commands.",
             })
             fusion_record_file.write(json.dumps(header, ensure_ascii=False, allow_nan=False) + "\n")
@@ -1012,13 +1803,15 @@ def main() -> int:
         recording = enabled
         print(f"4-ZED fusion kayit {'ACIK' if enabled else 'KAPALI'}: {record_path} ({recorded} kare, drop={record_dropped})", flush=True)
 
-    histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=16) for item in endpoints}
+    histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=32) for item in endpoints}
+    clock_offsets = ClockOffsetEstimator(window=300, quantile=0.05)
     last_any_packet_ns: dict[int, int] = {}
     last_body_packet_ns: dict[int, int] = {}
     last_source_status: dict[int, str] = {}
     per_source_input = {item.serial: 0 for item in endpoints}
     per_source_status = {item.serial: 0 for item in endpoints}
-    last_bundle: tuple[tuple[int, int], ...] | None = None
+    last_calibration_bundle: tuple[tuple[int, int], ...] | None = None
+    last_output_bundle: tuple[tuple[int, int], ...] | None = None
     last_output_at = 0.0
     last_record_at = 0.0
     output_sequence = 0
@@ -1035,6 +1828,9 @@ def main() -> int:
     body_events = {item.serial: deque(maxlen=120) for item in endpoints}
     output_events: deque[float] = deque(maxlen=120)
     source_metrics: dict[int, dict[str, Any]] = {item.serial: {} for item in endpoints}
+    workspace_inside_state: dict[int, bool] = {
+        item.serial: False for item in endpoints
+    }
     last_preview_at = 0.0
     started = time.monotonic()
     last_status = started
@@ -1106,14 +1902,28 @@ def main() -> int:
                         invalid_packets += 1
                         print(f"UYARI: port {endpoint.port} ZED {endpoint.serial} beklerken {declared_serial} paketi geldi; atlandi.", file=sys.stderr)
                         continue
-                    if points(document.get("keypoints_3d_m")).shape != (38, 3):
+                    if not valid_body38_payload(document):
                         invalid_packets += 1
                         continue
+                    source_host_id = str(
+                        document.get("source_host_id") or f"legacy-{endpoint.serial}"
+                    )
+                    capture_timeline_ns, source_clock_offset_ns, clock_metrics = clock_offsets.update(
+                        source_host_id, document, received_ns
+                    )
+                    source_metrics[endpoint.serial].update(clock_metrics)
+                    source_metrics[endpoint.serial]["source_host_id"] = source_host_id
+                    source_metrics[endpoint.serial]["capture_to_receive_ms"] = clock_metrics.get(
+                        "corrected_capture_to_receive_ms"
+                    )
                     histories[endpoint.serial].append(Sample(
                         serial=endpoint.serial,
                         packet=document,
                         received_ns=received_ns,
                         sequence=int(document.get("sequence", 0) or 0),
+                        capture_timeline_ns=capture_timeline_ns,
+                        source_clock_offset_ns=source_clock_offset_ns,
+                        source_host_id=source_host_id,
                     ))
                     last_body_packet_ns[endpoint.serial] = received_ns
                     body_events[endpoint.serial].append(time.monotonic())
@@ -1131,12 +1941,46 @@ def main() -> int:
             )
             if selection is not None:
                 samples, arrival_spread_ms = selection
-                marker = tuple(sorted((sample.serial, sample.sequence) for sample in samples))
-                is_new = marker != last_bundle
+                workspace_samples = samples
+                workspace_excluded: list[int] = []
+                if extrinsics is not None:
+                    workspace_samples = []
+                    for sample in samples:
+                        _strict_inside, forward_x_m = world_forward_in_workspace(
+                            sample,
+                            extrinsics.cameras[sample.serial],
+                            args.workspace_x_min_m,
+                            args.workspace_x_max_m,
+                        )
+                        inside = workspace_membership_with_hysteresis(
+                            forward_x_m,
+                            was_inside=workspace_inside_state[sample.serial],
+                            minimum_x_m=args.workspace_x_min_m,
+                            maximum_x_m=args.workspace_x_max_m,
+                            hysteresis_m=args.workspace_hysteresis_m,
+                        )
+                        workspace_inside_state[sample.serial] = inside
+                        source_metrics[sample.serial]["world_forward_x_m"] = forward_x_m
+                        source_metrics[sample.serial]["workspace_hysteresis_m"] = (
+                            args.workspace_hysteresis_m
+                        )
+                        source_metrics[sample.serial]["workspace_state"] = (
+                            "INSIDE" if inside else "OUTSIDE"
+                        )
+                        if inside:
+                            workspace_samples.append(sample)
+                        else:
+                            workspace_excluded.append(sample.serial)
+                    if len(workspace_samples) < args.minimum_sources:
+                        last_fused_serials = []
                 now = time.monotonic()
-                if is_new:
-                    last_bundle = marker
-                    if record_file is not None and len(samples) == len(endpoints) and now - last_record_at >= 0.98 / args.calibration_max_hz:
+                calibration_marker = tuple(sorted(
+                    (sample.serial, sample.sequence) for sample in samples
+                ))
+                calibration_is_new = calibration_marker != last_calibration_bundle
+                if calibration_is_new:
+                    last_calibration_bundle = calibration_marker
+                    if record_file is not None and len(samples) == len(endpoints) and now - last_record_at >= 0.80 / args.calibration_max_hz:
                         record_file.write(json.dumps(sanitize({
                             "schema": "zed_body38_multihost_calibration_sample/v1",
                             "recorded_unix_ns": time.time_ns(),
@@ -1145,45 +1989,112 @@ def main() -> int:
                         }), ensure_ascii=False, allow_nan=False) + "\n")
                         raw_records += 1
                         last_record_at = now
-                    if extrinsics is not None and now - last_output_at >= 0.98 / args.output_max_hz:
-                        views = [(sample, extrinsics.cameras[sample.serial]) for sample in samples]
-                        status_now_ns = time.time_ns()
-                        online_serials = sorted(serial for serial, stamp in last_any_packet_ns.items() if status_now_ns - stamp <= int(args.source_timeout_ms * 1.0e6))
-                        for sample in samples:
-                            capture_ns = int(sample.packet.get("timestamp_ns", 0) or 0)
-                            trace = sample.packet.get("latency_trace_ns") or {}
-                            if isinstance(trace, dict):
-                                capture_ns = int(trace.get("t0_capture_ns", capture_ns) or capture_ns)
-                            latency_ms = (sample.received_ns - capture_ns) / 1.0e6 if capture_ns else None
-                            source_metrics[sample.serial].update({
-                                "status": last_source_status.get(sample.serial, "BODY"),
-                                "body_fps": event_rate(body_events[sample.serial], now),
-                                "rx_fps": event_rate(any_events[sample.serial], now),
-                                "capture_to_receive_ms": latency_ms,
-                                "last_body_ns": last_body_packet_ns.get(sample.serial),
-                                "source_transport": sample.packet.get("transport_metrics") or {},
-                            })
-                        effective_hz = event_rate(output_events, now)
-                        packet = make_output_packet(
-                            views,
-                            minimum_confidence=args.confidence,
-                            maximum_spread_m=args.max_joint_spread_m,
-                            output_sequence=output_sequence,
-                            reference_serial=extrinsics.reference_serial,
-                            arrival_spread_ms=arrival_spread_ms,
-                            source_metrics=source_metrics,
-                            connected_serials=online_serials,
-                            effective_output_hz=effective_hz,
-                            record_queue_depth=record_queue.qsize(),
-                            record_dropped=record_dropped,
-                            maximum_pose_disagreement_m=args.max_pose_disagreement_m,
-                            maximum_alignment_translation_m=args.max_alignment_translation_m,
+                if (
+                    extrinsics is not None
+                    and len(workspace_samples) >= args.minimum_sources
+                    and now - last_output_at >= 0.80 / args.output_max_hz
+                ):
+                    compensated_samples = temporal_compensate_samples(
+                        workspace_samples,
+                        histories,
+                        minimum_confidence=args.confidence,
+                        maximum_prediction_ms=args.max_temporal_prediction_ms,
+                    )
+                    views = [
+                        (sample, extrinsics.cameras[sample.serial])
+                        for sample in compensated_samples
+                    ]
+                    status_now_ns = time.time_ns()
+                    online_serials = sorted(
+                        serial for serial, stamp in last_any_packet_ns.items()
+                        if status_now_ns - stamp <= int(args.source_timeout_ms * 1.0e6)
+                    )
+                    for sample in compensated_samples:
+                        source_metrics[sample.serial].update({
+                            "status": last_source_status.get(sample.serial, "BODY"),
+                            "body_fps": event_rate(body_events[sample.serial], now),
+                            "rx_fps": event_rate(any_events[sample.serial], now),
+                            "received_fps": event_rate(body_events[sample.serial], now),
+                            "capture_to_receive_ms": source_metrics[sample.serial].get(
+                                "corrected_capture_to_receive_ms"
+                            ),
+                            "received_latency_ms": source_metrics[sample.serial].get(
+                                "corrected_capture_to_receive_ms"
+                            ),
+                            "temporal_prediction_ms": sample.packet.get(
+                                "_fusion_temporal_prediction_ms", 0.0
+                            ),
+                            "last_body_ns": last_body_packet_ns.get(sample.serial),
+                            "source_transport": sample.packet.get("transport_metrics") or {},
+                        })
+                    effective_hz = event_rate(output_events, now)
+                    packet = make_output_packet(
+                        views,
+                        minimum_confidence=args.confidence,
+                        maximum_spread_m=args.max_joint_spread_m,
+                        output_sequence=output_sequence,
+                        reference_serial=extrinsics.reference_serial,
+                        arrival_spread_ms=arrival_spread_ms,
+                        source_metrics=source_metrics,
+                        connected_serials=online_serials,
+                        effective_output_hz=effective_hz,
+                        record_queue_depth=record_queue.qsize(),
+                        record_dropped=record_dropped,
+                        maximum_pose_disagreement_m=args.max_pose_disagreement_m,
+                        maximum_alignment_translation_m=args.max_alignment_translation_m,
+                        maximum_capture_spread_ms=args.max_sync_ms,
+                        workspace_excluded_serials=workspace_excluded,
+                        workspace_x_min_m=args.workspace_x_min_m,
+                        workspace_x_max_m=args.workspace_x_max_m,
+                    )
+                    accepted_views = [
+                        view
+                        for view in (packet.get("multi_camera") or {}).get(
+                            "per_camera", []
+                        )
+                        if view.get("accepted_for_fusion")
+                    ]
+                    output_marker = tuple(sorted(
+                        (
+                            int(view.get("serial_number", 0) or 0),
+                            int(view.get("sequence", 0) or 0),
+                        )
+                        for view in accepted_views
+                    ))
+                    should_emit = bool(
+                        len(accepted_views) >= args.minimum_sources
+                        and output_marker
+                        and output_marker != last_output_bundle
+                    )
+                    if should_emit:
+                        # Stamp as close as possible to JSON serialization and
+                        # sendto(). The GMR bridge uses t2-t0 for the Windows
+                        # perception/Fusion latency.
+                        send_ready_ns = time.time_ns()
+                        packet["latency_trace_ns"]["t2_windows_udp_send_ns"] = send_ready_ns
+                        packet["transport_metrics"]["capture_to_send_ms"] = max(
+                            0.0,
+                            (
+                                send_ready_ns
+                                - int(packet["latency_trace_ns"]["t0_capture_ns"])
+                            )
+                            / 1.0e6,
                         )
                         compact = compact_live_packet(packet)
-                        compact_encoded = json.dumps(compact, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-                        full_encoded = json.dumps(packet, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+                        compact_encoded = json.dumps(
+                            compact, ensure_ascii=False, allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        full_encoded = json.dumps(
+                            packet, ensure_ascii=False, allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
                         if len(compact_encoded) > 60000:
-                            print(f"UYARI: kompakt fusion UDP paketi cok buyuk ({len(compact_encoded)} byte).", file=sys.stderr)
+                            print(
+                                f"UYARI: kompakt fusion UDP paketi cok buyuk "
+                                f"({len(compact_encoded)} byte).",
+                                file=sys.stderr,
+                            )
                         else:
                             # Control is deliberately sent before analysis and disk work.
                             if output_socket is not None:
@@ -1192,20 +2103,37 @@ def main() -> int:
                                     if target_config is None:
                                         continue
                                     target, target_hz = target_config
-                                    if now - last_target_send[target_name] < 0.98 / target_hz:
+                                    if now - last_target_send[target_name] < 0.80 / target_hz:
                                         continue
-                                    outgoing = full_encoded if target_name == "monitor" and len(full_encoded) <= 60000 else compact_encoded
+                                    outgoing = (
+                                        full_encoded
+                                        if target_name == "monitor" and len(full_encoded) <= 60000
+                                        else compact_encoded
+                                    )
                                     try:
                                         output_socket.sendto(outgoing, target)
                                         last_target_send[target_name] = now
                                     except OSError as exc:
-                                        print(f"UYARI: {target_name} UDP gonderilemedi: {exc}", file=sys.stderr)
+                                        print(
+                                            f"UYARI: {target_name} UDP gonderilemedi: {exc}",
+                                            file=sys.stderr,
+                                        )
                             output_sequence += 1
                             fused_packets += 1
                             output_events.append(now)
-                            last_fused_serials = sorted(int(value) for value in (packet.get("fusion") or {}).get("contributing_serials", []))
-                            last_arrival_spread_ms = arrival_spread_ms
+                            last_fused_serials = sorted(
+                                int(value)
+                                for value in (packet.get("fusion") or {}).get(
+                                    "contributing_serials", []
+                                )
+                            )
+                            last_arrival_spread_ms = float(
+                                (packet.get("fusion") or {}).get(
+                                    "capture_spread_ms", arrival_spread_ms
+                                )
+                            )
                             last_output_at = now
+                            last_output_bundle = output_marker
                             if recording:
                                 try:
                                     record_queue.put_nowait(packet)
@@ -1223,6 +2151,8 @@ def main() -> int:
                     "status": last_source_status.get(endpoint.serial, "YOK"),
                     "body_fps": event_rate(body_events[endpoint.serial], now),
                     "rx_fps": event_rate(any_events[endpoint.serial], now),
+                    "received_fps": event_rate(body_events[endpoint.serial], now),
+                    "received_latency_ms": metric.get("corrected_capture_to_receive_ms"),
                     "last_body_ns": last_body_packet_ns.get(endpoint.serial),
                     "preview_age_ms": (status_now_ns - preview_received_ns[endpoint.serial]) / 1.0e6 if endpoint.serial in preview_received_ns else None,
                 })
@@ -1249,7 +2179,14 @@ def main() -> int:
 
             if now - last_status >= 1.0:
                 details = ", ".join(
-                    f"{item.serial}:{last_source_status.get(item.serial, 'YOK')}/body={source_metrics[item.serial].get('body_fps', 0.0):.1f}fps/rx={source_metrics[item.serial].get('rx_fps', 0.0):.1f}fps"
+                    f"{item.serial}:{last_source_status.get(item.serial, 'YOK')}"
+                    f"/body={source_metrics[item.serial].get('body_fps', 0.0):.1f}fps"
+                    f"/rx={source_metrics[item.serial].get('rx_fps', 0.0):.1f}fps"
+                    f"/lat={metric_text(source_metrics[item.serial].get('corrected_capture_to_receive_ms'), 'ms')}"
+                    f"/net={metric_text(source_metrics[item.serial].get('network_queue_ms'), 'ms')}"
+                    f"/clk={metric_text(source_metrics[item.serial].get('clock_offset_estimate_ms'), 'ms')}"
+                    f"/X={metric_text(source_metrics[item.serial].get('world_forward_x_m'), 'm', 2)}"
+                    f"/{source_metrics[item.serial].get('workspace_state', 'BEKLE')}"
                     for item in endpoints
                 )
                 print(

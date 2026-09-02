@@ -12,7 +12,6 @@ import argparse
 import json
 from pathlib import Path
 import sys
-import time
 from typing import Any
 
 import numpy as np
@@ -23,6 +22,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from zed_four_camera_test.calibrate_distributed_body38 import write_world_poses_jsonl
+from zed_four_camera_test.extrinsic_geometry import rebase_camera_transforms
 from zed_four_camera_test.fusion_config_io import read_fusion_configuration_file
 
 
@@ -49,16 +49,27 @@ def convert_configuration(path: Path, *, reference_serial: int) -> tuple[dict[st
     if len(set(serials)) != 4 or reference_serial not in serials:
         raise ValueError("Dort benzersiz seri ve listede bulunan reference-serial gerekli.")
 
-    cameras: dict[str, Any] = {}
+    raw_transforms: dict[int, np.ndarray] = {}
     source_ports: dict[int, int] = {}
     for item in configurations:
         serial = int(item.serial_number)
         transform = np.asarray(item.pose.m, dtype=np.float64)
         if transform.shape != (4, 4) or not np.isfinite(transform).all():
             raise ValueError(f"ZED {serial} pozu gecersiz.")
+        raw_transforms[serial] = transform
+        source_ports[serial] = int(item.communication_parameters.port)
+
+    rebased_transforms = rebase_camera_transforms(
+        raw_transforms, reference_serial
+    )
+    cameras: dict[str, Any] = {}
+    for serial, transform in rebased_transforms.items():
         rotation = transform[:3, :3]
         translation = transform[:3, 3]
-        if not np.isclose(np.linalg.det(rotation), 1.0, atol=0.03):
+        if (
+            not np.isclose(np.linalg.det(rotation), 1.0, atol=0.03)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=0.03)
+        ):
             raise ValueError(f"ZED {serial} rotation matrisi proper rotation degil.")
         cameras[str(serial)] = {
             "rotation_camera_to_world": rotation.tolist(),
@@ -66,13 +77,26 @@ def convert_configuration(path: Path, *, reference_serial: int) -> tuple[dict[st
             "fit": {
                 "source": "zed360_sdk_configuration",
                 "reference": serial == reference_serial,
+                "quality_gate_passed": True,
+                "validation": "zed360_finish_calibration_nonzero_baseline",
             },
         }
-        source_ports[serial] = int(item.communication_parameters.port)
 
     origins = np.asarray([
         cameras[str(serial)]["translation_camera_to_world_m"] for serial in serials
     ], dtype=np.float64)
+    reference_index = serials.index(reference_serial)
+    for index, serial in enumerate(serials):
+        if serial == reference_serial:
+            continue
+        baseline_to_reference = float(
+            np.linalg.norm(origins[index] - origins[reference_index])
+        )
+        if not 0.05 <= baseline_to_reference <= 20.0:
+            raise ValueError(
+                f"ZED {serial} referans baseline'i gecersiz: "
+                f"{baseline_to_reference:.3f} m. Finish Calibration sonucunu secin."
+            )
     maximum_baseline = max(
         float(np.linalg.norm(origins[first] - origins[second]))
         for first in range(len(origins))
@@ -86,10 +110,14 @@ def convert_configuration(path: Path, *, reference_serial: int) -> tuple[dict[st
 
     document = {
         "schema": "zed_body38_distributed_extrinsics/v1",
-        "created_unix_ns": time.time_ns(),
+        # Derive identity metadata from the saved calibration, not from this
+        # conversion run. Re-validating an unchanged ``four json`` file must
+        # keep the runtime SHA256 stable across days/machines.
+        "created_unix_ns": path.stat().st_mtime_ns,
         "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
         "units": "meter",
         "reference_world_serial": reference_serial,
+        "world_frame": "SELECTED_REFERENCE_CAMERA",
         "source_capture": str(path),
         "method": "zed_sdk_read_fusion_configuration_file_from_zed360",
         "cameras": cameras,

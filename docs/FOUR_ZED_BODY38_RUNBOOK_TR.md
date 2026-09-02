@@ -52,7 +52,9 @@ Ana PC'de ayri bir PowerShell'de Isaac/GMR'i ac:
 .\start_g1_isaaclab_live.ps1 -Mode upper_body -ImitationMode kinematic_debug -AcceptNvidiaEula -InputFps 15
 ```
 
-Son olarak ana PC'de 4-ZED fusion ve 2x2 arayuzu ac:
+Son olarak ana PC'de 4-ZED fusion ve 2x2 arayuzu ac. Bu komut `dual json`
+akisiyla ayni sekilde proje kokundeki `four json` klasorunde bulunan tek JSON'u
+otomatik secer; ZED360 ve dogrulanmis BODY_38 extrinsic tiplerini ayirt eder:
 
 ```powershell
 .\start_zed_four_fusion_to_wsl.ps1 -Record -MinimumSources 3 -FusionHz 15 -PreviewHz 10
@@ -80,6 +82,9 @@ kullanma.
 Saglikli bir kayitta `bagli=4/4`, `gecersiz=0`, `drop=0`, fusion FPS yaklasik
 14-15 ve mumkun oldugunca cok `fusion_katki=4/4` beklenir. `cross_view_mpjpe_m`
 dusuk olmalidir; 0.10 m uzeri kalibrasyon/ortak gorus kontrolu gerektirir.
+Her kamera satirinda `lat` saat-ofseti duzeltilmis capture gecikmesi, `net`
+yalniz ag kuyrugu, `clk` iki Windows hostu arasindaki tahmini saat farkidir.
+Laptop satirindaki ham 70 ms degeri tek basina gercek ag gecikmesi sayilmaz.
 
 Alıcı iki ayrı uyum metriği kaydeder:
 
@@ -114,6 +119,22 @@ kenarlar artık USB bozulması diye sürekli yazdırılmaz.
 
 ## Tripod hareket ederse yeniden kalibrasyon
 
+Tercih edilen resmi yol ZED360'da dört kamerayi BODY_18 ile kalibre edip
+`Finish Calibration` sonucunu kaydetmektir. Kaynaklari durdurduktan sonra yeni
+dosyayi proje kokundeki `four json` klasorune `fourkamera.json` adi ile koyun;
+klasorde baska `.json` birakmayin. Runtime BODY_38 olarak devam eder:
+
+```powershell
+Copy-Item -LiteralPath "C:\Program Files (x86)\ZED SDK\tools\fourkamera.json" `
+  -Destination ".\four json\fourkamera.json" -Force
+.\start_zed_four_fusion_to_wsl.ps1 -ValidateCalibrationOnly `
+  -ReferenceSerial 33773329
+```
+
+ZED360 sonucu uretemezse asagidaki BODY_38 tabanli uygulama kalibrasyonu
+fallback'tir. Bu yolda odada yalniz tek kisi bulunmali ve tum ortak hacimde
+45-60 saniye hareketli, cok pozlu kayit alinmalidir.
+
 Kaynaklar acik, Isaac/Rerun/fusion alicisi kapali olsun. Ana PC'de 25-30 saniye
 ham kalibrasyon kaydi al:
 
@@ -124,9 +145,10 @@ ham kalibrasyon kaydi al:
   -Fps 15 -MinimumSources 4
 ```
 
-Ortak gorus alaninda tek kisi, ayaklar sabit ve kollar acik T-poza yakin dursun.
-`ham_kayit` en az 150-240 olunca `Ctrl+C` yap. Sonra extrinsic ve world-pose
-dosyalarini uretip dogrudan aktif et:
+Ortak gorus alaninda tek kisiyle farkli noktalarda T/A pozlari, bukulu dirsek
+ve kollar onde/arkada hareketleri yapin. `ham_kayit` tercihen 400'u gecince
+`Ctrl+C` yap. Sonra extrinsic ve world-pose dosyalarini uretip kalite kapisindan
+gecirin:
 
 ```powershell
 .\zed_four_camera_test\start_distributed_calibration.ps1 `
@@ -143,14 +165,22 @@ config/zed_four/active_distributed_body38_extrinsics.json
 config/zed_four/active_four_camera_world_poses.jsonl
 ```
 
-`start_zed_four_fusion_to_wsl.ps1` sonraki gun bu aktif dosyayi otomatik okur,
-dört seri numarasini ve semayi dogrular. Kameralar/tripodlar hareket etmediyse
-yeniden kalibrasyon gerekmez.
+Varsayilan `start_zed_four_fusion_to_wsl.ps1`, `four json` klasorundeki tek
+ZED360 veya BODY_38 extrinsic dosyasini otomatik okur. Klasoru kullanmadan
+BODY_38 fallback dosyasini acikca vermek de mumkundur:
+
+```powershell
+.\start_zed_four_fusion_to_wsl.ps1 -Record -MinimumSources 3 `
+  -Extrinsics ".\config\zed_four\active_distributed_body38_extrinsics.json"
+```
+
+Kameralar/tripodlar hareket etmediyse yeniden kalibrasyon gerekmez.
 
 Kalibrasyonu yalniz dogrulamak icin:
 
 ```powershell
-.\start_zed_four_fusion_to_wsl.ps1 -ValidateCalibrationOnly
+.\start_zed_four_fusion_to_wsl.ps1 -ValidateCalibrationOnly `
+  -Extrinsics ".\config\zed_four\active_distributed_body38_extrinsics.json"
 ```
 
 ## Kapatma sirasi

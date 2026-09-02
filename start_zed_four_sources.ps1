@@ -11,6 +11,11 @@ param(
     [string]$DepthMode = "neural-light",
     [ValidateSet("strict", "monitor", "off")]
     [string]$FrameIntegrityMode = "off",
+    [ValidateRange(0.3, 20.0)]
+    [double]$DistanceMin = 1.0,
+    [ValidateRange(0.5, 30.0)]
+    [double]$DistanceMax = 5.25,
+    [switch]$CalibrationMode,
     [ValidateRange(1, 10)]
     [double]$PreviewHz = 8,
     [switch]$RecordLocal,
@@ -24,6 +29,9 @@ $deviceProbe = Join-Path $project "zed_g1_skeleton.py"
 $sourceLauncher = Join-Path $project "zed_four_camera_test\start_distributed_source.ps1"
 if (-not (Test-Path -LiteralPath $python)) {
     throw "ZED Python ortami bulunamadi: $python"
+}
+if ($DistanceMax -le $DistanceMin) {
+    throw "DistanceMax, DistanceMin degerinden buyuk olmali."
 }
 
 if ($Role -eq "Laptop") {
@@ -64,10 +72,13 @@ foreach ($definition in $definitions) {
         "-Serial", "$($definition.Serial)",
         "-TargetHost", $bodyTarget,
         "-TargetPort", "$($definition.BodyPort)",
+        "-SourceHostId", $Role,
         "-Fps", "$Fps",
         "-Model", $Model,
         "-DepthMode", $DepthMode,
         "-FrameIntegrityMode", $FrameIntegrityMode,
+        "-DistanceMin", "$DistanceMin",
+        "-DistanceMax", "$DistanceMax",
         "-PreviewHost", $previewTarget,
         "-PreviewPort", "$($definition.PreviewPort)",
         "-PreviewHz", "$PreviewHz"
@@ -78,10 +89,20 @@ foreach ($definition in $definitions) {
     elseif ($RecordLocal) {
         $arguments += "-RecordLocal"
     }
+    if ($CalibrationMode) {
+        $arguments += "-DisableDistanceGate"
+    }
     Start-Process -FilePath "powershell.exe" -ArgumentList $arguments
     Start-Sleep -Milliseconds 800
 }
 
 Write-Host "4-ZED kaynaklari baslatildi | rol=$Role | BODY hedefi=$bodyTarget | JPEG hedefi=$previewTarget"
+if ($CalibrationMode) {
+    Write-Warning "KALIBRASYON MODU: kamera-yerel mesafe kapisi kapali; ortamda yalniz tek kisi olsun."
+}
+else {
+    Write-Host "Kamera-yerel kaba operator kapisi: ${DistanceMin}-${DistanceMax} m (kilitli kiside +/-0.20 m histerezis)"
+    Write-Host "Kesin 2-4 m operator hacmi ana PC'de, kalibre edilmis ortak dunya koordinatinda uygulanir."
+}
 Write-Host "Seriler: $((@($definitions | ForEach-Object { $_.Serial })) -join ', ')"
 Write-Host "Her kaynak penceresini acik birakin. Operator kilidi gerekirse yalniz ilgili kaynak penceresinde R tusuna basin."

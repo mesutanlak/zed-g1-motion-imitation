@@ -80,12 +80,22 @@ def main() -> int:
     view_counts: Counter[int] = Counter()
     serial_contributions: Counter[int] = Counter()
     source_fps: dict[int, list[float]] = defaultdict(list)
+    source_latency: dict[int, list[float]] = defaultdict(list)
+    source_raw_clock_mixed: dict[int, list[float]] = defaultdict(list)
+    source_clock_offset: dict[int, list[float]] = defaultdict(list)
+    source_network_queue: dict[int, list[float]] = defaultdict(list)
+    source_prediction: dict[int, list[float]] = defaultdict(list)
     sync_ms: list[float] = []
+    selection_sync_ms: list[float] = []
     mpjpe_m: list[float] = []
     p95_error_m: list[float] = []
     aligned_mpjpe_m: list[float] = []
     capture_send_ms: list[float] = []
     record_drops: list[float] = []
+    left_clear_views: list[float] = []
+    right_clear_views: list[float] = []
+    workspace_excluded_frames = 0
+    workspace_excluded_serials: Counter[int] = Counter()
 
     for packet in packets:
         multi = packet.get("multi_camera") or {}
@@ -95,6 +105,17 @@ def main() -> int:
         value = finite_number(multi.get("camera_timestamp_delta_ms"))
         if value is not None:
             sync_ms.append(value)
+        fusion_detail = packet.get("fusion") or {}
+        value = finite_number(fusion_detail.get("selection_capture_spread_ms"))
+        if value is not None:
+            selection_sync_ms.append(value)
+        excluded_workspace = [
+            int(value)
+            for value in multi.get("workspace_excluded_serials") or []
+        ]
+        if excluded_workspace:
+            workspace_excluded_frames += 1
+            workspace_excluded_serials.update(excluded_workspace)
         agreement = multi.get("cross_view_agreement") or {}
         value = finite_number(agreement.get("mpjpe_m"))
         if value is not None:
@@ -107,9 +128,26 @@ def main() -> int:
         if value is not None:
             aligned_mpjpe_m.append(value)
         for serial_text, metric in ((multi.get("fusion_metrics") or {}).get("per_camera") or {}).items():
-            value = finite_number((metric or {}).get("body_fps"))
+            metric = metric or {}
+            serial = int(serial_text)
+            value = finite_number(metric.get("body_fps"))
             if value is not None:
-                source_fps[int(serial_text)].append(value)
+                source_fps[serial].append(value)
+            for field, target in (
+                ("corrected_capture_to_receive_ms", source_latency),
+                ("raw_clock_mixed_capture_to_receive_ms", source_raw_clock_mixed),
+                ("clock_offset_estimate_ms", source_clock_offset),
+                ("network_queue_ms", source_network_queue),
+                ("temporal_prediction_ms", source_prediction),
+            ):
+                value = finite_number(metric.get(field))
+                if value is not None:
+                    target[serial].append(value)
+        arm_evidence = multi.get("arm_evidence") or {}
+        for side, target in (("left", left_clear_views), ("right", right_clear_views)):
+            value = finite_number((arm_evidence.get(side) or {}).get("reliable_clear_views"))
+            if value is not None:
+                target.append(value)
         transport = packet.get("transport_metrics") or {}
         value = finite_number(transport.get("capture_to_send_ms"))
         if value is not None:
@@ -128,6 +166,8 @@ def main() -> int:
         )
     )
     print(f"DOSYA: {path}")
+    if metadata:
+        print(f"KALIBRASYON: {metadata.get('extrinsics_path') or 'metadata yok'}")
     print(
         f"FUSION: kare={total} duvar_suresi={duration_s:.2f}s "
         f"duvar_hizi={measured_hz:.2f} fps aktif_sure={active_duration_s:.2f}s "
@@ -142,12 +182,23 @@ def main() -> int:
         print(
             f"ZED {serial}: katki={serial_contributions[serial]}/{total} "
             f"({100.0 * serial_contributions[serial] / total:.1f}%) "
-            f"ortalama_BODY_fps={format_metric(mean_fps)}"
+            f"ortalama_BODY_fps={format_metric(mean_fps)} "
+            f"duzeltilmis_gecikme_p50={format_metric(percentile(source_latency[serial], 0.50), 'ms')} "
+            f"ag_kuyruk_p50={format_metric(percentile(source_network_queue[serial], 0.50), 'ms')} "
+            f"clock_offset_p50={format_metric(percentile(source_clock_offset[serial], 0.50), 'ms')} "
+            f"tahmin_p50={format_metric(percentile(source_prediction[serial], 0.50), 'ms')}"
         )
     print(
         "SENKRON: "
-        f"p50={format_metric(percentile(sync_ms, 0.50), 'ms')} "
-        f"p95={format_metric(percentile(sync_ms, 0.95), 'ms')}"
+        f"katkici_p50={format_metric(percentile(sync_ms, 0.50), 'ms')} "
+        f"katkici_p95={format_metric(percentile(sync_ms, 0.95), 'ms')} "
+        f"secim_p95={format_metric(percentile(selection_sync_ms, 0.95), 'ms')}"
+    )
+    print(
+        "CALISMA_ALANI: "
+        f"dislanan_kare={workspace_excluded_frames}/{total} "
+        f"({100.0 * workspace_excluded_frames / total:.1f}%) "
+        f"kamera_sayaci={dict(sorted(workspace_excluded_serials.items())) or '{}'}"
     )
     print(
         "CROSS_VIEW: "
@@ -167,6 +218,12 @@ def main() -> int:
         f"p95={format_metric(percentile(capture_send_ms, 0.95), 'ms')} "
         f"record_drop_max={int(max(record_drops, default=0.0))}"
     )
+    if left_clear_views or right_clear_views:
+        print(
+            "KOL_GORUSU: "
+            f"sol_temiz_kamera_p50={format_metric(percentile(left_clear_views, 0.50))} "
+            f"sag_temiz_kamera_p50={format_metric(percentile(right_clear_views, 0.50))}"
+        )
     return 0
 
 

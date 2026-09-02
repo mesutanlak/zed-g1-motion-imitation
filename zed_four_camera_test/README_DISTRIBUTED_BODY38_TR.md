@@ -12,10 +12,12 @@ ZED 39504762 + ZED 34760587 -> laptop USB 3 hub -> laptop
 ZED 33773329 + ZED 31571870 -> ana PC USB -------+-> ana PC alici/fusion
 ```
 
-Bu yol ZED360/`sl.Fusion` Network Workflow'u kullanmaz. Bu iki hostta ortaya
-çıkan `WRONG BODY FORMAT` hatasını atlar; ancak ZED'in **BODY_38** algılamasını
-korur ve sonuçta mevcut G1 alıcılarının bildiği `zed_body38_live/v1` UDP paketi
-üretir. Fiziksel robota komut göndermez.
+Canlı veri yolu `sl.Fusion` Network Workflow'unu kullanmaz; iki hostta ortaya
+çıkan `WRONG BODY FORMAT` hatasını atlar. Kamera pozlarını tercihen ZED360
+`Finish Calibration` JSON'undan (`four json` klasörü), gerekirse BODY_38
+fallback kalibrasyonundan alır. ZED'in **BODY_38** algılamasını korur ve mevcut
+G1 alıcılarının bildiği `zed_body38_live/v1` UDP paketi üretir. Fiziksel robota
+komut göndermez.
 
 ## Ön koşullar
 
@@ -82,28 +84,27 @@ o kamerayı tutan eski uygulamayı kapat ve yalnız o komutu yeniden başlat.
 
 Kameraları dört köşeye koy; her biri operatörün orta çalışma alanını görsün.
 En az iki kameranın her omuzu, dirseği ve bileği görmesi gerekir. Tripodlar
-kalibrasyon tamamlanana kadar hareket etmemeli.
+kalibrasyon tamamlanana kadar hareket etmemeli. Kalibrasyon için dört manuel
+kaynak yerine iki hostta `start_zed_four_sources.ps1 ... -CalibrationMode`
+kullanın; odada yalnız tek kişi bulunsun.
 
 Ana PC'de beşinci PowerShell penceresinde aşağıdaki alıcıyı aç:
 
 ```powershell
 .\zed_four_camera_test\start_distributed_receiver.ps1 `
   -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
-  -CalibrationRecord ".\recordings\four_body38_static_calibration.jsonl" `
-  -Fps 15 -MinimumSources 4
+  -CalibrationRecord ".\recordings\four_body38_static_calibration_v2.jsonl" `
+  -Fps 15 -MinimumSources 4 -MaxSyncMs 80 -SourceTimeoutMs 250
 ```
 
 Konsolda `DURUM | kaynak=4/4 [...] | ham_kayit=...` görmelisin. `ham_kayit`
 sayısı artıyorsa ağ ve dört BODY_38 kaynağı doğrudur.
 
-Ortadaki ortak görüş alanında 25-30 saniye boyunca T-pozda veya kollar hafif
-açık, **olabildiğince sabit** dur. Bu sırada yürüme, dönme ya da tripod
-oynatma. Sonra ana PC alıcısında `Ctrl+C` yap. Dört kaynak penceresi açık
-kalsın.
-
-Bu kalibrasyon, operatörün aynı anki iskelet noktalarından her kamerayı
-`33773329` kamera koordinatına dönüştürür. Bu yüzden kalibrasyon sırasında
-hareket etmek kaliteyi düşürür.
+45-60 saniye ortak hacimde yavaş yürüyün; farklı grid noktalarında 1-2 saniye
+A/T pozu, kollar önde ve bükülü dirsek pozları verin. Tüm kameralar aynı kişiyi
+ve mümkün olduğunca tam bedeni görmelidir. `ham_kayit` tercihen 400'ü geçince
+alıcıyı ve dört kaynağı `Ctrl+C` ile kapatın. Kısa tek-nokta T-poz kaydı
+extrinsic için yeterli geometrik çeşitlilik sağlamaz.
 
 ## C. Extrinsic dosyasını üret
 
@@ -111,30 +112,32 @@ Ana PC'de:
 
 ```powershell
 .\zed_four_camera_test\start_distributed_calibration.ps1 `
-  -CapturePath ".\recordings\four_body38_static_calibration.jsonl" `
-  -OutputPath ".\config\zed_four\distributed_body38_extrinsics.json" `
-  -WorldPosesJsonl ".\config\zed_four\four_camera_world_poses.jsonl" `
-  -ReferenceSerial 33773329
+  -CapturePath ".\recordings\four_body38_static_calibration_v2.jsonl" `
+  -OutputPath ".\config\zed_four\distributed_body38_extrinsics_v2.json" `
+  -ReferenceSerial 33773329 -Activate
 ```
 
-Her referans dışı kamera için `rms` ve `p95` değerleri yazılır. Hedef, RMS'in
-`0.10 m` veya daha düşük olmasıdır. `0.16 m` üstünde dosya kasıtlı olarak
-oluşturulmaz; tripod açılarını/ortak görünümü düzeltip B adımını tekrarla.
-Kamera veya tripod sonradan hareket ederse bu JSON geçersiz olur.
+Her referans dışı kamera için örnek, inlier oranı, `rms`, `p95` ve pelvis p95
+yazılır. En az 60 örnek, 300 inlier, %25 inlier oranı ve pelvis p95 `<=0.25 m`
+sağlanmazsa dosya kasıtlı olarak oluşturulmaz. Tripod açılarını/ortak görünümü
+düzeltip B adımını tekrarlayın. Kamera veya tripod sonradan hareket ederse bu
+JSON geçersiz olur.
 
 ## D. Dört kamera BODY_38 birleşimini test et
 
-Kaynak dört pencere açıkken, B adımında kapattığın alıcıyı bu defa kalibrasyon
-dosyasıyla tekrar çalıştır:
+İki hostta kaynakları `start_zed_four_sources.ps1` ile bu kez
+`-CalibrationMode` olmadan yeniden başlatın. Böylece kamera-yerel kaba kapı
+etkinleşir. Sonra alıcıyı aktif kalibrasyonla çalıştırın:
 
 ```powershell
 .\zed_four_camera_test\start_distributed_receiver.ps1 `
   -Source "39504762:16000","31571870:16002","33773329:16004","34760587:16006" `
-  -Extrinsics ".\config\zed_four\distributed_body38_extrinsics.json" `
-  -Fps 15 -MinimumSources 4
+  -Extrinsics ".\config\zed_four\active_distributed_body38_extrinsics.json" `
+  -Fps 15 -MinimumSources 4 -MaxSyncMs 80 -SourceTimeoutMs 250 `
+  -MaxAlignmentTranslationM 0.25 -WorkspaceXMinM 2 -WorkspaceXMaxM 4
 ```
 
-`fusion_cikis` sayısı yaklaşık 15/s artmalıdır. Bu ilk kabul testinde birleşik
+`fusion_cikis` sayısı yaklaşık 14-15/s artmalıdır. Bu ilk kabul testinde birleşik
 veri henüz G1'e yönlendirilmez. Ortada yürüyüp, kolları sırayla kameraların
 görmediği tarafa çevir: bilekler için `per_joint_contributions` birden fazla
 kamerada artar; tek kamera kaybolsa diğer üçünden takip devam eder.
@@ -163,7 +166,8 @@ başlatma.
   yoktur. Kameraları ortak kesişime çevir, ortada görünür ol ve her kaynakta
   BODY_38 kilidinin oluşması için birkaç saniye bekle.
 - Kalibrasyon RMS yüksek: kameralar/tripodlar oynamış olabilir veya aynı anda
-  farklı pozlar eşleştirilmiştir. Yeni ham kayıt alırken sabit dur.
+  farklı kişiler eşleştirilmiştir. Odada tek kişiyle ortak hacmi yavaşça
+  dolaşarak yeni ham kayıt alın.
 - USB yırtılması, FPS düşüşü: önce yalnız sorunlu kamerayı doğrudan USB 3
   porta bağlayıp ZED Diagnostic ile doğrula. ZED360/UDP kodu bozuk görüntüyü
   düzeltemez.
