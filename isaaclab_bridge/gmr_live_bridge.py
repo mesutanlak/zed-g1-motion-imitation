@@ -64,6 +64,14 @@ MAX_CUTOFF_HZ_23 = np.asarray(
     [6, 6, 6, 6, 5, 5] * 2 + [5] + [8, 8, 8, 10, 7] * 2,
     dtype=np.float64,
 )
+# Sensor/GMR target changes below roughly one degree at the shoulder/elbow and
+# two degrees at the wrist are imperceptible as intentional operator motion,
+# but they visibly shake a position-controlled simulated robot.  The deadband
+# is applied after IK in joint space, preserving rigid human limb geometry.
+JOINT_DEADBAND_RAD_23 = np.asarray(
+    [0.0] * 12 + [0.012] + [0.018, 0.018, 0.018, 0.022, 0.032] * 2,
+    dtype=np.float64,
+)
 UPPER_REQUIRED = {
     "pelvis",
     "spine3",
@@ -108,6 +116,36 @@ HUMAN_RETARGET_EDGES = (
 )
 
 
+def calibration_ready_for_control(frame: dict) -> bool:
+    """Return whether a live packet carries a usable operator profile.
+
+    Four-camera packets prior to the distributed calibration-gate fix marked
+    the aggregate as ACQUIRING when *any* contributing view was not READY.
+    The selected metadata profile was nevertheless a complete READY profile
+    from another view.  Accept that narrowly identified application-level
+    fusion packet so existing recordings remain replayable; ordinary
+    single-camera packets still require an explicit READY state.
+    """
+    calibration = frame.get("calibration") or {}
+    profile = calibration.get("profile")
+    if calibration.get("state") == "READY":
+        # Preserve the legacy/single-camera contract: READY was historically
+        # the complete gate, including for old recordings with an empty
+        # serialized profile.
+        return True
+    fusion = frame.get("fusion") or {}
+    ready_sources = calibration.get("ready_profile_source_serials") or (
+        calibration.get("ready_source_serials") or []
+    )
+    return bool(
+        frame.get("schema") == "zed_body38_live/v1"
+        and frame.get("source_host_id") == "fusion_receiver"
+        and fusion.get("implementation") == "application_level_weighted_body38/v1"
+        and profile
+        and ready_sources
+    )
+
+
 def pelvis_left_right_swap_risk(frame: dict) -> bool:
     """Check anatomical shoulder order in the operator pelvis frame.
 
@@ -149,11 +187,13 @@ class AdaptiveJointFilter:
         max_cutoff_hz: float,
         velocity_beta: float,
         derivative_cutoff_hz: float,
+        deadband_rad: float | np.ndarray = 0.0,
     ) -> None:
         self.min_cutoff_hz = np.asarray(min_cutoff_hz, dtype=np.float64)
         self.max_cutoff_hz = np.asarray(max_cutoff_hz, dtype=np.float64)
         self.velocity_beta = float(velocity_beta)
         self.derivative_cutoff_hz = float(derivative_cutoff_hz)
+        self.deadband_rad = np.asarray(deadband_rad, dtype=np.float64)
         self.value: np.ndarray | None = None
         self.previous_raw: np.ndarray | None = None
         self.velocity: np.ndarray | None = None
@@ -182,7 +222,14 @@ class AdaptiveJointFilter:
             ).astype(np.float64).copy()
             return self.value.copy()
 
-        raw_velocity = (raw - self.previous_raw) / dt
+        deadband = np.broadcast_to(self.deadband_rad, raw.shape)
+        error = raw - self.value
+        effective_raw = np.where(
+            np.abs(error) <= deadband,
+            self.value,
+            raw - np.sign(error) * deadband,
+        )
+        raw_velocity = (effective_raw - self.previous_raw) / dt
         derivative_alpha = self._alpha(self.derivative_cutoff_hz, dt)
         self.velocity += derivative_alpha * (raw_velocity - self.velocity)
         cutoff = np.clip(
@@ -191,10 +238,10 @@ class AdaptiveJointFilter:
             self.max_cutoff_hz,
         )
         alpha = self._alpha(cutoff, dt)
-        candidate = self.value + alpha * (raw - self.value)
+        candidate = self.value + alpha * (effective_raw - self.value)
         max_delta = np.asarray(velocity_limit, dtype=np.float64) * dt
         self.value += np.clip(candidate - self.value, -max_delta, max_delta)
-        self.previous_raw = raw.copy()
+        self.previous_raw = effective_raw.copy()
         self.last_cutoff_hz = cutoff
         return self.value.copy()
 
@@ -435,6 +482,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-cutoff-hz", type=float, default=2.0)
     parser.add_argument("--velocity-beta", type=float, default=1.2)
     parser.add_argument("--derivative-cutoff-hz", type=float, default=1.0)
+    parser.add_argument(
+        "--stationary-deadband-scale", type=float, default=1.0,
+        help=(
+            "Sabit operator sallantisini bastiran eklem deadband katsayisi; "
+            "0 korumayi kapatir, 1 onerilen dort-kamera ayaridir."
+        ),
+    )
     parser.add_argument("--input-fps", type=float, default=60.0)
     parser.add_argument(
         "--require-calibration",
@@ -480,6 +534,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mirror-workers", type=int, default=4)
     parser.add_argument(
         "--mode", choices=("upper_body", "whole_body"), default="upper_body"
+    )
+    parser.add_argument(
+        "--restrict-backward-arms",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply the legacy +0.75 rad shoulder-pitch rear-reach cap. "
+            "Disabled by default; joint limits and the continuous torso/body "
+            "collision barrier still bound rear-arm motion."
+        ),
     )
     parser.add_argument("--stale-after", type=float, default=0.35)
     return parser.parse_args()
@@ -645,7 +709,9 @@ def main() -> int:
     constrain_gmr_to_23dof(
         gmr,
         lock_waist_yaw=args.mode == "upper_body",
-        restrict_backward_arms=args.mode == "upper_body",
+        restrict_backward_arms=(
+            args.mode == "upper_body" and args.restrict_backward_arms
+        ),
     )
     task_names = list(gmr.ik_match_table1.keys())
     elbow_regularizer = AnatomicalElbowRegularizer(
@@ -695,13 +761,23 @@ def main() -> int:
     )
 
     nyquist_safe_hz = 0.45 * float(args.input_fps)
-    max_cutoff_hz = np.minimum(MAX_CUTOFF_HZ_23, nyquist_safe_hz)
-    min_cutoff_hz = np.minimum(MIN_CUTOFF_HZ_23, max_cutoff_hz)
+    max_cutoff_hz = np.minimum(
+        np.minimum(MAX_CUTOFF_HZ_23, max(0.1, float(args.cutoff_hz))),
+        nyquist_safe_hz,
+    )
+    min_cutoff_hz = np.minimum(
+        np.minimum(MIN_CUTOFF_HZ_23, max(0.1, float(args.min_cutoff_hz))),
+        max_cutoff_hz,
+    )
     joint_filter = AdaptiveJointFilter(
         min_cutoff_hz=np.maximum(0.1, min_cutoff_hz),
         max_cutoff_hz=np.maximum(0.1, max_cutoff_hz),
         velocity_beta=max(0.0, float(args.velocity_beta)),
         derivative_cutoff_hz=max(0.1, float(args.derivative_cutoff_hz)),
+        deadband_rad=(
+            JOINT_DEADBAND_RAD_23
+            * max(0.0, float(args.stationary_deadband_scale))
+        ),
     )
     # Simulation-only tuning: body-origin Cartesian tasks have a measurable
     # residual even for a useful solution. The former 0.10 m warning reduced
@@ -836,9 +912,7 @@ def main() -> int:
                 receive_timestamp_ns,
                 windows_to_wsl_ms,
             )
-            calibration_ready = (
-                (frame.get("calibration") or {}).get("state") == "READY"
-            )
+            calibration_ready = calibration_ready_for_control(frame)
             operator_locked = (
                 (frame.get("operator_selection") or {}).get("state") == "LOCKED"
             )
@@ -1295,6 +1369,9 @@ def main() -> int:
                     "filter_mode": "adaptive_one_euro",
                     "min_cutoff_hz_by_joint": joint_filter.min_cutoff_hz.tolist(),
                     "max_cutoff_hz_by_joint": joint_filter.max_cutoff_hz.tolist(),
+                    "deadband_rad_by_joint": np.broadcast_to(
+                        joint_filter.deadband_rad, (23,)
+                    ).tolist(),
                     "mean_active_cutoff_hz": (
                         float(np.mean(joint_filter.last_cutoff_hz))
                         if joint_filter.last_cutoff_hz is not None
@@ -1361,6 +1438,7 @@ def main() -> int:
                     "limb_direction_error_deg": limb_direction_error,
                     "end_effector_normalized_error": end_effector_error,
                     "gmr_velocity_limit": args.gmr_velocity_limit,
+                    "backward_arm_restriction": args.restrict_backward_arms,
                     "system_transport": packet_metrics.snapshot(),
                 },
             }

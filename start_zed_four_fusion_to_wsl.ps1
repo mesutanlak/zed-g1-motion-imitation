@@ -10,6 +10,10 @@ param(
     [int]$FusionHz = 15,
     [ValidateRange(1, 15)]
     [int]$PreviewHz = 10,
+    [ValidateRange(0, 80)]
+    [double]$PreferredFullSetSpreadMs = 40,
+    [ValidateRange(0, 50)]
+    [double]$FullSetWaitMs = 20,
     [ValidateRange(0.0, 20.0)]
     [double]$WorkspaceXMinM = 2.0,
     [ValidateRange(0.1, 30.0)]
@@ -167,6 +171,8 @@ $receiverArguments = @{
     Fps = $FusionHz
     MinimumSources = $MinimumSources
     MaxSyncMs = 80
+    PreferredFullSetSpreadMs = $PreferredFullSetSpreadMs
+    FullSetWaitMs = $FullSetWaitMs
     SourceTimeoutMs = 250
     MaxTemporalPredictionMs = 70
     MaxAlignmentTranslationM = 0.25
@@ -193,7 +199,7 @@ if ($Record) { $receiverArguments.Record = $true }
 if ($Headless) { $receiverArguments.Headless = $true }
 
 Write-Host "GMR/Isaac: ${wslAddress}:15050 | Rerun: ${AnalysisHost}:15052 | ROS: ${wslAddress}:15054"
-Write-Host "Fusion: en az $MinimumSources/4 taze kamera, azami ${FusionHz}Hz | arayuz=${PreviewHz}Hz"
+Write-Host "Fusion: en az $MinimumSources/4 taze kamera, azami ${FusionHz}Hz | arayuz=${PreviewHz}Hz | dortlu tercih <=${PreferredFullSetSpreadMs}ms, bekleme <=${FullSetWaitMs}ms"
 Write-Host "Operator ortak-dunya kapisi: referans kamera X=${WorkspaceXMinM}-${WorkspaceXMaxM} m | cikis toleransi=${WorkspaceHysteresisM}m"
 Write-Host "JSONL klasoru: $(Join-Path $project 'recordings')"
 Set-Location -LiteralPath $project

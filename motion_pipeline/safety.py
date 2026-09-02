@@ -68,6 +68,7 @@ class G1FeasibilityFilter:
         yellow_blend: float = 0.55,
         orange_return_after_s: float | None = None,
         orange_return_tau_s: float = 0.80,
+        arm_blend_recovery_tau_s: float = 0.18,
     ) -> None:
         self.nominal = np.zeros(23) if nominal_q is None else np.asarray(list(nominal_q), dtype=np.float64)
         if self.nominal.shape != (23,):
@@ -82,11 +83,15 @@ class G1FeasibilityFilter:
             else float(max(0.0, orange_return_after_s))
         )
         self.orange_return_tau_s = float(max(0.05, orange_return_tau_s))
+        self.arm_blend_recovery_tau_s = float(
+            max(0.02, arm_blend_recovery_tau_s)
+        )
         self.safe_q: np.ndarray | None = None
         self.velocity = np.zeros(23, dtype=np.float64)
         self.last_reliable: np.ndarray | None = None
         self.orange_elapsed_s = 0.0
         self.arm_collision_elapsed_s = {"left": 0.0, "right": 0.0}
+        self.arm_blend_state = {"left": 1.0, "right": 1.0}
 
     def reset(self) -> None:
         self.safe_q = None
@@ -94,6 +99,7 @@ class G1FeasibilityFilter:
         self.last_reliable = None
         self.orange_elapsed_s = 0.0
         self.arm_collision_elapsed_s = {"left": 0.0, "right": 0.0}
+        self.arm_blend_state = {"left": 1.0, "right": 1.0}
 
     @staticmethod
     def _collision_blend(margin_m: float) -> float:
@@ -232,7 +238,22 @@ class G1FeasibilityFilter:
             quality_blend = float(np.clip(
                 (arm_quality_blend or {}).get(side, 1.0), 0.0, 1.0
             ))
-            side_blend = min(collision_blend, quality_blend)
+            requested_blend = min(collision_blend, quality_blend)
+            previous_blend = self.arm_blend_state[side]
+            if requested_blend <= previous_blend:
+                # Enter the safer state immediately.
+                side_blend = requested_blend
+            else:
+                # Recover gradually after a noisy capsule/visibility boundary
+                # clears.  This hysteresis prevents frame-to-frame 0.3 <-> 1
+                # gain chatter from shaking an otherwise stationary arm.
+                recovery_alpha = 1.0 - np.exp(
+                    -dt / self.arm_blend_recovery_tau_s
+                )
+                side_blend = previous_blend + recovery_alpha * (
+                    requested_blend - previous_blend
+                )
+            self.arm_blend_state[side] = float(side_blend)
             arm_blend[side] = side_blend
             if side_blend < 1.0 and motion_level != SafetyLevel.ORANGE:
                 target[indices] = base[indices] + side_blend * (

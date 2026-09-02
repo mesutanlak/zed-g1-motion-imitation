@@ -549,6 +549,26 @@ def test_occlusion_quality_governor_degrades_only_affected_arm() -> None:
     assert np.linalg.norm(result.safe_q[18:23]) > np.linalg.norm(result.safe_q[13:18])
 
 
+def test_arm_quality_blend_recovers_smoothly_without_gain_chatter() -> None:
+    filter_ = G1FeasibilityFilter(arm_blend_recovery_tau_s=0.18)
+    command = np.zeros(23)
+    command[13] = 0.2
+    degraded = filter_.update(
+        command,
+        1.0 / 60.0,
+        arm_reasons={"left": ["left_wrist_occluded"]},
+        arm_quality_blend={"left": 0.30, "right": 1.0},
+    )
+    assert degraded.arm_blend["left"] == 0.30
+
+    recovered = filter_.update(
+        command,
+        1.0 / 60.0,
+        arm_collision_margins={"left": 0.10, "right": 0.10},
+    )
+    assert 0.30 < recovered.arm_blend["left"] < 1.0
+
+
 def test_continuation_rescue_reduces_arm_task_error() -> None:
     rescue = MirrorContinuationRescue(
         residual_trigger_m=0.01,

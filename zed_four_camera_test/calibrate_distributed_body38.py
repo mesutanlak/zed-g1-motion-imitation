@@ -51,6 +51,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-capture-samples", type=int, default=60)
     parser.add_argument("--max-pelvis-p95-m", type=float, default=0.25)
     parser.add_argument(
+        "--min-pelvis-motion-m", type=float, default=0.10,
+        help=(
+            "Referans operator pelvisinin kalibrasyon boyunca yapmasi gereken "
+            "asgari saglam hareket genisligi. Yanlis/sabit kisi kilidini yakalar."
+        ),
+    )
+    parser.add_argument(
+        "--min-pelvis-motion-ratio", type=float, default=0.60,
+        help="Kamera ve referans pelvis hareket genisliklerinin asgari orani.",
+    )
+    parser.add_argument(
+        "--min-pelvis-trajectory-correlation", type=float, default=0.75,
+        help="Donusturulmus kamera ile referans pelvis yollari arasindaki asgari korelasyon.",
+    )
+    parser.add_argument(
         "--world-poses-jsonl",
         type=Path,
         default=None,
@@ -226,6 +241,59 @@ def collect_correspondences(
     )
 
 
+def pelvis_trajectory_metrics(
+    pelvis_pairs: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> dict[str, float]:
+    """Measure whether both cameras tracked the same moving pelvis.
+
+    A rigid fit over many BODY_38 joints can appear numerically acceptable
+    even when one camera stays locked to a different, mostly stationary
+    person.  Translation/rotation cannot change trajectory scale; comparing
+    the centered pelvis paths therefore catches that cross-person failure.
+    """
+    if len(pelvis_pairs) < 3:
+        return {
+            "pelvis_source_motion_m": 0.0,
+            "pelvis_reference_motion_m": 0.0,
+            "pelvis_motion_scale_ratio": 0.0,
+            "pelvis_trajectory_correlation": 0.0,
+        }
+    source = pelvis_pairs[:, 0] @ rotation.T + translation
+    reference = pelvis_pairs[:, 1]
+
+    def robust_motion_extent(values: np.ndarray) -> float:
+        centered_radius = np.linalg.norm(
+            values - np.median(values, axis=0), axis=1
+        )
+        return float(
+            np.percentile(centered_radius, 95)
+            - np.percentile(centered_radius, 5)
+        )
+
+    source_motion = robust_motion_extent(source)
+    reference_motion = robust_motion_extent(reference)
+    maximum_motion = max(source_motion, reference_motion, 1.0e-9)
+    motion_ratio = min(source_motion, reference_motion) / maximum_motion
+    source_centered = source - np.mean(source, axis=0)
+    reference_centered = reference - np.mean(reference, axis=0)
+    denominator = float(
+        np.linalg.norm(source_centered) * np.linalg.norm(reference_centered)
+    )
+    correlation = (
+        float(np.sum(source_centered * reference_centered) / denominator)
+        if denominator > 1.0e-9
+        else 0.0
+    )
+    return {
+        "pelvis_source_motion_m": source_motion,
+        "pelvis_reference_motion_m": reference_motion,
+        "pelvis_motion_scale_ratio": float(np.clip(motion_ratio, 0.0, 1.0)),
+        "pelvis_trajectory_correlation": float(np.clip(correlation, -1.0, 1.0)),
+    }
+
+
 def main() -> int:
     args = parse_args()
     if (
@@ -235,6 +303,9 @@ def main() -> int:
         or args.min_inlier_points < 12
         or args.min_capture_samples < 1
         or args.max_pelvis_p95_m <= 0.0
+        or args.min_pelvis_motion_m <= 0.0
+        or not 0.0 < args.min_pelvis_motion_ratio <= 1.0
+        or not -1.0 <= args.min_pelvis_trajectory_correlation <= 1.0
     ):
         print("HATA: confidence veya max-residual-m gecersiz.", file=sys.stderr)
         return 2
@@ -290,12 +361,17 @@ def main() -> int:
         )
         pelvis_median_m = float(np.median(pelvis_errors)) if pelvis_errors.size else math.inf
         pelvis_p95_m = float(np.percentile(pelvis_errors, 95)) if pelvis_errors.size else math.inf
+        trajectory = pelvis_trajectory_metrics(pelvis_pairs, rotation, translation)
         quality_ok = bool(
             used_samples >= args.min_capture_samples
             and int(metrics["paired_keypoints"]) >= args.min_inlier_points
             and inlier_ratio >= args.min_inlier_ratio
             and float(metrics["rms_m"]) <= args.max_residual_m
             and pelvis_p95_m <= args.max_pelvis_p95_m
+            and trajectory["pelvis_reference_motion_m"] >= args.min_pelvis_motion_m
+            and trajectory["pelvis_motion_scale_ratio"] >= args.min_pelvis_motion_ratio
+            and trajectory["pelvis_trajectory_correlation"]
+            >= args.min_pelvis_trajectory_correlation
         )
         fit_metrics = {
             "capture_samples": used_samples,
@@ -305,6 +381,7 @@ def main() -> int:
             "pelvis_median_m": pelvis_median_m,
             "pelvis_p95_m": pelvis_p95_m,
             "quality_gate_passed": quality_ok,
+            **trajectory,
             **metrics,
         }
         cameras[str(serial)] = {
@@ -316,14 +393,21 @@ def main() -> int:
             f"ZED {serial} -> {args.reference_serial} | kare={used_samples} "
             f"nokta={metrics['paired_keypoints']}/{candidate_points} "
             f"({100.0 * inlier_ratio:.1f}%) | rms={metrics['rms_m']:.3f}m "
-            f"p95={metrics['p95_m']:.3f}m | pelvis_p95={pelvis_p95_m:.3f}m"
+            f"p95={metrics['p95_m']:.3f}m | pelvis_p95={pelvis_p95_m:.3f}m "
+            f"| pelvis_hareket={trajectory['pelvis_source_motion_m']:.3f}/"
+            f"{trajectory['pelvis_reference_motion_m']:.3f}m "
+            f"oran={trajectory['pelvis_motion_scale_ratio']:.2f} "
+            f"korelasyon={trajectory['pelvis_trajectory_correlation']:.2f}"
         )
         if not quality_ok:
             print(
                 f"HATA: ZED {serial} kalibrasyon kalite kapisini gecemedi "
                 f"(en az {args.min_capture_samples} kare, {args.min_inlier_points} nokta, "
                 f"%{100.0 * args.min_inlier_ratio:.0f} inlier, pelvis p95 <= "
-                f"{args.max_pelvis_p95_m:.2f} m gerekli).",
+                f"{args.max_pelvis_p95_m:.2f} m, referans pelvis hareketi >= "
+                f"{args.min_pelvis_motion_m:.2f} m, hareket orani >= "
+                f"{args.min_pelvis_motion_ratio:.2f}, yol korelasyonu >= "
+                f"{args.min_pelvis_trajectory_correlation:.2f} gerekli).",
                 file=sys.stderr,
             )
             failures += 1

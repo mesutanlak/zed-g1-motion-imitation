@@ -52,6 +52,15 @@ Ana PC'de ayri bir PowerShell'de Isaac/GMR'i ac:
 .\start_g1_isaaclab_live.ps1 -Mode upper_body -ImitationMode kinematic_debug -AcceptNvidiaEula -InputFps 15
 ```
 
+Bu dort-kamera profili eklem uzayinda sabit-durus deadband'i kullanir: omuzda
+yaklasik `0.018 rad`, dirsekte `0.022 rad`, bilekte `0.032 rad`. Gercek hareket
+deadband'i astiginda hiz-duyarli filtre gecikmeyi azaltir.
+`-StationaryDeadbandScale 0` yalniz A/B tani icin eski davranisi geri getirir.
+Arka kol erisimi varsayilan
+olarak aciktir; resmi eklem limitleri ve surekli govde/kapsul bariyeri kolun
+govdenin icinden gecmesini engeller. Eski dar arka-erisim davranisi gerekirse
+`-RestrictBackwardArms` ile secilebilir.
+
 Son olarak ana PC'de 4-ZED fusion ve 2x2 arayuzu ac. Bu komut `dual json`
 akisiyla ayni sekilde proje kokundeki `four json` klasorunde bulunan tek JSON'u
 otomatik secer; ZED360 ve dogrulanmis BODY_38 extrinsic tiplerini ayirt eder:
@@ -62,7 +71,10 @@ otomatik secer; ZED360 ve dogrulanmis BODY_38 extrinsic tiplerini ayirt eder:
 
 `-MinimumSources 3`, tek gorusun anlik BODY kaybinda Isaac akisini kesmez;
 ekranda ve kayitta her karenin gercek katkisi `fusion_katki=3/4` veya `4/4`
-olarak kalir. Yalniz dort goruslu kare uretmek icin `-MinimumSources 4` kullan.
+olarak kalir. Alici, dort kaynak canliyken dorduncu ayni-dongu paketini en
+fazla 20 ms bekler ve `<=40 ms` sikiliktaki gercek 4'lu paketi daha yeni 3'lu
+pakete tercih eder. Yalniz dort goruslu kare uretmek icin `-MinimumSources 4`
+kullan; gunluk canli kontrol icin 3 emniyetli geri dusustur.
 
 Fusion penceresi tuslari: `S` JSONL kaydini acip kapatir; `Q`/`Esc` guvenli
 cikis yapar. Kaynak penceresindeki `R` yalniz o kameranin operator kilidini ve
@@ -79,7 +91,7 @@ kullanma.
 - Rerun `15052`: dört kamera ham iskeleti dahil tam analiz paketi.
 - WSL/ROS `15054`: kompakt ek kopya.
 
-Saglikli bir kayitta `bagli=4/4`, `gecersiz=0`, `drop=0`, fusion FPS yaklasik
+Saglikli bir kayitta `bagli=4/4`, `gmr_kapi=READY`, `gecersiz=0`, `drop=0`, fusion FPS yaklasik
 14-15 ve mumkun oldugunca cok `fusion_katki=4/4` beklenir. `cross_view_mpjpe_m`
 dusuk olmalidir; 0.10 m uzeri kalibrasyon/ortak gorus kontrolu gerektirir.
 Her kamera satirinda `lat` saat-ofseti duzeltilmis capture gecikmesi, `net`
@@ -135,7 +147,7 @@ ZED360 sonucu uretemezse asagidaki BODY_38 tabanli uygulama kalibrasyonu
 fallback'tir. Bu yolda odada yalniz tek kisi bulunmali ve tum ortak hacimde
 45-60 saniye hareketli, cok pozlu kayit alinmalidir.
 
-Kaynaklar acik, Isaac/Rerun/fusion alicisi kapali olsun. Ana PC'de 25-30 saniye
+Kaynaklar acik, Isaac/Rerun/fusion alicisi kapali olsun. Ana PC'de 45-60 saniye
 ham kalibrasyon kaydi al:
 
 ```powershell
@@ -163,7 +175,15 @@ Aktif kopyalar:
 ```text
 config/zed_four/active_distributed_body38_extrinsics.json
 config/zed_four/active_four_camera_world_poses.jsonl
+four json/fourkamera.json
 ```
+
+Yeni kalite kapisi yalniz nokta RMS'ine bakmaz. Her kameranin referansla ayni
+hareketli pelvisi izlemesini de zorunlu tutar: referans hareketi `>=0.10 m`,
+hareket genisligi orani `>=0.60` ve pelvis yol korelasyonu `>=0.75`. Bir ZED
+arkadaki sabit kisiye kilitlenirse dusuk Kabsch RMS'i uretse bile kalibrasyon
+yazilmaz. `-Activate`, kaliteyi gecen dosyayi `four json/fourkamera.json` olarak
+da etkinlestirir; gunluk launcher ek `-Extrinsics` istemeden bunu okur.
 
 Varsayilan `start_zed_four_fusion_to_wsl.ps1`, `four json` klasorundeki tek
 ZED360 veya BODY_38 extrinsic dosyasini otomatik okur. Klasoru kullanmadan

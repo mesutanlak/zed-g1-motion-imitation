@@ -16,6 +16,11 @@ import numpy as np
 
 
 def to_live(record: dict) -> dict:
+    if record.get("schema") == "zed_body38_live/v1":
+        # Preserve native live packets byte-for-byte at the semantic level.
+        # In particular, this exercises compatibility gates for previously
+        # recorded distributed-fusion sessions.
+        return dict(record)
     # Preserve pelvis-local coordinates, calibration and occlusion metadata so
     # this regression test exercises the exact live retargeting path.
     packet = dict(record)
@@ -110,11 +115,18 @@ def main() -> int:
         with recording.open("r", encoding="utf-8") as stream:
             for line in stream:
                 record = json.loads(line)
-                if record.get("schema") != "zed_body38_g1_reference/v1":
+                schema = record.get("schema")
+                if schema not in {
+                    "zed_body38_g1_reference/v1", "zed_body38_live/v1"
+                }:
                     continue
-                if int(record.get("frame_index", 0)) < args.start_sequence:
+                sequence = int(record.get("frame_index", record.get("sequence", 0)))
+                if sequence < args.start_sequence:
                     continue
-                if (record.get("calibration") or {}).get("state") != "READY":
+                if (
+                    schema == "zed_body38_g1_reference/v1"
+                    and (record.get("calibration") or {}).get("state") != "READY"
+                ):
                     continue
                 if (record.get("operator_selection") or {}).get("state") != "LOCKED":
                     continue

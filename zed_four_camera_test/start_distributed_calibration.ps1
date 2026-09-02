@@ -50,9 +50,24 @@ if ($Activate) {
     New-Item -ItemType Directory -Path $activeDir -Force | Out-Null
     $activeExtrinsics = Join-Path $activeDir "active_distributed_body38_extrinsics.json"
     $activeWorldPoses = Join-Path $activeDir "active_four_camera_world_poses.jsonl"
+    $fourJsonDir = Join-Path $root "four json"
+    $fourJsonExtrinsics = Join-Path $fourJsonDir "fourkamera.json"
+    New-Item -ItemType Directory -Path $fourJsonDir -Force | Out-Null
+    # Keep the same single-inbox contract as the dual-camera launcher.  An
+    # explicit -Activate is the user's request to replace the runtime
+    # calibration; the four-camera launcher will pick this file automatically.
+    Get-ChildItem -LiteralPath $fourJsonDir -File -Filter "*.json" |
+        Where-Object { $_.FullName -ne $fourJsonExtrinsics } |
+        ForEach-Object {
+            throw "'four json' klasorunde baska JSON var: $($_.FullName). Yanlis dosyayi silmeden/arsivlemeden etkinlestirme yapilmadi."
+        }
     Copy-Item -LiteralPath $resolvedOutput -Destination $activeExtrinsics -Force
     Copy-Item -LiteralPath $resolvedWorldPoses -Destination $activeWorldPoses -Force
+    if ([string]::Compare($resolvedOutput, $fourJsonExtrinsics, $true) -ne 0) {
+        Copy-Item -LiteralPath $resolvedOutput -Destination $fourJsonExtrinsics -Force
+    }
     Write-Host "AKTIF 4-ZED EXTRINSIC: $activeExtrinsics"
     Write-Host "AKTIF 4-ZED WORLD POSES: $activeWorldPoses"
+    Write-Host "FOUR JSON RUNTIME KALIBRASYONU: $fourJsonExtrinsics"
 }
 exit 0

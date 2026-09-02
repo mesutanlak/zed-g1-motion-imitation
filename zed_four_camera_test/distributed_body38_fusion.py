@@ -548,6 +548,7 @@ def synchronized_samples(
     source_timeout_ns: int,
     maximum_spread_ns: int,
     minimum_sources: int,
+    preferred_full_set_spread_ns: int = 40_000_000,
 ) -> tuple[list[Sample], float] | None:
     """Choose the largest, freshest clock-normalized capture-time bundle."""
     fresh = {
@@ -559,6 +560,7 @@ def synchronized_samples(
         return None
     anchors = [sample_timeline_ns(sample) for samples in fresh.values() for sample in samples]
     best: tuple[tuple[int, int, int, int], list[Sample], float] | None = None
+    bundles: list[tuple[list[Sample], int, int, int]] = []
     for anchor_ns in anchors:
         candidates = [min(samples, key=lambda item: abs(sample_timeline_ns(item) - anchor_ns)) for samples in fresh.values()]
         candidates = [item for item in candidates if abs(sample_timeline_ns(item) - anchor_ns) <= maximum_spread_ns]
@@ -577,16 +579,49 @@ def synchronized_samples(
                 )
                 if spread_ns > maximum_spread_ns:
                     continue
+                oldest_ns = min(sample_timeline_ns(item) for item in selected)
+                newest_ns = max(sample_timeline_ns(item) for item in selected)
+                bundles.append((selected, spread_ns, oldest_ns, newest_ns))
                 # Advance on the newest *common* instant (the oldest member of
                 # the bundle), then prefer more cameras and a tighter spread.
                 score = (
-                    min(sample_timeline_ns(item) for item in selected),
+                    oldest_ns,
                     len(selected),
                     -spread_ns,
-                    max(sample_timeline_ns(item) for item in selected),
+                    newest_ns,
                 )
                 if best is None or score > best[0]:
                     best = (score, selected, spread_ns / 1.0e6)
+    if best is not None and bundles:
+        # Once all online cameras are inside a tight part of the same capture
+        # cycle, prefer that larger bundle over a three-view subset that is
+        # only a few milliseconds newer.  Without this bounded coherence
+        # preference, asynchronous UDP arrival can repeatedly emit 3/4 just
+        # before the fourth 15 Hz packet arrives.  A genuinely previous-cycle
+        # fourth frame (roughly 66 ms old) still loses to the fresh 3-view set.
+        # At 15 Hz two independently started hosts can have a stable phase
+        # offset close to half a frame (~33 ms).  Forty milliseconds still
+        # cannot mistake the previous 66.7 ms capture cycle for the current
+        # one, while allowing that legitimate fourth camera to participate.
+        coherent_ns = min(maximum_spread_ns, preferred_full_set_spread_ns)
+        preferred = max(
+            bundles,
+            key=lambda item: (len(item[0]), item[2], -item[1], item[3]),
+        )
+        best_oldest_ns = best[0][0]
+        if (
+            len(preferred[0]) > len(best[1])
+            and preferred[1] <= coherent_ns
+            and best_oldest_ns - preferred[2] <= coherent_ns
+        ):
+            best = (
+                (
+                    preferred[2], len(preferred[0]),
+                    -preferred[1], preferred[3],
+                ),
+                preferred[0],
+                preferred[1] / 1.0e6,
+            )
     return (best[1], best[2]) if best is not None else None
 
 
@@ -975,7 +1010,19 @@ def _fuse_prepared_keypoints(
             pool = clear
             center = np.median(np.asarray([item["point"] for item in clear]), axis=0)
         elif len(clear) == 1:
-            pool = candidates
+            # One clear view is the anatomical anchor. Torso-overlapped rear
+            # cameras may support it only when they agree tightly; otherwise
+            # several low-quality occluded estimates can still drag an arm
+            # through the torso despite their smaller individual weights.
+            support_radius_m = max(
+                0.06, min(0.12, 0.55 * maximum_spread_m)
+            )
+            pool = [
+                item for item in candidates
+                if item["clear"]
+                or float(np.linalg.norm(item["point"] - clear[0]["point"]))
+                <= support_radius_m
+            ]
             center = clear[0]["point"]
         else:
             pool = candidates
@@ -1017,6 +1064,11 @@ def _fuse_prepared_keypoints(
             for name in ARM_JOINT_NAMES[side]
             for serial in contribution_serials[IDX[name]]
         }
+        selected_motion = {
+            serial
+            for name in (f"{side.upper()}_ELBOW", f"{side.upper()}_WRIST")
+            for serial in contribution_serials[IDX[name]]
+        }
         evidence[side] = {
             "supporting_views": sum(bool(state["complete"]) for state in states.values()),
             "reliable_clear_views": sum(bool(state["clear"]) for state in states.values()),
@@ -1025,6 +1077,12 @@ def _fuse_prepared_keypoints(
             "overlapped_serials": sorted(serial for serial, state in states.items() if state["overlap"]),
             "recovered_serials": sorted(serial for serial, state in states.items() if state["recovered"]),
             "selected_serials": sorted(selected),
+            "selected_motion_serials": sorted(selected_motion),
+            "occlusion_rejected_serials": sorted(
+                serial
+                for serial, state in states.items()
+                if state["complete"] and serial not in selected_motion
+            ),
         }
     return result, result_confidence, contribution_count, contribution_serials, evidence
 
@@ -1221,6 +1279,7 @@ def make_output_packet(
     workspace_excluded_serials: list[int] | None = None,
     workspace_x_min_m: float = 2.0,
     workspace_x_max_m: float = 4.0,
+    full_set_wait_applied_ms: float = 0.0,
 ) -> dict[str, Any]:
     prepared = prepare_aligned_views(
         views,
@@ -1321,14 +1380,27 @@ def make_output_packet(
         })
     agreement = cross_view_agreement(raw_agreement_views, fused, minimum_confidence)
     aligned_agreement = cross_view_agreement(aligned_agreement_views, fused, minimum_confidence)
-    # Use a stable calibration/profile source.  Prefer the reference camera
-    # once it is READY; otherwise keep the most mature READY contributing
-    # camera.  This prevents the human scaling profile from changing merely
-    # because a different view wins one frame's overall quality score.
+    # BODY_38's operator calibration is a human scale/neutral-pose profile,
+    # not the multi-camera extrinsic calibration.  One complete profile is
+    # sufficient after every view has already been transformed into the
+    # validated common world frame.  Requiring *all* contributing cameras to
+    # be READY deadlocks distributed fusion whenever an occluded/rear camera
+    # reports COLLECTING or FAILED, even though another camera has a valid
+    # profile.  Prefer a READY profile (reference camera first), and expose
+    # the other source states as diagnostics rather than making them a global
+    # control gate.
+    ready_profile_views = [
+        item
+        for item in accepted
+        if (
+            (item.sample.packet.get("calibration") or {}).get("state") == "READY"
+            and bool((item.sample.packet.get("calibration") or {}).get("profile"))
+        )
+    ]
+    metadata_pool = ready_profile_views or accepted
     metadata_view = max(
-        accepted,
+        metadata_pool,
         key=lambda item: (
-            (item.sample.packet.get("calibration") or {}).get("state") == "READY",
             item.sample.serial == reference_serial,
             int((item.sample.packet.get("calibration") or {}).get("sample_count", 0) or 0),
             item.quality,
@@ -1356,7 +1428,14 @@ def make_output_packet(
         for serial, state in calibration_states.items()
         if state == "READY"
     )
-    if not accepted or any(state != "READY" for state in calibration_states.values()):
+    calibration["ready_profile_source_serials"] = sorted(
+        item.sample.serial for item in ready_profile_views
+    )
+    if ready_profile_views:
+        calibration["state"] = "READY"
+        calibration["progress"] = 1.0
+        calibration["reason"] = "ready_profile_in_calibrated_fusion_world"
+    else:
         calibration["state"] = "ACQUIRING"
         calibration["progress"] = min(
             [
@@ -1365,9 +1444,6 @@ def make_output_packet(
             ]
             or [0.0]
         )
-    else:
-        calibration["state"] = "READY"
-        calibration["progress"] = 1.0
     operator_sources = {
         str(item.sample.serial): dict(
             item.sample.packet.get("operator_selection") or {}
@@ -1542,6 +1618,7 @@ def make_output_packet(
             "capture_spread_ms": contributor_spread_ms,
             "capture_stdev_ms": contributor_stdev_ms,
             "selection_capture_spread_ms": arrival_spread_ms,
+            "full_set_wait_applied_ms": full_set_wait_applied_ms,
             # Backward-compatible name used by existing Rerun summaries.  In
             # v2 it is the clock-normalized capture spread, not socket arrival.
             "arrival_spread_ms": contributor_spread_ms,
@@ -1619,6 +1696,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ros-max-hz", type=float, default=15.0)
     parser.add_argument("--confidence", type=float, default=45.0)
     parser.add_argument("--max-sync-ms", type=float, default=80.0, help="Saat-ofseti duzeltilmis capture zamanina gore azami paket yayilimi.")
+    parser.add_argument("--preferred-full-set-spread-ms", type=float, default=40.0, help="Dort kamerayi ayni 15 Hz dongusu sayip 3 gorunume tercih eden sikilik esigi.")
+    parser.add_argument("--full-set-wait-ms", type=float, default=20.0, help="Diger tum kaynaklar canliyken dorduncu yeni kare icin azami bekleme.")
     parser.add_argument("--source-timeout-ms", type=float, default=250.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
     parser.add_argument("--minimum-sources", type=int, choices=(2, 3, 4), default=2, help="Calisma aninda cikis icin gereken en az taze kamera.")
     parser.add_argument("--max-joint-spread-m", type=float, default=0.30)
@@ -1659,6 +1738,8 @@ def main() -> int:
     if (
         not 0.0 <= args.confidence <= 100.0
         or args.max_sync_ms <= 0.0
+        or not 0.0 <= args.preferred_full_set_spread_ms <= args.max_sync_ms
+        or not 0.0 <= args.full_set_wait_ms <= 50.0
         or args.source_timeout_ms <= 0.0
         or args.max_joint_spread_m <= 0.0
         or args.max_pose_disagreement_m <= 0.0
@@ -1822,6 +1903,9 @@ def main() -> int:
     raw_records = 0
     last_fused_serials: list[int] = []
     last_arrival_spread_ms = math.nan
+    last_gmr_gate = "BEKLE"
+    partial_set_wait_started_at: float | None = None
+    last_full_set_wait_applied_ms = 0.0
     preview_frames: dict[int, np.ndarray] = {}
     preview_received_ns: dict[int, int] = {}
     any_events = {item.serial: deque(maxlen=120) for item in endpoints}
@@ -1845,7 +1929,16 @@ def main() -> int:
                     break
                 if pressed == "s":
                     set_recording(not recording)
-            events = selector.select(timeout=0.20)
+            select_timeout_s = 0.20
+            if partial_set_wait_started_at is not None:
+                wait_remaining_s = (
+                    args.full_set_wait_ms / 1000.0
+                    - (time.monotonic() - partial_set_wait_started_at)
+                )
+                select_timeout_s = min(
+                    select_timeout_s, max(0.001, wait_remaining_s)
+                )
+            events = selector.select(timeout=select_timeout_s)
             for key, _ in events:
                 kind, endpoint = key.data
                 if kind == "preview":
@@ -1938,7 +2031,12 @@ def main() -> int:
                 source_timeout_ns=int(args.source_timeout_ms * 1.0e6),
                 maximum_spread_ns=int(args.max_sync_ms * 1.0e6),
                 minimum_sources=args.minimum_sources,
+                preferred_full_set_spread_ns=int(
+                    args.preferred_full_set_spread_ms * 1.0e6
+                ),
             )
+            if selection is None:
+                partial_set_wait_started_at = None
             if selection is not None:
                 samples, arrival_spread_ms = selection
                 workspace_samples = samples
@@ -1994,6 +2092,41 @@ def main() -> int:
                     and len(workspace_samples) >= args.minimum_sources
                     and now - last_output_at >= 0.80 / args.output_max_hz
                 ):
+                    # If all four publishers are alive but the selector has
+                    # only received three frames from this capture cycle,
+                    # wait a small bounded interval for the fourth datagram.
+                    # Do not wait when a four-view bundle was already formed
+                    # and a camera was explicitly rejected by the workspace
+                    # or pose gate; latency cannot repair that condition.
+                    fresh_body_count = sum(
+                        now_ns - stamp
+                        <= int(args.source_timeout_ms * 1.0e6)
+                        for stamp in last_body_packet_ns.values()
+                    )
+                    should_wait_for_four = bool(
+                        args.full_set_wait_ms > 0.0
+                        and len(samples) < len(endpoints)
+                        and len(workspace_samples) == len(samples)
+                        and fresh_body_count == len(endpoints)
+                    )
+                    if should_wait_for_four:
+                        if partial_set_wait_started_at is None:
+                            partial_set_wait_started_at = now
+                        elapsed_wait_ms = (
+                            now - partial_set_wait_started_at
+                        ) * 1000.0
+                        if elapsed_wait_ms < args.full_set_wait_ms:
+                            continue
+                        last_full_set_wait_applied_ms = elapsed_wait_ms
+                        partial_set_wait_started_at = None
+                    else:
+                        if partial_set_wait_started_at is not None:
+                            last_full_set_wait_applied_ms = (
+                                now - partial_set_wait_started_at
+                            ) * 1000.0
+                        else:
+                            last_full_set_wait_applied_ms = 0.0
+                        partial_set_wait_started_at = None
                     compensated_samples = temporal_compensate_samples(
                         workspace_samples,
                         histories,
@@ -2046,6 +2179,18 @@ def main() -> int:
                         workspace_excluded_serials=workspace_excluded,
                         workspace_x_min_m=args.workspace_x_min_m,
                         workspace_x_max_m=args.workspace_x_max_m,
+                        full_set_wait_applied_ms=last_full_set_wait_applied_ms,
+                    )
+                    calibration_state = str(
+                        (packet.get("calibration") or {}).get("state", "MISSING")
+                    )
+                    operator_state = str(
+                        (packet.get("operator_selection") or {}).get("state", "MISSING")
+                    )
+                    last_gmr_gate = (
+                        "READY"
+                        if calibration_state == "READY" and operator_state == "LOCKED"
+                        else f"BEKLE({calibration_state}/{operator_state})"
                     )
                     accepted_views = [
                         view
@@ -2195,7 +2340,9 @@ def main() -> int:
                     f"| ham_kayit={raw_records} | fusion_cikis={fused_packets} "
                     f"| son_katki=[{', '.join(map(str, last_fused_serials)) or 'yok'}] "
                     f"| fusion_fps={event_rate(output_events, now):.1f} "
+                    f"| gmr_kapi={last_gmr_gate} "
                     f"| yayilim_ms={last_arrival_spread_ms:.1f} "
+                    f"| dortlu_bekleme_ms={last_full_set_wait_applied_ms:.1f} "
                     f"| rec={recorded}/drop={record_dropped}/q={record_queue.qsize()} "
                     f"| durum={status_packets} | gecersiz={invalid_packets} | {details}",
                     flush=True,

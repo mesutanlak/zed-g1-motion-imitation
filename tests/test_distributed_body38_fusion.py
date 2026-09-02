@@ -7,7 +7,10 @@ import numpy as np
 
 from zed_g1_skeleton import body_in_distance_gate, detect_torn_frame
 
-from zed_four_camera_test.calibrate_distributed_body38 import write_world_poses_jsonl
+from zed_four_camera_test.calibrate_distributed_body38 import (
+    pelvis_trajectory_metrics,
+    write_world_poses_jsonl,
+)
 from zed_four_camera_test.extrinsic_geometry import rebase_camera_transforms
 from zed_four_camera_test.validate_distributed_extrinsics import validate_document
 from zed_four_camera_test.distributed_body38_fusion import (
@@ -269,6 +272,37 @@ def test_synchronized_samples_prefers_fresh_three_views_over_stale_four() -> Non
     assert spread_ms < 0.001
 
 
+def test_synchronized_samples_prefers_coherent_four_over_slightly_newer_three() -> None:
+    now = 1_000_000_000
+    capture_times = {
+        # Stable two-host camera phase can be slightly above half a 15 Hz
+        # frame; this must still form a true four-view current-cycle bundle.
+        1: 955_000_000,
+        2: 985_000_000,
+        3: 988_000_000,
+        4: 990_000_000,
+    }
+    histories = {
+        serial: deque([
+            Sample(serial, packet(serial, 2), capture_ns, 2, capture_ns)
+        ], maxlen=16)
+        for serial, capture_ns in capture_times.items()
+    }
+
+    selected = synchronized_samples(
+        histories,
+        now_ns=now,
+        source_timeout_ns=250_000_000,
+        maximum_spread_ns=80_000_000,
+        minimum_sources=3,
+    )
+
+    assert selected is not None
+    samples, spread_ms = selected
+    assert {sample.serial for sample in samples} == {1, 2, 3, 4}
+    assert spread_ms == 35.0
+
+
 def test_synchronized_samples_waits_for_new_common_cycle_instead_of_smearing() -> None:
     old_ns = 934_000_000
     histories = {
@@ -458,6 +492,9 @@ def test_runtime_validator_recomputes_body38_quality_thresholds() -> None:
                     "inlier_ratio": 0.6,
                     "rms_m": 0.08,
                     "pelvis_p95_m": 0.12,
+                    "pelvis_reference_motion_m": 0.25,
+                    "pelvis_motion_scale_ratio": 0.90,
+                    "pelvis_trajectory_correlation": 0.95,
                     "quality_gate_passed": True,
                 }
             ),
@@ -470,6 +507,25 @@ def test_runtime_validator_recomputes_body38_quality_thresholds() -> None:
         assert "yetersiz" in str(exc)
     else:
         raise AssertionError("Relaxed producer thresholds must not bypass runtime policy")
+
+
+def test_pelvis_trajectory_gate_rejects_stationary_wrong_person() -> None:
+    reference = np.column_stack((
+        np.linspace(0.0, 1.0, 120),
+        0.1 * np.sin(np.linspace(0.0, 4.0, 120)),
+        np.zeros(120),
+    ))
+    wrong_stationary = np.column_stack((
+        0.01 * np.sin(np.linspace(0.0, 10.0, 120)),
+        0.01 * np.cos(np.linspace(0.0, 10.0, 120)),
+        np.zeros(120),
+    ))
+    pairs = np.stack((wrong_stationary, reference), axis=1)
+    metrics = pelvis_trajectory_metrics(pairs, np.eye(3), np.zeros(3))
+
+    assert metrics["pelvis_reference_motion_m"] >= 0.10
+    assert metrics["pelvis_motion_scale_ratio"] < 0.60
+    assert metrics["pelvis_trajectory_correlation"] < 0.75
 
 
 def test_fused_packet_rebuilds_world_and_g1_reference_features() -> None:
@@ -536,6 +592,66 @@ def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -
     assert compact["keypoints_3d_m"] == fused["keypoints_3d_m"]
 
 
+def test_fused_calibration_is_ready_when_one_contributing_view_has_ready_profile() -> None:
+    views = []
+    for serial, state in ((1, "FAILED"), (2, "READY"), (3, "COLLECTING")):
+        document = packet(serial, serial)
+        document["calibration"].update({
+            "state": state,
+            "progress": 1.0 if state != "COLLECTING" else 0.5,
+            "sample_count": 120 if state == "READY" else 20,
+        })
+        views.append((
+            Sample(serial, document, 1_000_000_000 + serial, serial),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        ))
+
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=2.0,
+    )
+
+    assert fused["calibration"]["state"] == "READY"
+    assert fused["calibration"]["profile_source_serial"] == 2
+    assert fused["calibration"]["ready_profile_source_serials"] == [2]
+    assert fused["calibration"]["source_states"] == {
+        "1": "FAILED", "2": "READY", "3": "COLLECTING",
+    }
+
+
+def test_fused_calibration_waits_when_no_contributing_view_has_ready_profile() -> None:
+    views = []
+    for serial, state, progress in (
+        (1, "FAILED", 1.0), (2, "COLLECTING", 0.4), (3, "COLLECTING", 0.7)
+    ):
+        document = packet(serial, serial)
+        document["calibration"].update({
+            "state": state,
+            "progress": progress,
+            "sample_count": 10,
+        })
+        views.append((
+            Sample(serial, document, 1_000_000_000 + serial, serial),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        ))
+
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=2.0,
+    )
+
+    assert fused["calibration"]["state"] == "ACQUIRING"
+    assert fused["calibration"]["ready_profile_source_serials"] == []
+
+
 def test_arm_fusion_prefers_two_clear_views_over_two_torso_occluded_views() -> None:
     base = body38_points()
     bad = base.copy()
@@ -586,6 +702,50 @@ def test_arm_fusion_prefers_two_clear_views_over_two_torso_occluded_views() -> N
     assert fused["operator_selection"]["state"] == "LOCKED"
     assert fused["timestamp_ns"] == fused["latency_trace_ns"]["t0_capture_ns"]
     assert fused["latency_trace_ns"]["t2_windows_udp_send_ns"] >= fused["timestamp_ns"]
+
+
+def test_one_clear_arm_view_rejects_disagreeing_occluded_views() -> None:
+    base = body38_points()
+    views = []
+    for serial, offset, overlap in (
+        (1, 0.0, False),
+        (2, 0.22, True),
+        (3, -0.20, True),
+        (4, 0.18, True),
+    ):
+        xyz = base.copy()
+        xyz[IDX["LEFT_ELBOW"], 1] += offset
+        xyz[IDX["LEFT_WRIST"], 1] += offset
+        document = packet(serial, serial, xyz)
+        document["occlusion_analysis"] = {
+            "arm_torso_overlap": {"left": overlap, "right": False},
+            "arm_chain_recovered": {"left": overlap, "right": False},
+        }
+        views.append((
+            Sample(serial, document, 1_000_000_000 + serial, serial),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        ))
+
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=1.0,
+    )
+
+    wrist_serials = fused["fusion"]["per_joint_contributing_serials"][
+        IDX["LEFT_WRIST"]
+    ]
+    assert wrist_serials == [1]
+    assert fused["fusion"]["arm_evidence"]["left"][
+        "occlusion_rejected_serials"
+    ] == [2, 3, 4]
+    assert np.allclose(
+        np.asarray(fused["keypoints_3d_m"])[IDX["LEFT_WRIST"]],
+        base[IDX["LEFT_WRIST"]],
+    )
 
 
 def test_dynamic_pelvis_alignment_repairs_translation_biased_extrinsic() -> None:

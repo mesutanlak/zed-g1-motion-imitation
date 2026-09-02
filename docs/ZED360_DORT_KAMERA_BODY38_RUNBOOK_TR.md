@@ -311,9 +311,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
   -Fps 15 -Model medium -DepthMode neural-light -CalibrationMode
 ```
 
-`-CalibrationMode`, henüz extrinsic yokken kamera-yerel kaba alan kapısını
-geçici kapatır. Dört kaynak penceresinin her birinde doğru tek kişinin BODY_38
-iskeleti görünmelidir.
+`-CalibrationMode` artik kamera-yerel kaba alan kapisini acik tutar. Kapinin
+ozellikle kapatilmasi zorunluysa ayrica `-DisableCalibrationDistanceGate`
+verilebilir; normal kurulumda kullanmayin. Dort kaynak penceresinin her birinde
+ayni tek kisinin BODY_38 iskeleti gorunmelidir.
 
 ### 5.2 Ham kalibrasyon kaydı
 
@@ -341,10 +342,14 @@ tercihen 400'ü geçince alıcıyı ve dört kaynak sürecini `Ctrl+C` ile kapat
   -ReferenceSerial 33773329 -Activate
 ```
 
-Kalibratör her kamera için en az 60 eşzamanlı örnek, 300 inlier nokta, %25
-inlier oranı ve pelvis p95 `<=0.25 m` ister; herhangi biri geçmezse dosya
-yazılmaz/etkinleştirilmez. Çıktının yanında dünya-pozu JSONL'si de üretilir.
-Tripodlardan biri oynarsa bu adımların tamamını tekrarlayın.
+Kalibrator her kamera icin en az 60 eszamanli ornek, 300 inlier nokta, %25
+inlier orani ve pelvis p95 `<=0.25 m` ister. Ayrica ayni operator kimligini
+hareket yoluyla dogrular: referans pelvis hareketi `>=0.10 m`, hareket
+genisligi orani `>=0.60`, pelvis yol korelasyonu `>=0.75`. Bir kamera sabit bir
+arka plan kisisine kilitlenirse dusuk RMS'e ragmen dosya yazilmaz. Ciktinin
+yaninda dunya-pozu JSONL'si uretilir ve `-Activate` sonucu
+`four json/fourkamera.json` dosyasina da yerlestirir. Tripodlardan biri oynarsa
+bu adimlarin tamamini tekrarlayin.
 
 BODY_38 tabanlı alternatif etkin dosyayı bağımsız doğrulayın (ZED360 JSON yolunu
 kullanıyorsanız bu komut yerine Bölüm 4'teki doğrulama komutunu kullanın):
@@ -386,7 +391,7 @@ alıcısında uygulanır; 6–7 m arka plan kişisi çıkışa giremez.
   -Duration 120 -Record
 ```
 
-**Kabul:** `body_taze=4/4`, `son_katki` dört seri, `fusion_fps` yaklaşık
+**Kabul:** `body_taze=4/4`, `gmr_kapi=READY`, `son_katki` dört seri, `fusion_fps` yaklaşık
 14–15, düzeltilmiş `yayilim_ms<=80`, `gecersiz=0`, kayıt drop=0. Kolları gövde
 önünde çaprazlayın ve sonra arkaya alın; arayüz/Rerun içindeki sol-sağ
 `reliable_clear_views` en az bir görüşü korumalıdır.

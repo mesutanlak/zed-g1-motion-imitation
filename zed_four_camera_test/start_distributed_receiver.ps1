@@ -23,6 +23,10 @@ param(
     [int]$MinimumSources = 2,
     [ValidateRange(20, 1000)]
     [double]$MaxSyncMs = 80,
+    [ValidateRange(0, 80)]
+    [double]$PreferredFullSetSpreadMs = 40,
+    [ValidateRange(0, 50)]
+    [double]$FullSetWaitMs = 20,
     [ValidateRange(100, 5000)]
     [double]$SourceTimeoutMs = 250,
     [ValidateRange(0.05, 1.0)]
@@ -73,6 +77,10 @@ $arguments += "--minimum-sources"
 $arguments += "$MinimumSources"
 $arguments += "--max-sync-ms"
 $arguments += "$MaxSyncMs"
+$arguments += "--preferred-full-set-spread-ms"
+$arguments += "$PreferredFullSetSpreadMs"
+$arguments += "--full-set-wait-ms"
+$arguments += "$FullSetWaitMs"
 $arguments += "--source-timeout-ms"
 $arguments += "$SourceTimeoutMs"
 $arguments += "--max-pose-disagreement-m"

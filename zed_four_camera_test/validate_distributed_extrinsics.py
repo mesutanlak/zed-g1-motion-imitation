@@ -140,6 +140,29 @@ def validate_document(
         pelvis_p95_m = finite_number(
             fit.get("pelvis_p95_m"), f"ZED {serial} pelvis_p95_m"
         )
+        trajectory_fields = (
+            "pelvis_reference_motion_m",
+            "pelvis_motion_scale_ratio",
+            "pelvis_trajectory_correlation",
+        )
+        if any(name not in fit for name in trajectory_fields):
+            raise ValueError(
+                f"ZED {serial} kalibrasyonu eski: ayni-operator pelvis hareket "
+                "dogrulamasi yok. Yeni calibrate_distributed_body38.py ile "
+                "yeniden kalibre edin."
+            )
+        reference_motion_m = finite_number(
+            fit.get("pelvis_reference_motion_m"),
+            f"ZED {serial} pelvis_reference_motion_m",
+        )
+        motion_ratio = finite_number(
+            fit.get("pelvis_motion_scale_ratio"),
+            f"ZED {serial} pelvis_motion_scale_ratio",
+        )
+        trajectory_correlation = finite_number(
+            fit.get("pelvis_trajectory_correlation"),
+            f"ZED {serial} pelvis_trajectory_correlation",
+        )
         if candidates <= 0.0 or abs(inlier_ratio - paired / candidates) > 0.01:
             raise ValueError(f"ZED {serial} inlier orani tutarsiz.")
         if capture_samples < 60 or paired < 300 or inlier_ratio < 0.25:
@@ -152,6 +175,23 @@ def validate_document(
         if not 0.0 <= pelvis_p95_m <= 0.25:
             raise ValueError(
                 f"ZED {serial} pelvis p95={pelvis_p95_m:.3f}m > 0.25m."
+            )
+        if reference_motion_m < 0.10:
+            raise ValueError(
+                f"ZED {serial} referans pelvis hareketi "
+                f"{reference_motion_m:.3f}m < 0.10m; kalibrasyonda ortak "
+                "hacimde daha fazla yuruyun."
+            )
+        if not 0.60 <= motion_ratio <= 1.0:
+            raise ValueError(
+                f"ZED {serial} pelvis hareket orani={motion_ratio:.3f} < 0.60; "
+                "kamera muhtemelen farkli/sabit bir kisiye kilitlendi."
+            )
+        if not 0.75 <= trajectory_correlation <= 1.0:
+            raise ValueError(
+                f"ZED {serial} pelvis yol korelasyonu="
+                f"{trajectory_correlation:.3f} < 0.75; dort kamera ayni "
+                "operatoru takip etmemis."
             )
 
 

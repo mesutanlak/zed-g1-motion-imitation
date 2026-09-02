@@ -16,6 +16,7 @@ param(
     [ValidateRange(0.5, 30.0)]
     [double]$DistanceMax = 5.25,
     [switch]$CalibrationMode,
+    [switch]$DisableCalibrationDistanceGate,
     [ValidateRange(1, 10)]
     [double]$PreviewHz = 8,
     [switch]$RecordLocal,
@@ -89,7 +90,7 @@ foreach ($definition in $definitions) {
     elseif ($RecordLocal) {
         $arguments += "-RecordLocal"
     }
-    if ($CalibrationMode) {
+    if ($CalibrationMode -and $DisableCalibrationDistanceGate) {
         $arguments += "-DisableDistanceGate"
     }
     Start-Process -FilePath "powershell.exe" -ArgumentList $arguments
@@ -98,7 +99,13 @@ foreach ($definition in $definitions) {
 
 Write-Host "4-ZED kaynaklari baslatildi | rol=$Role | BODY hedefi=$bodyTarget | JPEG hedefi=$previewTarget"
 if ($CalibrationMode) {
-    Write-Warning "KALIBRASYON MODU: kamera-yerel mesafe kapisi kapali; ortamda yalniz tek kisi olsun."
+    if ($DisableCalibrationDistanceGate) {
+        Write-Warning "KALIBRASYON MODU: kamera-yerel mesafe kapisi elle kapatildi; ortamda yalniz tek kisi olsun."
+    }
+    else {
+        Write-Host "KALIBRASYON MODU: kamera-yerel operator kapisi ${DistanceMin}-${DistanceMax} m ACIK."
+        Write-Warning "Dort kameranin da ayni hareketli operatoru kilitledigini onizlemelerden dogrulayin; ortamda ikinci kisi bulunmasin."
+    }
 }
 else {
     Write-Host "Kamera-yerel kaba operator kapisi: ${DistanceMin}-${DistanceMax} m (kilitli kiside +/-0.20 m histerezis)"

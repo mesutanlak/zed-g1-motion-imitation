@@ -10,6 +10,7 @@ param(
     [switch]$NoFallArrest,
     [switch]$NoMirrorRescue,
     [switch]$NoAnatomicalBranchContinuity,
+    [switch]$RestrictBackwardArms,
     [ValidateRange(1, 16)]
     [int]$MirrorWorkers = 4,
     [ValidateSet("shared_gpu_safe", "gpu_max")]
@@ -24,6 +25,8 @@ param(
     [double]$UpperMinCutoffHz = 2.0,
     [ValidateRange(0.0, 10.0)]
     [double]$UpperVelocityBeta = 1.2,
+    [ValidateRange(0.0, 3.0)]
+    [double]$StationaryDeadbandScale = 1.0,
     [ValidateRange(0.0, 1.0)]
     [double]$MimicBlend = 1.0,
     [ValidateSet("low_latency", "smooth_bounded")]
@@ -181,7 +184,7 @@ Write-Host "  NVIDIA surucu: $driverText"
     Write-Host "  Grafik API: D3D12"
 Write-Host "  Calisma profili: $RuntimeProfile"
 Write-Host "  Alt beden: $StanceMode"
-Write-Host "  Canli takip: ${InputFps} Hz, adaptive cutoff=${UpperMinCutoffHz}-${UpperCutoffHz} Hz, beta=$UpperVelocityBeta, blend=$MimicBlend"
+Write-Host "  Canli takip: ${InputFps} Hz, adaptive cutoff=${UpperMinCutoffHz}-${UpperCutoffHz} Hz, beta=$UpperVelocityBeta, stationary deadband=$StationaryDeadbandScale, blend=$MimicBlend"
 Write-Host "  Insan boyu / GMR olcegi: ${HumanHeightM} m"
 Write-Host "  Ust govde PD olcegi: Kp=$UpperStiffnessScale Kd=$UpperDampingScale"
 Write-Host "  Isaac referans profili: Unitree G1 fiziksel zarf | mode=$ReferenceTrackingMode response=${ReferenceResponseHz}Hz vel<=${ReferenceMaxVelocity}rad/s acc<=${ReferenceMaxAcceleration}rad/s2 jerk<=${ReferenceMaxJerk}rad/s3"
@@ -194,6 +197,7 @@ if (Test-Path -LiteralPath $nativeReferencePolicy) {
 }
 Write-Host "  AKC/GMR dirsek dal surekliligi: $(-not $NoAnatomicalBranchContinuity)"
 Write-Host "  Olay tetiklemeli continuation rescue: $(-not $NoMirrorRescue) (workers=$MirrorWorkers)"
+Write-Host "  Arka kol erisimi: $(if ($RestrictBackwardArms) { 'eski +0.75rad omuz siniri' } else { 'ACIK; eklem limiti + govde carpisma bariyeri' })"
 if (-not $Headless) {
     Write-Host "  GUI notu: ilk D3D12/RTX onbellek acilisi 3-4 dakika surebilir."
     Write-Host "  'G1 scene initialization complete' gorulene kadar pencereyi kapatmayin."
@@ -214,6 +218,7 @@ $bridgeArguments = @(
     "--cutoff-hz", "$UpperCutoffHz",
     "--min-cutoff-hz", "$UpperMinCutoffHz",
     "--velocity-beta", "$UpperVelocityBeta",
+    "--stationary-deadband-scale", "$StationaryDeadbandScale",
     "--human-height", "$HumanHeightM",
     "--no-gmr-velocity-limit"
 )
@@ -228,6 +233,12 @@ if ($NoAnatomicalBranchContinuity) {
 }
 else {
     $bridgeArguments += "--anatomical-branch-continuity"
+}
+if ($RestrictBackwardArms) {
+    $bridgeArguments += "--restrict-backward-arms"
+}
+else {
+    $bridgeArguments += "--no-restrict-backward-arms"
 }
 
 $bridgeProcess = $null
