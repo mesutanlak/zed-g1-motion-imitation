@@ -157,6 +157,18 @@ ham kalibrasyon kaydi al:
   -Fps 15 -MinimumSources 4
 ```
 
+`-CalibrationRecord` kullanildiginda ve `-Headless` verilmediginde dort JPEG
+onizleme portu (`BODY portu + 100`) otomatik acilir. Ana PC'deki 2x2 pencerede
+her kamera icin secilen yesil iskelet, `secim=LOCKED/ACQUIRING/LOST`, kilitli
+kisi ID'si, gorulen kisi sayisi ve preview yasi gosterilir. `bagli=2/4` ag veya
+guvenlik duvari; `bagli=4/4` ama `body_taze=2/4` ise operator secimi/mesafe/gorus
+sorunudur.
+
+Laptop kaynaklari `bagli` listesine hic girmiyorsa ana PC'de Yonetici PowerShell
+ile bir kez `.\zed_four_camera_test\enable_main_pc_calibration_firewall.ps1`
+calistirin. Kural yalniz `192.168.50.11` kaynagindan gelen BODY UDP
+`16000/16006` ve preview UDP `16100/16106` portlarini acar.
+
 Ortak gorus alaninda tek kisiyle farkli noktalarda T/A pozlari, bukulu dirsek
 ve kollar onde/arkada hareketleri yapin. `ham_kayit` tercihen 400'u gecince
 `Ctrl+C` yap. Sonra extrinsic ve world-pose dosyalarini uretip kalite kapisindan

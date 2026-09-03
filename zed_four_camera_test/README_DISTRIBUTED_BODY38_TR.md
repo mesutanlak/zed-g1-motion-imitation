@@ -97,6 +97,11 @@ Ana PC'de beşinci PowerShell penceresinde aşağıdaki alıcıyı aç:
   -Fps 15 -MinimumSources 4 -MaxSyncMs 80 -SourceTimeoutMs 250
 ```
 
+Kalibrasyon kaydinda `-PreviewSource` yazmak gerekmez: launcher dort standart
+JPEG portunu (`16100`, `16102`, `16104`, `16106`) otomatik turetir ve 2x2 canli
+monitoru acar. Yesil iskelet secilen operatordur; ust bilgi satiri kaynak bazinda
+`LOCKED/ACQUIRING/LOST`, kilit ID'si, gorulen kisi sayisi ve preview yasini verir.
+
 Konsolda `DURUM | kaynak=4/4 [...] | ham_kayit=...` görmelisin. `ham_kayit`
 sayısı artıyorsa ağ ve dört BODY_38 kaynağı doğrudur.
 

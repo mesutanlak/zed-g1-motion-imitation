@@ -1246,9 +1246,28 @@ def draw_four_preview(
         world_x_text = f"{float(world_x):.2f}m" if isinstance(world_x, (int, float)) and math.isfinite(float(world_x)) else "n/a"
         workspace_state = str(metric.get("workspace_state", "BEKLE"))
         color = (40, 220, 80) if endpoint.serial in body_fresh else (0, 165, 255)
-        cv2.rectangle(tile, (0, 0), (tile_width, 62), (18, 18, 18), -1)
+        selection_state = str(metric.get("operator_state", "YOK"))
+        locked_id = metric.get("locked_body_id")
+        detected_count = int(metric.get("detected_body_count", 0) or 0)
+        preview_age_ms = metric.get("preview_age_ms")
+        preview_age_text = (
+            f"{float(preview_age_ms):.0f}ms"
+            if isinstance(preview_age_ms, (int, float))
+            and math.isfinite(float(preview_age_ms))
+            else "yok"
+        )
+        lock_text = str(locked_id) if locked_id is not None else "-"
+        selection_color = (
+            (40, 220, 80)
+            if selection_state == "LOCKED"
+            else (0, 165, 255)
+            if selection_state in {"ACQUIRING", "LOST"}
+            else (150, 150, 150)
+        )
+        cv2.rectangle(tile, (0, 0), (tile_width, 82), (18, 18, 18), -1)
         cv2.putText(tile, f"ZED {endpoint.serial}  BODY {body_fps:.1f} fps  RX {rx_fps:.1f} fps", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, color, 2, cv2.LINE_AA)
-        cv2.putText(tile, f"durum={metric.get('status', 'YOK')}  X={world_x_text}/{workspace_state}  gecikme={capture_text}  ag={queue_text}", (12, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (235, 235, 235), 1, cv2.LINE_AA)
+        cv2.putText(tile, f"secim={selection_state}  kilit_id={lock_text}  kisi={detected_count}  preview={preview_age_text}", (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, selection_color, 1, cv2.LINE_AA)
+        cv2.putText(tile, f"durum={metric.get('status', 'YOK')}  X={world_x_text}/{workspace_state}  gecikme={capture_text}  ag={queue_text}", (12, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
         tiles.append(tile)
     while len(tiles) < 4:
         tiles.append(np.zeros((tile_height, tile_width, 3), dtype=np.uint8))
@@ -1986,6 +2005,16 @@ def main() -> int:
                         status_packets += 1
                         per_source_status[endpoint.serial] += 1
                         last_source_status[endpoint.serial] = str(document.get("status", "STATUS"))
+                        operator_selection = document.get("operator_selection") or {}
+                        source_metrics[endpoint.serial]["operator_state"] = str(
+                            operator_selection.get("state", "YOK")
+                        )
+                        source_metrics[endpoint.serial]["locked_body_id"] = (
+                            operator_selection.get("locked_body_id")
+                        )
+                        source_metrics[endpoint.serial]["detected_body_count"] = int(
+                            document.get("detected_body_count", 0) or 0
+                        )
                         continue
                     if document.get("schema") != "zed_body38_live/v1":
                         invalid_packets += 1
@@ -2008,6 +2037,16 @@ def main() -> int:
                     source_metrics[endpoint.serial]["source_host_id"] = source_host_id
                     source_metrics[endpoint.serial]["capture_to_receive_ms"] = clock_metrics.get(
                         "corrected_capture_to_receive_ms"
+                    )
+                    operator_selection = document.get("operator_selection") or {}
+                    source_metrics[endpoint.serial]["operator_state"] = str(
+                        operator_selection.get("state", "YOK")
+                    )
+                    source_metrics[endpoint.serial]["locked_body_id"] = (
+                        operator_selection.get("locked_body_id")
+                    )
+                    source_metrics[endpoint.serial]["detected_body_count"] = int(
+                        document.get("detected_body_count", 1) or 1
                     )
                     histories[endpoint.serial].append(Sample(
                         serial=endpoint.serial,
@@ -2330,6 +2369,10 @@ def main() -> int:
                     f"/lat={metric_text(source_metrics[item.serial].get('corrected_capture_to_receive_ms'), 'ms')}"
                     f"/net={metric_text(source_metrics[item.serial].get('network_queue_ms'), 'ms')}"
                     f"/clk={metric_text(source_metrics[item.serial].get('clock_offset_estimate_ms'), 'ms')}"
+                    f"/secim={source_metrics[item.serial].get('operator_state', 'YOK')}"
+                    f"/id={source_metrics[item.serial].get('locked_body_id', '-')}"
+                    f"/kisi={source_metrics[item.serial].get('detected_body_count', 0)}"
+                    f"/preview={metric_text(source_metrics[item.serial].get('preview_age_ms'), 'ms', 0)}"
                     f"/X={metric_text(source_metrics[item.serial].get('world_forward_x_m'), 'm', 2)}"
                     f"/{source_metrics[item.serial].get('workspace_state', 'BEKLE')}"
                     for item in endpoints

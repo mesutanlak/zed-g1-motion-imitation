@@ -1918,6 +1918,10 @@ def main() -> int:
                         "locked_hysteresis_m": 0.20,
                     },
                 }
+                # Needed by the central 2x2 calibration monitor: a green
+                # selected skeleton is only trustworthy when the operator can
+                # also see whether another candidate exists in that camera.
+                record["detected_body_count"] = len(body_list)
                 record["calibration"] = {
                     "state": calibration.state,
                     "progress": calibration.progress,

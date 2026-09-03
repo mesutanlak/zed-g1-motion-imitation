@@ -64,6 +64,29 @@ if ($Source.Count -ne 4) {
     throw "Dort -Source 'SERIAL:PORT' degeri gerekli."
 }
 
+# Calibration must be observable.  The standard four-camera launcher sends a
+# presentation-only JPEG stream on BODY_PORT + 100.  Derive those endpoints
+# automatically so a calibration capture cannot accidentally run blind merely
+# because -PreviewSource was omitted from a long PowerShell command.
+if ($CalibrationRecord -and $PreviewSource.Count -eq 0 -and -not $Headless) {
+    $derivedPreviewSources = @()
+    foreach ($item in $Source) {
+        if ($item -notmatch '^(\d+):(\d+)$') {
+            throw "Preview otomatik kesfi icin Source 'SERIAL:PORT' biciminde olmali: $item"
+        }
+        $serial = $Matches[1]
+        $bodyPort = [int]$Matches[2]
+        $previewPort = $bodyPort + 100
+        if ($previewPort -gt 65535) {
+            throw "ZED $serial icin otomatik preview portu gecersiz: $previewPort"
+        }
+        $derivedPreviewSources += "${serial}:${previewPort}"
+    }
+    $PreviewSource = $derivedPreviewSources
+    Write-Host "KALIBRASYON ONIZLEMESI OTOMATIK: $($PreviewSource -join ', ')"
+    Write-Host "2x2 pencerede yesil iskelet secilen operatoru; secim=LOCKED aktif kilidi gosterir."
+}
+
 $arguments = @($receiver)
 foreach ($item in $Source) {
     $arguments += "--source"
