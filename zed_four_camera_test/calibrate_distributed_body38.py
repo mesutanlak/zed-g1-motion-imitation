@@ -45,7 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-serial", type=int, required=True)
     parser.add_argument("--confidence", type=float, default=55.0)
     parser.add_argument("--max-residual-m", type=float, default=0.16)
-    parser.add_argument("--max-samples", type=int, default=900)
+    # A distributed capture can contain short periods where one view is
+    # geometrically weaker.  Using the whole ordinary 45-90 second session is
+    # more stable than an arbitrary first-900-frame prefix; the wrapper caps
+    # unusually long sessions explicitly when needed.
+    parser.add_argument("--max-samples", type=int, default=5000)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.25)
     parser.add_argument("--min-inlier-points", type=int, default=300)
     parser.add_argument("--min-capture-samples", type=int, default=60)

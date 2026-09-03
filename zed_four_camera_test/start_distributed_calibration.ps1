@@ -7,6 +7,8 @@ param(
     [string]$OutputPath,
     [Parameter(Mandatory = $true)]
     [long]$ReferenceSerial,
+    [ValidateRange(60, 100000)]
+    [int]$MaxSamples = 5000,
     [string]$WorldPosesJsonl = "",
     [switch]$Activate
 )
@@ -21,7 +23,8 @@ $arguments = @(
     $calibrator,
     "--input", $CapturePath,
     "--output", $OutputPath,
-    "--reference-serial", "$ReferenceSerial"
+    "--reference-serial", "$ReferenceSerial",
+    "--max-samples", "$MaxSamples"
 )
 if ($WorldPosesJsonl) {
     $arguments += "--world-poses-jsonl"

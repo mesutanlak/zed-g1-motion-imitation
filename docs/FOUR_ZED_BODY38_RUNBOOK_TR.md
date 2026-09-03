@@ -179,8 +179,12 @@ gecirin:
   -CapturePath ".\recordings\four_body38_static_calibration_NEW.jsonl" `
   -OutputPath ".\config\zed_four\distributed_body38_extrinsics_NEW.json" `
   -WorldPosesJsonl ".\config\zed_four\four_camera_world_poses_NEW.jsonl" `
-  -ReferenceSerial 33773329 -Activate
+  -ReferenceSerial 33773329 -MaxSamples 5000 -Activate
 ```
+
+Kalibrator varsayilan olarak en fazla 5000 ortak kareyi kullanir. Boylece
+45-90 saniyelik kaydin yalniz ilk bolumune bagli kalmadan daha kararlı bir
+extrinsic hesaplanir.
 
 Aktif kopyalar:
 
