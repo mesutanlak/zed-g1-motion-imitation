@@ -49,12 +49,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmr-listen-host", default="0.0.0.0")
     parser.add_argument("--gmr-listen-port", type=int, default=15053)
     parser.add_argument(
-        "--live-max-hz", type=float, default=30.0,
+        "--live-max-hz", type=float, default=15.0,
         help="Canli BODY_38 analiz/render hizi; kontrol akisini etkilemez",
     )
     parser.add_argument(
-        "--gmr-log-max-hz", type=float, default=30.0,
+        "--gmr-log-max-hz", type=float, default=15.0,
         help="Her GMR telemetri semasi icin azami kayit hizi",
+    )
+    parser.add_argument(
+        "--detailed-joint-entities", action="store_true",
+        help=(
+            "Her BODY_38 eklemini ayri Rerun entity/metric olarak yaz. "
+            "Kapaliyken sayisal CSV/JSONL verisi korunur ve canli RRD daha hizlidir."
+        ),
     )
     parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "rerun_recordings"
@@ -556,18 +563,48 @@ class RerunSkeletonApp:
         for camera_index in range(len(camera_serials) + 1, 5):
             rr.log(f"/cam{camera_index}/body38", rr.Clear(recursive=False))
 
-        # A BODY_38 packet can temporarily omit a joint name altogether. Clear
-        # any entity that existed in the previous packet but is absent now.
-        current_joint_names = set(names)
+        visible_joint_names = [name for name in names if name in points]
+        if visible_joint_names:
+            joint_colors = []
+            for name in visible_joint_names:
+                state = states.get(name, "missing")
+                joint_colors.append(
+                    [80, 220, 120]
+                    if state == "tracked"
+                    else [255, 190, 50]
+                    if state in {"held", "held_outlier"}
+                    else [240, 80, 80]
+                )
+            rr.log(
+                "/world/skeleton/joints",
+                rr.Points3D(
+                    [points[name] for name in visible_joint_names],
+                    radii=0.025,
+                    colors=joint_colors,
+                    labels=visible_joint_names,
+                    show_labels=False,
+                ),
+            )
+        else:
+            rr.log("/world/skeleton/joints", rr.Clear(recursive=False))
+
+        # The normal live path batches all joints into one Rerun entity.  Full
+        # per-joint values remain losslessly available in joints.csv and
+        # skeleton_analysis.jsonl.  The opt-in detailed mode is intended for
+        # slower offline inspection and creates over 100 log calls per frame.
+        current_joint_names = (
+            set(names) if self.args.detailed_joint_entities else set()
+        )
         for removed_name in self._logged_joint_names - current_joint_names:
             rr.log(
-                f"/world/skeleton/joints/{removed_name}",
+                f"/world/skeleton/joints_detail/{removed_name}",
                 rr.Clear(recursive=False),
             )
         self._logged_joint_names = current_joint_names
 
-        for index, name in enumerate(names):
-            entity = f"/world/skeleton/joints/{name}"
+        detailed_names = names if self.args.detailed_joint_entities else ()
+        for index, name in enumerate(detailed_names):
+            entity = f"/world/skeleton/joints_detail/{name}"
             if name not in points:
                 # Rerun keeps the latest component value until explicitly
                 # cleared. Without this, an occluded joint floats indefinitely.
@@ -751,6 +788,20 @@ class RerunSkeletonApp:
                     payload, _address = sock.recvfrom(2_000_000)
                 except socket.timeout:
                     continue
+                # Rendering and RRD writes are intentionally slower than the
+                # lossless 15 Hz JSONL recorder.  Never replay an accumulated
+                # UDP backlog: drain it and visualize the newest complete
+                # sample so the live window remains current instead of several
+                # seconds behind the robot.
+                sock.setblocking(False)
+                try:
+                    while True:
+                        newest, _address = sock.recvfrom(2_000_000)
+                        payload = newest
+                except BlockingIOError:
+                    pass
+                finally:
+                    sock.settimeout(0.2)
                 try:
                     packet = json.loads(payload.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):

@@ -89,7 +89,17 @@ G1_SKELETON_BODIES = (
     "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link",
     "left_shoulder_pitch_link", "left_elbow_link", "left_wrist_roll_rubber_hand",
     "right_shoulder_pitch_link", "right_elbow_link", "right_wrist_roll_rubber_hand",
+    "left_hand_endpoint", "right_hand_endpoint",
 )
+# The 23-DOF articulation ends at the wrist-roll link origin.  Unitree's
+# official rubber-hand link continues about 10.8 cm along its local +X axis
+# (the link inertial/mesh centre is at x=0.1079465 m).  Exposing this virtual
+# endpoint fixes the misleading 10.1 cm elbow-to-"hand" line without inventing
+# wrist pitch/yaw commands that do not exist in the stable 23-DOF controller.
+G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M = {
+    "left": np.asarray([0.1079465665, 0.00163511945, 0.00202244863], dtype=np.float64),
+    "right": np.asarray([0.1079465665, -0.00163511945, 0.00202244863], dtype=np.float64),
+}
 G1_SKELETON_EDGES = (
     ("pelvis", "torso_link"),
     ("pelvis", "left_hip_roll_link"), ("left_hip_roll_link", "left_knee_link"),
@@ -99,9 +109,11 @@ G1_SKELETON_EDGES = (
     ("torso_link", "left_shoulder_pitch_link"),
     ("left_shoulder_pitch_link", "left_elbow_link"),
     ("left_elbow_link", "left_wrist_roll_rubber_hand"),
+    ("left_wrist_roll_rubber_hand", "left_hand_endpoint"),
     ("torso_link", "right_shoulder_pitch_link"),
     ("right_shoulder_pitch_link", "right_elbow_link"),
     ("right_elbow_link", "right_wrist_roll_rubber_hand"),
+    ("right_wrist_roll_rubber_hand", "right_hand_endpoint"),
 )
 HUMAN_RETARGET_EDGES = (
     ("pelvis", "spine3"),
@@ -111,8 +123,10 @@ HUMAN_RETARGET_EDGES = (
     ("right_knee", "right_foot"),
     ("spine3", "left_shoulder"),
     ("left_shoulder", "left_elbow"), ("left_elbow", "left_wrist"),
+    ("left_wrist", "left_hand_endpoint"),
     ("spine3", "right_shoulder"),
     ("right_shoulder", "right_elbow"), ("right_elbow", "right_wrist"),
+    ("right_wrist", "right_hand_endpoint"),
 )
 
 
@@ -601,6 +615,17 @@ def forward_g1_skeleton(
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
         if body_id >= 0:
             positions[name] = data.xpos[body_id].astype(float).tolist()
+    for side in ("left", "right"):
+        wrist_name = f"{side}_wrist_roll_rubber_hand"
+        wrist_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, wrist_name)
+        if wrist_id < 0:
+            continue
+        endpoint = (
+            data.xpos[wrist_id]
+            + data.xmat[wrist_id].reshape(3, 3)
+            @ G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side]
+        )
+        positions[f"{side}_hand_endpoint"] = endpoint.astype(float).tolist()
     self_contacts = 0
     for contact in data.contact:
         first = int(model.geom_bodyid[int(contact.geom1)])
@@ -613,6 +638,37 @@ def forward_g1_skeleton(
         ):
             self_contacts += 1
     return positions, self_contacts
+
+
+def retarget_human_visualization_positions(
+    human_data: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> dict[str, list[float]]:
+    """Return GMR task points plus the physical rubber-hand endpoint.
+
+    ``left_wrist``/``right_wrist`` remain the exact wrist-roll task origins
+    used by GMR.  The derived endpoint is visualization/quality metadata only;
+    it makes the displayed human target comparable to the complete G1 hand.
+    """
+    positions = {
+        name: np.asarray(value[0], dtype=float).tolist()
+        for name, value in human_data.items()
+    }
+    for side in ("left", "right"):
+        elbow = np.asarray(positions.get(f"{side}_elbow", []), dtype=np.float64)
+        wrist = np.asarray(positions.get(f"{side}_wrist", []), dtype=np.float64)
+        if elbow.shape != (3,) or wrist.shape != (3,):
+            continue
+        direction = wrist - elbow
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1.0e-8 or not np.isfinite(direction).all():
+            continue
+        endpoint_length = float(
+            np.linalg.norm(G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side])
+        )
+        positions[f"{side}_hand_endpoint"] = (
+            wrist + direction * (endpoint_length / norm)
+        ).astype(float).tolist()
+    return positions
 
 
 def retarget_with_iterations(
@@ -1291,6 +1347,9 @@ def main() -> int:
                     "t5_gmr_finish_ns": bridge_send_timestamp_ns,
                 }
             )
+            human_visualization = retarget_human_visualization_positions(
+                adapted.human_data
+            )
             packet = {
                 "schema": "zed_gmr_g1_23dof_live/v1",
                 "sequence": int(frame.get("sequence", accepted)),
@@ -1353,12 +1412,9 @@ def main() -> int:
                     "safe_positions_m": safe_skeleton,
                 },
                 "retarget_comparison": {
-                    "human_body_names": list(adapted.human_data),
+                    "human_body_names": list(human_visualization),
                     "human_edges": [list(edge) for edge in HUMAN_RETARGET_EDGES],
-                    "human_positions_m": {
-                        name: np.asarray(value[0], dtype=float).tolist()
-                        for name, value in adapted.human_data.items()
-                    },
+                    "human_positions_m": human_visualization,
                 },
                 "latency_trace_ns": latency_trace,
                 "bridge_metrics": {
@@ -1409,6 +1465,24 @@ def main() -> int:
                     ),
                     "right_direct_ik_candidate_count": (
                         arm_ik_refiner.last_candidate_count["right"]
+                    ),
+                    "left_direct_ik_target_motion_m": (
+                        arm_ik_refiner.last_target_motion_m["left"]
+                    ),
+                    "right_direct_ik_target_motion_m": (
+                        arm_ik_refiner.last_target_motion_m["right"]
+                    ),
+                    "left_front_clearance_blend": (
+                        arm_ik_refiner.last_front_clearance_blend["left"]
+                    ),
+                    "right_front_clearance_blend": (
+                        arm_ik_refiner.last_front_clearance_blend["right"]
+                    ),
+                    "left_front_clearance_shift_m": (
+                        arm_ik_refiner.last_front_clearance_shift_m["left"]
+                    ),
+                    "right_front_clearance_shift_m": (
+                        arm_ik_refiner.last_front_clearance_shift_m["right"]
                     ),
                     "left_arm_pole_source": adapter.last_arm_pole_source["left"],
                     "right_arm_pole_source": adapter.last_arm_pole_source["right"],

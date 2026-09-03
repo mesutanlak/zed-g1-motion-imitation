@@ -7,9 +7,10 @@ param(
     [int]$ListenPort = 15052,
     [int]$GmrListenPort = 15053,
     [ValidateRange(1, 60)]
-    [int]$LiveMaxHz = 30,
+    [int]$LiveMaxHz = 15,
     [ValidateRange(1, 60)]
-    [int]$GmrLogMaxHz = 30,
+    [int]$GmrLogMaxHz = 15,
+    [switch]$DetailedJointEntities,
     [switch]$NoViewer,
     [switch]$Headless,
     [switch]$NoRealtime
@@ -85,6 +86,9 @@ if ($Headless) {
 }
 if ($NoRealtime) {
     $arguments += "--no-realtime"
+}
+if ($DetailedJointEntities) {
+    $arguments += "--detailed-joint-entities"
 }
 
 Write-Host "Bagimsiz Rerun BODY_38 analiz sistemi baslatiliyor..."

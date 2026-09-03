@@ -30,7 +30,9 @@ param(
     [ValidateRange(35, 90)]
     [int]$PreviewJpegQuality = 65,
     [switch]$RecordLocal,
-    [switch]$RecordSvo2
+    [switch]$RecordSvo2,
+    [string]$OutputDir = "",
+    [string]$RecordStem = ""
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -69,6 +71,12 @@ if ($PreviewHost) {
         "--preview-stream-width", "$PreviewWidth",
         "--preview-jpeg-quality", "$PreviewJpegQuality"
     )
+}
+if ($OutputDir) {
+    $arguments += @("--output-dir", $OutputDir)
+}
+if ($RecordStem) {
+    $arguments += @("--record-stem", $RecordStem)
 }
 if ($RecordSvo2) {
     $arguments += @("--record", "--record-svo2")

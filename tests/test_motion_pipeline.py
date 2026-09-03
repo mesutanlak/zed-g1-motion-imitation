@@ -496,6 +496,26 @@ def test_forearm_across_torso_is_a_hard_robot_body_barrier() -> None:
     assert report.minimum_margin_m < 0.0
 
 
+def test_physical_hand_endpoint_extends_collision_capsule() -> None:
+    positions = {
+        "pelvis": [0.0, 0.0, 0.0],
+        "torso_link": [0.0, 0.0, 0.4],
+        "left_shoulder_pitch_link": [0.0, 0.28, 0.44],
+        "left_elbow_link": [0.0, 0.35, 0.38],
+        "left_wrist_roll_rubber_hand": [0.0, 0.25, 0.32],
+        # The wrist-roll origin itself is outside the torso; the physical
+        # rubber hand crosses inward and must still trip the body barrier.
+        "left_hand_endpoint": [0.0, 0.02, 0.31],
+        "right_shoulder_pitch_link": [0.0, -0.28, 0.44],
+        "right_elbow_link": [0.0, -0.50, 0.35],
+        "right_wrist_roll_rubber_hand": [0.0, -0.70, 0.25],
+        "right_hand_endpoint": [0.0, -0.80, 0.22],
+    }
+    report = upper_body_capsule_report(positions)
+    assert "left_hand__torso" in report.risk_pairs
+    assert report.hard_pair_margins_m["left_hand__torso"] < 0.0
+
+
 def test_collision_governor_degrades_only_unsafe_arm() -> None:
     filter_ = G1FeasibilityFilter(yellow_blend=0.82)
     command = np.zeros(23)

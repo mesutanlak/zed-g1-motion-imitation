@@ -75,6 +75,8 @@ IMITATION_FIELDS = (
     "left_direct_ik_objective_m", "right_direct_ik_objective_m",
     "left_direct_ik_upper_error_deg", "right_direct_ik_upper_error_deg",
     "left_direct_ik_forearm_error_deg", "right_direct_ik_forearm_error_deg",
+    "left_front_clearance_blend", "right_front_clearance_blend",
+    "left_front_clearance_shift_m", "right_front_clearance_shift_m",
     "gmr_upper_relative_residual_m", "mirror_rescue_triggered",
     "mirror_rescue_applied", "fusion_mode", "evidence_views",
     "cross_view_mpjpe_m", "cross_view_p95_m",
@@ -89,6 +91,9 @@ IMITATION_FIELDS = (
     "physics_wall_hz", "render_interval",
     "fusion_state",
     "joint_saturation_count", "self_collision_count",
+    "robot_body_barrier_projection_applied",
+    "robot_body_barrier_projection_alpha",
+    "robot_body_barrier_safe_margin_m",
     "left_hand_position_error_m", "right_hand_position_error_m",
     "left_elbow_position_error_m", "right_elbow_position_error_m",
     "policy_control_mode", "policy_inference_wrapper_version",
@@ -384,6 +389,15 @@ class AnalysisSessionWriter:
             ),
             "joint_saturation_count": safety.get("joint_limit_saturation"),
             "self_collision_count": safety.get("safe_self_collision_count"),
+            "robot_body_barrier_projection_applied": safety.get(
+                "robot_body_barrier_projection_applied"
+            ),
+            "robot_body_barrier_projection_alpha": safety.get(
+                "robot_body_barrier_projection_alpha"
+            ),
+            "robot_body_barrier_safe_margin_m": safety.get(
+                "robot_body_barrier_safe_margin_m"
+            ),
             "policy_control_mode": policy_observation.get("control_mode"),
             "policy_inference_wrapper_version": policy_observation.get(
                 "inference_wrapper_version"
@@ -428,8 +442,12 @@ class AnalysisSessionWriter:
         body_errors = isaac.get("body_position_errors_m") or {}
         for side in ("left", "right"):
             row[f"{side}_hand_position_error_m"] = body_errors.get(
-                f"{side}_wrist_roll_rubber_hand"
+                f"{side}_hand_endpoint"
             )
+            if row[f"{side}_hand_position_error_m"] is None:
+                row[f"{side}_hand_position_error_m"] = body_errors.get(
+                    f"{side}_wrist_roll_rubber_hand"
+                )
             row[f"{side}_elbow_position_error_m"] = body_errors.get(
                 f"{side}_elbow_link"
             )
@@ -437,9 +455,17 @@ class AnalysisSessionWriter:
             h = _interior_deg(human, *chains["human"][side])
             row[f"{side}_human_elbow_deg"] = h
             for variant in ("raw", "safe", "actual"):
+                variant_positions = skeleton.get(f"{variant}_positions_m") or {}
+                g1_chain = list(chains["g1"][side])
+                endpoint_name = f"{side}_hand_endpoint"
+                # New packets expose the physical rubber-hand endpoint.  Old
+                # recordings ended at the wrist-roll body origin; retain that
+                # fallback so historical sessions remain analyzable.
+                if endpoint_name in variant_positions:
+                    g1_chain[-1] = endpoint_name
                 value = _interior_deg(
-                    skeleton.get(f"{variant}_positions_m") or {},
-                    *chains["g1"][side],
+                    variant_positions,
+                    *g1_chain,
                 )
                 row[f"{side}_{variant}_elbow_deg"] = value
                 if variant in ("safe", "actual"):
@@ -489,6 +515,12 @@ class AnalysisSessionWriter:
             row[f"{side}_direct_ik_forearm_error_deg"] = direction_error.get(
                 "forearm"
             )
+            row[f"{side}_front_clearance_blend"] = bridge.get(
+                f"{side}_front_clearance_blend"
+            )
+            row[f"{side}_front_clearance_shift_m"] = bridge.get(
+                f"{side}_front_clearance_shift_m"
+            )
         with self._imitation_lock:
             self.imitation_count += 1
             record = {
@@ -513,6 +545,8 @@ class AnalysisSessionWriter:
             "left_direct_ik_objective_m", "right_direct_ik_objective_m",
             "left_direct_ik_upper_error_deg", "right_direct_ik_upper_error_deg",
             "left_direct_ik_forearm_error_deg", "right_direct_ik_forearm_error_deg",
+            "left_front_clearance_blend", "right_front_clearance_blend",
+            "left_front_clearance_shift_m", "right_front_clearance_shift_m",
             "gmr_upper_relative_residual_m", "cross_view_mpjpe_m",
             "cross_view_p95_m", "post_alignment_mpjpe_m",
             "post_alignment_p95_m", "pelvis_disagreement_m",
@@ -528,6 +562,8 @@ class AnalysisSessionWriter:
             "physics_wall_hz",
             "right_hand_position_error_m", "left_elbow_position_error_m",
             "right_elbow_position_error_m",
+            "robot_body_barrier_projection_alpha",
+            "robot_body_barrier_safe_margin_m",
             "policy_raw_action_abs_max", "policy_raw_action_abs_p90",
             "policy_raw_action_saturation_rate", "policy_clipped_unclipped_l1",
             "policy_residual_rms_rad", "policy_residual_abs_max_rad",

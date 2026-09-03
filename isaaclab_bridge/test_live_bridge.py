@@ -14,13 +14,21 @@ from pathlib import Path
 
 import numpy as np
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from zed_four_camera_test.distributed_body38_fusion import compact_live_packet
+from motion_pipeline.safety import G1_23_LIMITS_RAD
+
 
 def to_live(record: dict) -> dict:
     if record.get("schema") == "zed_body38_live/v1":
-        # Preserve native live packets byte-for-byte at the semantic level.
-        # In particular, this exercises compatibility gates for previously
-        # recorded distributed-fusion sessions.
-        return dict(record)
+        # Lossless four-view JSONL records exceed one UDP datagram because
+        # they include every raw camera skeleton.  The production receiver
+        # sends this exact compact control contract to WSL/GMR; replay it too
+        # instead of failing with EMSGSIZE before the bridge is exercised.
+        return compact_live_packet(record)
     # Preserve pelvis-local coordinates, calibration and occlusion metadata so
     # this regression test exercises the exact live retargeting path.
     packet = dict(record)
@@ -110,6 +118,9 @@ def main() -> int:
     mirror_reasons: Counter[str] = Counter()
     mirror_task_improvement_m: list[float] = []
     mirror_margin_improvement_m: list[float] = []
+    raw_contact_frames = 0
+    barrier_projection_frames = 0
+    front_clearance_frames = {"left": 0, "right": 0}
     try:
         time.sleep(2.0)
         with recording.open("r", encoding="utf-8") as stream:
@@ -151,18 +162,27 @@ def main() -> int:
                     safe_by_name = dict(
                         zip(packet["joint_names"], packet["safe_joint_position_rad"])
                     )
-                    for elbow in ("left_elbow_joint", "right_elbow_joint"):
-                        assert float(raw_by_name[elbow]) >= -1.0e-5, (
-                            elbow, raw_by_name[elbow]
+                    # G1 elbow zero is mechanically offset; negative motor
+                    # angles are valid flexion, not human hyperextension.
+                    # Validate the official physical range for every joint.
+                    for index, joint_name in enumerate(packet["joint_names"]):
+                        low, high = G1_23_LIMITS_RAD[index]
+                        assert low - 1.0e-6 <= float(raw_by_name[joint_name]) <= high + 1.0e-6, (
+                            joint_name, raw_by_name[joint_name]
                         )
-                        assert float(safe_by_name[elbow]) >= -1.0e-5, (
-                            f"safe_{elbow}", safe_by_name[elbow]
+                        assert low - 1.0e-6 <= float(safe_by_name[joint_name]) <= high + 1.0e-6, (
+                            f"safe_{joint_name}", safe_by_name[joint_name]
                         )
                     comparison = packet.get("retarget_comparison") or {}
                     assert comparison.get("human_positions_m"), comparison
                     skeleton = packet.get("g1_skeleton") or {}
                     assert skeleton.get("raw_positions_m"), skeleton
                     assert skeleton.get("safe_positions_m"), skeleton
+                    for side in ("left", "right"):
+                        assert (
+                            f"{side}_hand_endpoint"
+                            in skeleton["safe_positions_m"]
+                        ), skeleton["safe_positions_m"].keys()
                     received_packets += 1
                     metrics = packet.get("bridge_metrics") or {}
                     relative = metrics.get("ik_upper_relative_residual_m")
@@ -172,6 +192,18 @@ def main() -> int:
                     if absolute is not None and math.isfinite(float(absolute)):
                         absolute_residuals.append(float(absolute))
                     safety = packet.get("safety") or {}
+                    raw_contact_frames += int(
+                        int(safety.get("raw_self_collision_count", 0) or 0) > 0
+                    )
+                    barrier_projection_frames += int(bool(
+                        safety.get("robot_body_barrier_projection_applied")
+                    ))
+                    for side in ("left", "right"):
+                        front_clearance_frames[side] += int(
+                            float(metrics.get(
+                                f"{side}_front_clearance_blend", 0.0
+                            ) or 0.0) > 0.01
+                        )
                     safety_levels[str(safety.get("level", "UNKNOWN"))] += 1
                     safety_reasons.update(str(reason) for reason in safety.get("reasons", []))
                     if bool(metrics.get("mirror_rescue_triggered")):
@@ -223,6 +255,9 @@ def main() -> int:
                             f"absolute_p95={np.percentile(absolute_residuals, 95):.4f} "
                             f"levels={dict(safety_levels)} "
                             f"reason_counts={dict(safety_reasons)} "
+                            f"raw_contact_frames={raw_contact_frames} "
+                            f"barrier_frames={barrier_projection_frames} "
+                            f"front_clearance={front_clearance_frames} "
                             f"max_abs_q={max_abs_q:.3f}"
                         )
                         return 0

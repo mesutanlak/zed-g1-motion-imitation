@@ -304,6 +304,14 @@ class ArmPositionIKRefiner:
 
     def reset(self, qpos: np.ndarray | None = None) -> None:
         self.previous.clear()
+        if hasattr(self, "previous_target"):
+            self.previous_target.clear()
+            self.last_target_motion_m = {"left": 0.0, "right": 0.0}
+        if hasattr(self, "last_front_clearance_blend"):
+            self.last_front_clearance_blend = {"left": 0.0, "right": 0.0}
+            self.last_front_clearance_shift_m = {
+                "left": 0.0, "right": 0.0,
+            }
         self.last_error_m = {"left": 0.0, "right": 0.0}
         self.last_gmr_error_m = {"left": 0.0, "right": 0.0}
         self.last_used_baseline = {"left": False, "right": False}
@@ -691,6 +699,16 @@ class SimpleArmPositionIK(ArmPositionIKRefiner):
             straightness_threshold_deg=straightness_threshold_deg,
         )
         self.segment_lengths: dict[str, tuple[float, float]] = {}
+        self.previous_target: dict[str, np.ndarray] = {}
+        self.last_target_motion_m: dict[str, float] = {
+            "left": 0.0, "right": 0.0,
+        }
+        self.last_front_clearance_blend: dict[str, float] = {
+            "left": 0.0, "right": 0.0,
+        }
+        self.last_front_clearance_shift_m: dict[str, float] = {
+            "left": 0.0, "right": 0.0,
+        }
         self.free_joint_qpos_addresses = [
             int(self.model.jnt_qposadr[joint_id])
             for joint_id in range(self.model.njnt)
@@ -711,6 +729,79 @@ class SimpleArmPositionIK(ArmPositionIKRefiner):
         self.data.qpos[:] = saved_qpos
         mujoco.mj_forward(self.model, self.data)
 
+    def _front_clearance_target(
+        self,
+        side: str,
+        human_data: Mapping[str, tuple[np.ndarray, np.ndarray]],
+        shoulder: np.ndarray,
+        wrist: np.ndarray,
+        target_elbow: np.ndarray,
+        target_wrist: np.ndarray,
+        upper_length: float,
+        forearm_length: float,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Route a human cross-body gesture in front of the G1 trunk.
+
+        BODY_38 may correctly place a wrist across the torso while direct
+        direction retargeting sends the shorter G1 forearm through its chest.
+        Only the robot-space target is moved forward; lateral/vertical intent
+        and both physical link lengths are retained. Arms behind the operator
+        are deliberately left unchanged.
+        """
+        left_entry = human_data.get("left_shoulder")
+        right_entry = human_data.get("right_shoulder")
+        if left_entry is None or right_entry is None:
+            return target_elbow, target_wrist, 0.0, 0.0
+        left_shoulder = np.asarray(left_entry[0], dtype=np.float64)
+        right_shoulder = np.asarray(right_entry[0], dtype=np.float64)
+        lateral = left_shoulder - right_shoulder
+        width = float(np.linalg.norm(lateral))
+        if width < 1.0e-8:
+            return target_elbow, target_wrist, 0.0, 0.0
+        lateral /= width
+        center = 0.5 * (left_shoulder + right_shoulder)
+        wrist_lateral = float(np.dot(wrist - center, lateral))
+        own_lateral = wrist_lateral if side == "left" else -wrist_lateral
+        forward = float(wrist[0] - shoulder[0])
+        crossing_blend = float(np.clip(
+            (0.15 - own_lateral) / 0.13, 0.0, 1.0
+        ))
+        # A wrist on the torso plane must already route around the front
+        # shell. Only a wrist clearly more than 2 cm behind the shoulder is
+        # treated as an intentional behind-the-back gesture.
+        front_blend = float(np.clip((forward + 0.02) / 0.02, 0.0, 1.0))
+        blend = crossing_blend * front_blend
+        if blend <= 0.0:
+            return target_elbow, target_wrist, 0.0, 0.0
+
+        # 22 cm from the shoulder keeps the wrist-roll origin ahead of the
+        # official trunk while leaving reach for the 10 cm G1 forearm.
+        requested_x = float(
+            target_wrist[0] + blend * max(0.0, 0.22 - target_wrist[0])
+        )
+        shift = max(0.0, requested_x - float(target_wrist[0]))
+        if shift <= 0.0:
+            return target_elbow, target_wrist, blend, 0.0
+        elbow_candidate = target_elbow + np.asarray(
+            [0.85 * shift, 0.0, 0.0], dtype=np.float64
+        )
+        elbow_norm = float(np.linalg.norm(elbow_candidate))
+        if elbow_norm > 1.0e-8:
+            elbow_candidate *= upper_length / elbow_norm
+        wrist_candidate = target_wrist + np.asarray(
+            [shift, 0.0, 0.0], dtype=np.float64
+        )
+        forearm_candidate = wrist_candidate - elbow_candidate
+        forearm_norm = float(np.linalg.norm(forearm_candidate))
+        if forearm_norm > 1.0e-8:
+            forearm_candidate *= forearm_length / forearm_norm
+        return (
+            elbow_candidate,
+            elbow_candidate + forearm_candidate,
+            blend,
+            shift,
+        )
+
     def update(
         self,
         qpos: np.ndarray,
@@ -728,6 +819,10 @@ class SimpleArmPositionIK(ArmPositionIKRefiner):
                 result[address + 3:address + 7] = (1.0, 0.0, 0.0, 0.0)
         self.data.qpos[:] = result
         for side, chain in self.chains.items():
+            # Telemetry describes this frame, never the last valid arm frame.
+            self.last_front_clearance_blend[side] = 0.0
+            self.last_front_clearance_shift_m[side] = 0.0
+            self.last_target_motion_m[side] = 0.0
             names = (
                 f"{side}_shoulder", f"{side}_elbow", f"{side}_wrist"
             )
@@ -749,10 +844,25 @@ class SimpleArmPositionIK(ArmPositionIKRefiner):
             forearm_direction = forearm / forearm_norm
             upper_length, forearm_length = self.segment_lengths[side]
             target_elbow = upper_direction * upper_length
-            target = np.concatenate((
+            target_wrist = target_elbow + forearm_direction * forearm_length
+            (
                 target_elbow,
-                target_elbow + forearm_direction * forearm_length,
-            ))
+                target_wrist,
+                front_clearance_blend,
+                front_clearance_shift_m,
+            ) = self._front_clearance_target(
+                side,
+                human_data,
+                shoulder,
+                wrist,
+                target_elbow,
+                target_wrist,
+                upper_length,
+                forearm_length,
+            )
+            self.last_front_clearance_blend[side] = front_clearance_blend
+            self.last_front_clearance_shift_m[side] = front_clearance_shift_m
+            target = np.concatenate((target_elbow, target_wrist))
             turn = self._direction_error_rad(upper, forearm)
             straightness = float(np.clip(
                 (np.radians(self.straightness_threshold_deg) - turn)
@@ -801,14 +911,27 @@ class SimpleArmPositionIK(ArmPositionIKRefiner):
                 )
                 candidates.append((source, solved))
 
-            def score(candidate: np.ndarray) -> float:
+            previous_target = self.previous_target.get(side)
+            target_motion_m = (
+                float(np.linalg.norm(target - previous_target))
+                if previous_target is not None else 0.0
+            )
+            self.last_target_motion_m[side] = target_motion_m
+
+            def score(source_name: str, candidate: np.ndarray) -> float:
                 objective, _, _, _ = self._candidate_objective(
                     chain, target, candidate, previous, straightness
                 )
+                if source_name == "PREVIOUS_HOLD":
+                    # Preserve a stationary pose, but do not let temporal
+                    # continuity freeze an arm whose BODY_38 target is moving.
+                    # Below 4 mm is fused sensor noise; motion above it applies
+                    # a proportional penalty only to the hold candidate.
+                    objective += 0.60 * max(0.0, target_motion_m - 0.004)
                 return objective
 
             source, proposed = min(
-                candidates, key=lambda item: score(item[1])
+                candidates, key=lambda item: score(item[0], item[1])
             )
             if straightness >= 0.5:
                 # At BODY_38 elbow angles of roughly 168 degrees and above,
@@ -845,6 +968,7 @@ class SimpleArmPositionIK(ArmPositionIKRefiner):
             }
             self.last_candidate_objective_m[side] = position_rms
             self.previous[side] = proposed.copy()
+            self.previous_target[side] = target.copy()
             result[qpos_ids] = proposed
         self.data.qpos[:] = result
         mujoco.mj_forward(self.model, self.data)

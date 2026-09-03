@@ -174,6 +174,7 @@ $receiverArguments = @{
     PreferredFullSetSpreadMs = $PreferredFullSetSpreadMs
     FullSetWaitMs = $FullSetWaitMs
     SourceTimeoutMs = 250
+    MaxJointSpreadM = 0.18
     MaxTemporalPredictionMs = 70
     MaxAlignmentTranslationM = 0.25
     WorkspaceXMinM = $WorkspaceXMinM

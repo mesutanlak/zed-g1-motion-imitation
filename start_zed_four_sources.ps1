@@ -20,7 +20,8 @@ param(
     [ValidateRange(1, 10)]
     [double]$PreviewHz = 8,
     [switch]$RecordLocal,
-    [switch]$RecordSvo2
+    [switch]$RecordSvo2,
+    [string]$SvoRecordDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +51,15 @@ else {
     )
     $bodyTarget = "127.0.0.1"
     $previewTarget = "127.0.0.1"
+}
+
+# ZED's native recorder can fail on Windows paths containing non-ASCII
+# characters. Keep SVO2 output in a short ASCII-only local path by default.
+# A serial-numbered stem also prevents the two cameras started in the same
+# second from trying to open the same JSONL/SVO2 pair.
+$recordSession = Get-Date -Format "yyyyMMdd_HHmmss"
+if ($RecordSvo2 -and -not $SvoRecordDir) {
+    $SvoRecordDir = Join-Path $env:LOCALAPPDATA "ZED_G1\recordings"
 }
 
 $probeOutput = @(& $python $deviceProbe --list-devices 2>&1)
@@ -85,10 +95,16 @@ foreach ($definition in $definitions) {
         "-PreviewHz", "$PreviewHz"
     )
     if ($RecordSvo2) {
-        $arguments += "-RecordSvo2"
+        $recordStem = "zed_body38_$($definition.Serial)_$recordSession"
+        $arguments += @(
+            "-RecordSvo2",
+            "-OutputDir", $SvoRecordDir,
+            "-RecordStem", $recordStem
+        )
     }
     elseif ($RecordLocal) {
-        $arguments += "-RecordLocal"
+        $recordStem = "zed_body38_$($definition.Serial)_$recordSession"
+        $arguments += @("-RecordLocal", "-RecordStem", $recordStem)
     }
     if ($CalibrationMode -and $DisableCalibrationDistanceGate) {
         $arguments += "-DisableDistanceGate"
@@ -112,4 +128,7 @@ else {
     Write-Host "Kesin 2-4 m operator hacmi ana PC'de, kalibre edilmis ortak dunya koordinatinda uygulanir."
 }
 Write-Host "Seriler: $((@($definitions | ForEach-Object { $_.Serial })) -join ', ')"
+if ($RecordSvo2) {
+    Write-Host "SVO2/JSONL yerel kayit klasoru: $SvoRecordDir"
+}
 Write-Host "Her kaynak penceresini acik birakin. Operator kilidi gerekirse yalniz ilgili kaynak penceresinde R tusuna basin."

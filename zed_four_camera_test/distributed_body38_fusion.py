@@ -1321,8 +1321,48 @@ def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
 
 
 def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
-    """Keep four raw camera skeletons for Rerun while bounding UDP JSON size."""
-    return quantize_udp_floats(packet)
+    """Build the bounded four-view packet consumed by live Rerun.
+
+    The lossless JSONL recorder keeps the complete fusion document.  Rerun
+    needs the fused BODY_38 skeleton, calibrated per-camera skeletons and
+    timing/quality metrics, but not covariance tensors, duplicate source
+    packets or every calibration diagnostic.  Keeping an explicit allow-list
+    prevents the analysis socket from becoming a 55-60 kB bottleneck while
+    preserving everything drawn or exported by ``rerun_analysis``.
+    """
+    result = compact_live_packet(packet)
+    multi = dict(packet.get("multi_camera") or {})
+    compact_multi = dict(result.get("multi_camera") or {})
+    for key in ("camera_pose_fusion_from_local", "source_operator_selections"):
+        if key in multi:
+            compact_multi[key] = multi[key]
+
+    source_views = {
+        int(view.get("serial_number")): view
+        for view in multi.get("per_camera") or []
+        if isinstance(view, dict) and view.get("serial_number") is not None
+    }
+    analysis_views: list[dict[str, Any]] = []
+    for compact_view in compact_multi.get("per_camera") or []:
+        view = dict(compact_view)
+        source = source_views.get(int(view.get("serial_number", -1)), {})
+        for key in (
+            "keypoints_3d_fusion_m", "keypoint_confidence",
+            "operator_selection", "occlusion_analysis", "distance_quality",
+            "euclidean_distance_m",
+        ):
+            if key in source:
+                view[key] = source[key]
+        analysis_views.append(view)
+    compact_multi["per_camera"] = analysis_views
+
+    fusion_metrics = dict(multi.get("fusion_metrics") or {})
+    compact_fusion_metrics = dict(compact_multi.get("fusion_metrics") or {})
+    if "per_camera" in fusion_metrics:
+        compact_fusion_metrics["per_camera"] = fusion_metrics["per_camera"]
+    compact_multi["fusion_metrics"] = compact_fusion_metrics
+    result["multi_camera"] = compact_multi
+    return quantize_udp_floats(result)
 
 
 def draw_four_preview(
@@ -1384,18 +1424,24 @@ def draw_four_preview(
             if selection_state in {"ACQUIRING", "LOST"}
             else (150, 150, 150)
         )
-        cv2.rectangle(tile, (0, 0), (tile_width, 82), (18, 18, 18), -1)
-        cv2.putText(tile, f"ZED {endpoint.serial}  BODY {body_fps:.1f} fps  RX {rx_fps:.1f} fps", (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, color, 2, cv2.LINE_AA)
-        cv2.putText(tile, f"secim={selection_state}  kilit_id={lock_text}  kisi={detected_count}  preview={preview_age_text}", (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, selection_color, 1, cv2.LINE_AA)
-        cv2.putText(tile, f"durum={metric.get('status', 'YOK')}  X={world_x_text}/{workspace_state}  gecikme={capture_text}  ag={queue_text}", (12, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
+        # One small translucent console replaces the old 82 px opaque banner.
+        # Source previews are intentionally transmitted without their local
+        # diagnostics overlay, so the operator's head and shoulders stay clear.
+        console_width, console_height = 355, 55
+        roi = tile[:console_height, :console_width]
+        shade = np.zeros_like(roi)
+        cv2.addWeighted(shade, 0.56, roi, 0.44, 0.0, dst=roi)
+        cv2.putText(tile, f"ZED {endpoint.serial}  B {body_fps:.1f}  RX {rx_fps:.1f}", (7, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
+        cv2.putText(tile, f"{selection_state} id={lock_text} kisi={detected_count} oniz={preview_age_text}", (7, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.33, selection_color, 1, cv2.LINE_AA)
+        cv2.putText(tile, f"{metric.get('status', 'YOK')} X={world_x_text}/{workspace_state} lat={capture_text} q={queue_text}", (7, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (225, 225, 225), 1, cv2.LINE_AA)
         tiles.append(tile)
     while len(tiles) < 4:
         tiles.append(np.zeros((tile_height, tile_width, 3), dtype=np.uint8))
     grid = np.vstack((np.hstack((tiles[0], tiles[1])), np.hstack((tiles[2], tiles[3]))))
-    footer = np.zeros((82, grid.shape[1], 3), dtype=np.uint8)
+    footer = np.zeros((58, grid.shape[1], 3), dtype=np.uint8)
     spread = f"{arrival_spread_ms:.1f} ms" if math.isfinite(arrival_spread_ms) else "n/a"
-    cv2.putText(footer, f"4-ZED BODY_38 | bagli={len(connected)}/4 | body_taze={len(body_fresh)}/4 | fusion_katki={len(contributing)}/4 | fusion={output_hz:.1f} fps | yayilim={spread}", (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (80, 235, 235), 2, cv2.LINE_AA)
-    cv2.putText(footer, f"REC={'ON' if recording else 'OFF'} kare={recorded} drop={record_dropped} | S: kayit ac/kapat | Q/ESC: cikis", (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (60, 220, 80) if recording else (200, 200, 200), 2, cv2.LINE_AA)
+    cv2.putText(footer, f"4-ZED | bagli={len(connected)}/4 taze={len(body_fresh)}/4 katki={len(contributing)}/4 fusion={output_hz:.1f}fps yayilim={spread}", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80, 235, 235), 1, cv2.LINE_AA)
+    cv2.putText(footer, f"REC={'ON' if recording else 'OFF'} kare={recorded} drop={record_dropped} | S kayit | Q/ESC cikis", (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (60, 220, 80) if recording else (200, 200, 200), 1, cv2.LINE_AA)
     return np.vstack((grid, footer))
 
 

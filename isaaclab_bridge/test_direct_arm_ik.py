@@ -12,6 +12,11 @@ from g1_dof_projection import (
     SimpleArmPositionIK,
     official_g1_23dof_xml,
 )
+from gmr_live_bridge import (
+    G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M,
+    forward_g1_skeleton,
+    retarget_human_visualization_positions,
+)
 
 
 def _retargeter():
@@ -245,3 +250,155 @@ def test_simple_arm_ik_preserves_lateral_straight_elbows() -> None:
         straight = float(refiner.chains[side]["straight_elbow_rad"])
         assert abs(float(elbow) - straight) < 0.12
         assert refiner.last_direction_error_deg[side]["forearm"] < 10.0
+
+
+def test_g1_skeleton_exposes_official_rubber_hand_endpoints() -> None:
+    retargeter = _retargeter()
+    data = retargeter.configuration.data
+    skeleton, _ = forward_g1_skeleton(
+        retargeter.model, data.qpos.copy(), np.zeros(23, dtype=np.float64)
+    )
+    for side in ("left", "right"):
+        elbow = np.asarray(skeleton[f"{side}_elbow_link"])
+        wrist = np.asarray(skeleton[f"{side}_wrist_roll_rubber_hand"])
+        endpoint = np.asarray(skeleton[f"{side}_hand_endpoint"])
+        expected = float(np.linalg.norm(
+            G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side]
+        ))
+        assert abs(float(np.linalg.norm(endpoint - wrist)) - expected) < 1.0e-9
+        # The visual chain now reaches the physical rubber hand instead of
+        # stopping at the wrist-roll link origin (~10 cm after the elbow).
+        assert float(np.linalg.norm(endpoint - elbow)) > 0.19
+
+
+def test_human_retarget_visualization_preserves_wrist_and_adds_hand() -> None:
+    identity = np.asarray([1.0, 0.0, 0.0, 0.0])
+    human = {
+        "left_elbow": (np.asarray([0.0, 0.0, 0.0]), identity),
+        "left_wrist": (np.asarray([0.2, 0.0, 0.0]), identity),
+        "right_elbow": (np.asarray([0.0, 0.0, 0.0]), identity),
+        "right_wrist": (np.asarray([0.0, -0.2, 0.0]), identity),
+    }
+    visual = retarget_human_visualization_positions(human)
+    np.testing.assert_allclose(visual["left_wrist"], [0.2, 0.0, 0.0])
+    assert visual["left_hand_endpoint"][0] > 0.30
+    assert visual["right_hand_endpoint"][1] < -0.30
+
+
+def test_simple_arm_ik_does_not_hold_a_moving_target() -> None:
+    retargeter = _retargeter()
+    model = retargeter.model
+    data = retargeter.configuration.data
+    mujoco.mj_forward(model, data)
+    initial = data.qpos.copy()
+    initial_targets = _targets_from_current_pose(retargeter)
+    refiner = SimpleArmPositionIK(retargeter)
+    current = refiner.update(initial, initial_targets)
+
+    moved = initial.copy()
+    for side, sign in (("left", 1.0), ("right", -1.0)):
+        moved[_joint_qpos_id(model, f"{side}_shoulder_pitch_joint")] = -0.55
+        moved[_joint_qpos_id(model, f"{side}_shoulder_roll_joint")] = 0.30 * sign
+        moved[_joint_qpos_id(model, f"{side}_elbow_joint")] = 0.90
+    data.qpos[:] = moved
+    mujoco.mj_forward(model, data)
+    moved_targets = _targets_from_current_pose(retargeter)
+    current = refiner.update(moved, moved_targets)
+
+    for side in ("left", "right"):
+        assert refiner.last_target_motion_m[side] > 0.004
+        assert refiner.last_selected_source[side] != "PREVIOUS_HOLD"
+
+
+def _actuated_positions(model, qpos: np.ndarray) -> np.ndarray:
+    return np.asarray([
+        qpos[_joint_qpos_id(model, name)] for name in (
+            "left_hip_pitch_joint", "left_hip_roll_joint",
+            "left_hip_yaw_joint", "left_knee_joint",
+            "left_ankle_pitch_joint", "left_ankle_roll_joint",
+            "right_hip_pitch_joint", "right_hip_roll_joint",
+            "right_hip_yaw_joint", "right_knee_joint",
+            "right_ankle_pitch_joint", "right_ankle_roll_joint",
+            "waist_yaw_joint", "left_shoulder_pitch_joint",
+            "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+            "left_elbow_joint", "left_wrist_roll_joint",
+            "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint", "right_elbow_joint",
+            "right_wrist_roll_joint",
+        )
+    ], dtype=np.float64)
+
+
+def test_cross_body_arm_routes_in_front_without_robot_contact() -> None:
+    retargeter = _retargeter()
+    model = retargeter.model
+    data = retargeter.configuration.data
+    mujoco.mj_forward(model, data)
+    targets = _targets_from_current_pose(retargeter)
+    identity = np.asarray([1.0, 0.0, 0.0, 0.0])
+    shoulder = targets["left_shoulder"][0]
+    # A representative BODY_38 hand-over-chest gesture from the 14:32 run:
+    # the left wrist crosses the shoulder centreline while remaining in front.
+    targets["left_elbow"] = (
+        shoulder + np.asarray([0.05, -0.05, -0.17]), identity
+    )
+    targets["left_wrist"] = (
+        shoulder + np.asarray([0.08, -0.14, -0.15]), identity
+    )
+    right_shoulder = targets["right_shoulder"][0]
+    targets["right_elbow"] = (
+        right_shoulder + np.asarray([0.02, -0.19, 0.0]), identity
+    )
+    targets["right_wrist"] = (
+        right_shoulder + np.asarray([0.04, -0.29, 0.0]), identity
+    )
+    refiner = SimpleArmPositionIK(retargeter)
+    current = data.qpos.copy()
+    for _ in range(30):
+        current = refiner.update(current, targets)
+
+    skeleton, contacts = forward_g1_skeleton(
+        model, current, _actuated_positions(model, current)
+    )
+    left_wrist = np.asarray(skeleton["left_wrist_roll_rubber_hand"])
+    assert refiner.last_front_clearance_blend["left"] > 0.95
+    assert refiner.last_front_clearance_shift_m["left"] > 0.05
+    assert left_wrist[1] < 0.0
+    assert contacts == 0
+
+
+def test_both_arms_can_follow_to_same_side_without_contact() -> None:
+    retargeter = _retargeter()
+    model = retargeter.model
+    data = retargeter.configuration.data
+    mujoco.mj_forward(model, data)
+    targets = _targets_from_current_pose(retargeter)
+    identity = np.asarray([1.0, 0.0, 0.0, 0.0])
+    left_shoulder = targets["left_shoulder"][0]
+    right_shoulder = targets["right_shoulder"][0]
+    targets["left_elbow"] = (
+        left_shoulder + np.asarray([0.10, 0.12, 0.02]), identity
+    )
+    targets["left_wrist"] = (
+        left_shoulder + np.asarray([0.18, 0.20, 0.08]), identity
+    )
+    targets["right_elbow"] = (
+        right_shoulder + np.asarray([0.10, 0.10, -0.12]), identity
+    )
+    targets["right_wrist"] = (
+        right_shoulder + np.asarray([0.18, 0.20, -0.18]), identity
+    )
+    refiner = SimpleArmPositionIK(retargeter)
+    current = data.qpos.copy()
+    for _ in range(30):
+        current = refiner.update(current, targets)
+
+    skeleton, contacts = forward_g1_skeleton(
+        model, current, _actuated_positions(model, current)
+    )
+    left_wrist = np.asarray(skeleton["left_wrist_roll_rubber_hand"])
+    right_wrist = np.asarray(skeleton["right_wrist_roll_rubber_hand"])
+    assert refiner.last_front_clearance_blend["right"] > 0.95
+    assert left_wrist[1] > 0.0
+    assert right_wrist[1] > 0.0
+    assert contacts == 0

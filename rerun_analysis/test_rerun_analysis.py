@@ -194,6 +194,8 @@ def main() -> int:
             "reference_confidence", "reference_velocity_max_rad_s",
             "fusion_state", "left_direct_ik_selected_source",
             "right_direct_ik_forearm_error_deg",
+            "left_front_clearance_blend", "right_front_clearance_shift_m",
+            "robot_body_barrier_projection_alpha",
         ):
             if field not in imitation_fields:
                 raise AssertionError((field, imitation_fields))

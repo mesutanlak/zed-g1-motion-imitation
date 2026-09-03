@@ -18,7 +18,7 @@ param(
     [ValidateSet("fixed_double_support", "balance_policy")]
     [string]$StanceMode = "fixed_double_support",
     [ValidateRange(1.0, 60.0)]
-    [double]$InputFps = 30.0,
+    [double]$InputFps = 15.0,
     [ValidateRange(0.5, 20.0)]
     [double]$UpperCutoffHz = 10.0,
     [ValidateRange(0.1, 10.0)]
@@ -32,13 +32,13 @@ param(
     [ValidateSet("low_latency", "smooth_bounded")]
     [string]$ReferenceTrackingMode = "low_latency",
     [ValidateRange(0.2, 10.0)]
-    [double]$ReferenceResponseHz = 5.0,
+    [double]$ReferenceResponseHz = 5.5,
     [ValidateRange(0.2, 5.0)]
-    [double]$ReferenceMaxVelocity = 0.65,
+    [double]$ReferenceMaxVelocity = 0.85,
     [ValidateRange(0.5, 80.0)]
-    [double]$ReferenceMaxAcceleration = 2.5,
+    [double]$ReferenceMaxAcceleration = 4.0,
     [ValidateRange(1.0, 500.0)]
-    [double]$ReferenceMaxJerk = 25.0,
+    [double]$ReferenceMaxJerk = 35.0,
     [ValidateRange(0.1, 5.0)]
     [double]$UpperStiffnessScale = 2.0,
     [ValidateRange(0.1, 5.0)]

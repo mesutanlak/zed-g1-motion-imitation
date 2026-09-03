@@ -30,6 +30,8 @@ param(
     [ValidateRange(100, 5000)]
     [double]$SourceTimeoutMs = 250,
     [ValidateRange(0.05, 1.0)]
+    [double]$MaxJointSpreadM = 0.18,
+    [ValidateRange(0.05, 1.0)]
     [double]$MaxPoseDisagreementM = 0.22,
     [ValidateRange(0.25, 3.0)]
     [double]$MaxAlignmentTranslationM = 0.25,
@@ -106,6 +108,8 @@ $arguments += "--full-set-wait-ms"
 $arguments += "$FullSetWaitMs"
 $arguments += "--source-timeout-ms"
 $arguments += "$SourceTimeoutMs"
+$arguments += "--max-joint-spread-m"
+$arguments += "$MaxJointSpreadM"
 $arguments += "--max-pose-disagreement-m"
 $arguments += "$MaxPoseDisagreementM"
 $arguments += "--max-alignment-translation-m"

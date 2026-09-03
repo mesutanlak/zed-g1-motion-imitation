@@ -2234,6 +2234,13 @@ def main() -> int:
                 fps_frames = 0
                 fps_started_at = time.monotonic()
 
+            # The network preview is consumed by the four-camera mosaic, which
+            # adds its own compact status console.  Preserve the BODY_38 drawing
+            # but do not transmit this local full-width title or the optional
+            # diagnostics panel a second time: on a 640x360 tile they hid the
+            # operator's head and upper torso.
+            network_preview_frame = frame.copy()
+
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 70), (20, 20, 20), -1)
             cv2.putText(
                 frame,
@@ -2284,7 +2291,7 @@ def main() -> int:
                 >= 0.98 / max(float(args.preview_stream_max_hz), 1.0)
             ):
                 preview_payload = encode_network_preview(
-                    frame,
+                    network_preview_frame,
                     target_width=args.preview_stream_width,
                     jpeg_quality=args.preview_jpeg_quality,
                 )

@@ -21,6 +21,11 @@ G1_TORSO_CAPSULE_RADIUS_M = 0.110
 G1_UPPER_ARM_CAPSULE_RADIUS_M = 0.038
 G1_FOREARM_CAPSULE_RADIUS_M = 0.038
 G1_HAND_CAPSULE_RADIUS_M = 0.045
+# One circular torso capsule intentionally overbounds the official G1 trunk
+# meshes. Without this calibration the neutral forearms have only 0.014 mm
+# apparent clearance and valid front-corner motion is rejected. Exact MuJoCo
+# contacts remain a separate hard boundary.
+G1_TORSO_CAPSULE_MODEL_ALLOWANCE_M = 0.040
 
 
 @dataclass(frozen=True)
@@ -200,9 +205,10 @@ def upper_body_capsule_report(
     """Approximate relevant G1 upper-body separation with smooth capsules.
 
     Proximal upper-arm sections are trimmed because the shoulder joint is
-    intentionally attached to the torso.  Forearms and hands are hard pairs:
-    a human hand-on-chest target may be valid for the operator, but the G1
-    command must remain outside the robot's trunk collision envelope.
+    intentionally attached to the torso. Forearms and hands remain hard
+    pairs. Torso pairs include a calibrated allowance because a circular
+    trunk capsule overestimates the official mesh at its front corners;
+    exact model contacts are still authoritative at the caller.
     """
     required = (
         "pelvis",
@@ -232,8 +238,14 @@ def upper_body_capsule_report(
         wrist = xyz[f"{side}_wrist_roll_rubber_hand"]
         fore_direction = wrist - elbow
         fore_norm = float(np.linalg.norm(fore_direction))
+        # New bridge packets expose the official rubber-hand endpoint.  Keep
+        # the legacy 5.5 cm estimate for old recordings/tests that contain only
+        # body origins, but use the complete hand geometry whenever available.
+        endpoint_name = f"{side}_hand_endpoint"
         hand_end = (
-            wrist + 0.055 * fore_direction / fore_norm
+            _point(positions[endpoint_name])
+            if endpoint_name in positions
+            else wrist + 0.055 * fore_direction / fore_norm
             if fore_norm > 1.0e-8
             else wrist
         )
@@ -259,12 +271,12 @@ def upper_body_capsule_report(
         # poses. Treat this approximation as measured telemetry; inter-arm
         # and hand/head contacts below remain hard safety events.
         ("left_upper", "torso", True, 0.0),
-        ("left_fore", "torso", False, 0.0),
-        ("left_hand", "torso", False, 0.0),
+        ("left_fore", "torso", False, G1_TORSO_CAPSULE_MODEL_ALLOWANCE_M),
+        ("left_hand", "torso", False, G1_TORSO_CAPSULE_MODEL_ALLOWANCE_M),
         ("left_hand", "head", False, 0.0),
         ("right_upper", "torso", True, 0.0),
-        ("right_fore", "torso", False, 0.0),
-        ("right_hand", "torso", False, 0.0),
+        ("right_fore", "torso", False, G1_TORSO_CAPSULE_MODEL_ALLOWANCE_M),
+        ("right_hand", "torso", False, G1_TORSO_CAPSULE_MODEL_ALLOWANCE_M),
         ("right_hand", "head", False, 0.0),
         ("left_upper", "right_upper", False, 0.0),
         ("left_upper", "right_fore", False, 0.0),

@@ -46,6 +46,12 @@ ve oturum ozeti olarak yazar:
 .\start_g1_rerun.ps1 -Mode live -ListenPort 15052 -LiveMaxHz 15
 ```
 
+Canli modda 38 eklem tek bir Rerun entity'sinde toplu yazilir; sayisal
+`joints.csv`/`skeleton_analysis.jsonl` verisi eksilmez. Yalniz yavas cevrimdisi
+incelemede her eklemi ayri entity olarak gormek icin
+`-DetailedJointEntities` eklenebilir. Canli kayitta bu secenek RRD boyutunu ve
+goruntuleme gecikmesini buyutur.
+
 Ana PC'de ayri bir PowerShell'de Isaac/GMR'i ac:
 
 ```powershell
@@ -60,6 +66,12 @@ Arka kol erisimi varsayilan
 olarak aciktir; resmi eklem limitleri ve surekli govde/kapsul bariyeri kolun
 govdenin icinden gecmesini engeller. Eski dar arka-erisim davranisi gerekirse
 `-RestrictBackwardArms` ile secilebilir.
+
+Rerun'daki G1 RAW/SAFE cizgisi artik bilek-roll govde orijininde bitmez;
+resmi Unitree rubber-hand geometrisindeki yaklasik 10.8 cm'lik fiziksel el
+uzantisini `left/right_hand_endpoint` olarak gosterir. Bu nokta goruntuleme,
+kalite ve govde-carpisma kapsulu icindir; kararlı 23 motorlu kontrol sozlesmesine
+sahte bilek pitch/yaw komutu eklemez.
 
 Son olarak ana PC'de 4-ZED fusion ve 2x2 arayuzu ac. Bu komut `dual json`
 akisiyla ayni sekilde proje kokundeki `four json` klasorunde bulunan tek JSON'u
@@ -97,6 +109,10 @@ dusuk olmalidir; 0.10 m uzeri kalibrasyon/ortak gorus kontrolu gerektirir.
 Her kamera satirinda `lat` saat-ofseti duzeltilmis capture gecikmesi, `net`
 yalniz ag kuyrugu, `clk` iki Windows hostu arasindaki tahmini saat farkidir.
 Laptop satirindaki ham 70 ms degeri tek basina gercek ag gecikmesi sayilmaz.
+Canli Rerun paketi ham kayittaki tekrarlı/covariance alanlarini tasimaz;
+kontrol paketi yaklasik 15 kB, dort goruslu analiz paketi yaklasik 29 kB'dir.
+Tam kayipsiz belge yalniz JSONL'ye yazilir. Boylece UDP parcalanmasi ve Rerun
+kuyruk birikimi kontrol dongusunu yavaslatmaz.
 
 Alıcı iki ayrı uyum metriği kaydeder:
 
@@ -211,6 +227,20 @@ BODY_38 fallback dosyasini acikca vermek de mumkundur:
 ```
 
 Kameralar/tripodlar hareket etmediyse yeniden kalibrasyon gerekmez.
+
+## Canli G1 hareket profili ve capraz-govde takibi
+
+`start_g1_isaaclab_live.ps1` dort-kamera cikisiyla uyumlu dengeli varsayilan
+profil kullanir: `InputFps=15`, `ReferenceResponseHz=5.5`,
+`ReferenceMaxVelocity=0.85 rad/s`, `ReferenceMaxAcceleration=4 rad/s2` ve
+`ReferenceMaxJerk=35 rad/s3`. Normal baslatmada ek parametre gerekmez.
+
+Insan bilegi govdenin onunde karsi tarafa gectiginde retarget katmani daha kisa
+G1 kolunu robot gogus geometrisinin onunden dolastirir. Bu, sol/sag eli veya iki
+kolu ayni yana goturme hareketini korurken kesin G1 model temasini gecirmez.
+Arkaya uzanma hareketi ayri tutulur. Yeni Rerun kaydinda
+`left/right_front_clearance_blend`, `left/right_front_clearance_shift_m` ve
+`robot_body_barrier_projection_alpha` alanlari bu davranisi dogrudan olcer.
 
 Kalibrasyonu yalniz dogrulamak icin:
 

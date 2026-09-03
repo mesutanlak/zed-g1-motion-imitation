@@ -42,6 +42,11 @@ from motion_pipeline.reference_policy import (
     residual_scale_vector,
 )
 
+G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M = {
+    "left": (0.1079465665, 0.00163511945, 0.00202244863),
+    "right": (0.1079465665, -0.00163511945, 0.00202244863),
+}
+
 from isaaclab.app import AppLauncher
 
 
@@ -76,7 +81,7 @@ parser.add_argument(
 )
 parser.add_argument("--stale-after", type=float, default=0.35)
 parser.add_argument(
-    "--input-fps", type=float, default=30.0,
+    "--input-fps", type=float, default=15.0,
     help="Accepted GMR reference rate used by the 200 Hz cubic resampler",
 )
 parser.add_argument(
@@ -86,15 +91,15 @@ parser.add_argument(
     help="Live velocity-feedforward tracking or deliberately slow jerk-bounded tracking",
 )
 parser.add_argument(
-    "--reference-response-hz", type=float, default=5.0,
+    "--reference-response-hz", type=float, default=5.5,
     help="Critically damped upper-body reference response bandwidth",
 )
 parser.add_argument(
-    "--reference-max-velocity", type=float, default=0.65,
+    "--reference-max-velocity", type=float, default=0.85,
     help="Maximum applied upper-body reference velocity in rad/s",
 )
 parser.add_argument(
-    "--reference-max-acceleration", type=float, default=2.5,
+    "--reference-max-acceleration", type=float, default=4.0,
     help="Maximum applied upper-body reference acceleration in rad/s^2",
 )
 parser.add_argument(
@@ -102,7 +107,7 @@ parser.add_argument(
     help="Render one frame per N physics steps (4 = 50 Hz at 200 Hz physics)",
 )
 parser.add_argument(
-    "--reference-max-jerk", type=float, default=25.0,
+    "--reference-max-jerk", type=float, default=35.0,
     help="Maximum applied upper-body reference jerk in rad/s^3",
 )
 parser.add_argument(
@@ -1593,6 +1598,42 @@ def main() -> None:
                         body_error = float(np.linalg.norm(actual_local - reference_local))
                         body_errors.append(body_error)
                         body_position_errors_m[body_name] = body_error
+                    for side in ("left", "right"):
+                        wrist_name = f"{side}_wrist_roll_rubber_hand"
+                        endpoint_name = f"{side}_hand_endpoint"
+                        if (
+                            wrist_name not in tracking_body_ids
+                            or endpoint_name not in safe_reference
+                        ):
+                            continue
+                        wrist_id = tracking_body_ids[wrist_name]
+                        local_offset = torch.tensor(
+                            [G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side]],
+                            dtype=robot.data.body_pos_w.dtype,
+                            device=robot.data.body_pos_w.device,
+                        )
+                        endpoint_world = (
+                            robot.data.body_pos_w[0, wrist_id]
+                            + math_utils.quat_apply(
+                                robot.data.body_quat_w[0, wrist_id].unsqueeze(0),
+                                local_offset,
+                            )[0]
+                        )
+                        endpoint_local = (
+                            endpoint_world.detach().cpu().numpy() - actual_pelvis
+                        )
+                        actual_positions_m[endpoint_name] = (
+                            reference_pelvis + endpoint_local
+                        ).astype(float).tolist()
+                        reference_local = (
+                            np.asarray(safe_reference[endpoint_name], dtype=float)
+                            - reference_pelvis
+                        )
+                        endpoint_error = float(
+                            np.linalg.norm(endpoint_local - reference_local)
+                        )
+                        body_errors.append(endpoint_error)
+                        body_position_errors_m[endpoint_name] = endpoint_error
                     if body_errors:
                         body_mpjpe = float(np.mean(body_errors))
                 telemetry = dict(pending_telemetry)
@@ -1643,7 +1684,7 @@ def main() -> None:
                     ),
                     "reference_step_dt_s": float(reference_step_dt),
                     "reference_limits_basis": (
-                        "unitree_g1_userctrl_0p5rad_s_responsive_1p3x"
+                        "unitree_g1_upper_body_balanced_live_profile"
                     ),
                     "control_mode": (
                         "policy_powered"

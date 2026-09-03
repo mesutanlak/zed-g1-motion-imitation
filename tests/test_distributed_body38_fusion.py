@@ -640,9 +640,17 @@ def test_udp_packets_stay_below_safe_datagram_size_with_four_raw_views() -> None
     analysis_payload = json.dumps(
         analysis_live_packet(fused), separators=(",", ":")
     ).encode("utf-8")
+    analysis = analysis_live_packet(fused)
 
     assert len(compact_payload) < 30_000
     assert len(analysis_payload) < 60_000
+    assert all(
+        len(view["keypoints_3d_fusion_m"]) == 38
+        for view in analysis["multi_camera"]["per_camera"]
+    )
+    assert "per_camera" in analysis["multi_camera"]["fusion_metrics"]
+    assert "keypoints_covariance" not in analysis
+    assert "source_latency_trace_ns" not in analysis
     assert (
         compact["multi_camera"]["per_camera"][0]["source_metrics"].get(
             "unused_diagnostic"
