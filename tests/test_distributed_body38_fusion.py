@@ -20,6 +20,7 @@ from zed_four_camera_test.distributed_body38_fusion import (
     Extrinsic,
     InputEndpoint,
     Sample,
+    analysis_live_packet,
     compact_live_packet,
     covariance_weight,
     load_extrinsics,
@@ -589,7 +590,68 @@ def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -
     compact = compact_live_packet(fused)
     assert "camera_pose_fusion_from_local" not in compact["multi_camera"]
     assert all("keypoints_3d_fusion_m" not in view for view in compact["multi_camera"]["per_camera"])
-    assert compact["keypoints_3d_m"] == fused["keypoints_3d_m"]
+    assert all("keypoint_confidence" not in view for view in compact["multi_camera"]["per_camera"])
+    assert "keypoints_3d_m" in compact
+    assert "pelvis_frame" in compact
+    assert "calibration" in compact
+    assert "operator_selection" in compact
+    assert "occlusion_analysis" in compact
+
+
+def test_udp_packets_stay_below_safe_datagram_size_with_four_raw_views() -> None:
+    views = []
+    for serial in (1, 2, 3, 4):
+        source = packet(serial, serial)
+        source["keypoints_3d_m"] = (
+            body38_points() + serial * 0.000000123456789
+        ).tolist()
+        source["human_state"] = {
+            "joint_quality": {name: 0.987654321012345 for name in BODY38_NAMES},
+            "joint_source": {name: "measured" for name in BODY38_NAMES},
+            "joint_state": {name: "TRACKED" for name in BODY38_NAMES},
+        }
+        views.append((
+            Sample(serial, source, 1_000_000_000 + serial, serial),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        ))
+    source_metrics = {
+        serial: {
+            "status": "BODY",
+            "body_fps": 14.999999999123,
+            "rx_fps": 15.000000000321,
+            "corrected_capture_to_receive_ms": 27.123456789123,
+            "network_queue_ms": 3.123456789123,
+            "source_transport": {"unused_diagnostic": "x" * 4000},
+        }
+        for serial in (1, 2, 3, 4)
+    }
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.35,
+        output_sequence=1,
+        reference_serial=1,
+        arrival_spread_ms=37.123456789,
+        source_metrics=source_metrics,
+        connected_serials=[1, 2, 3, 4],
+    )
+    compact = compact_live_packet(fused)
+    compact_payload = json.dumps(compact, separators=(",", ":")).encode("utf-8")
+    analysis_payload = json.dumps(
+        analysis_live_packet(fused), separators=(",", ":")
+    ).encode("utf-8")
+
+    assert len(compact_payload) < 30_000
+    assert len(analysis_payload) < 60_000
+    assert (
+        compact["multi_camera"]["per_camera"][0]["source_metrics"].get(
+            "unused_diagnostic"
+        )
+        is None
+    )
+    assert np.allclose(
+        compact["keypoints_3d_m"], fused["keypoints_3d_m"], atol=0.5e-6
+    )
 
 
 def test_fused_calibration_is_ready_when_one_contributing_view_has_ready_profile() -> None:

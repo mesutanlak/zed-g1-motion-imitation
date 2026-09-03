@@ -1189,20 +1189,140 @@ def cross_view_agreement(
     })
 
 
+UDP_FLOAT_DECIMALS = 6
+UDP_SAFE_DATAGRAM_BYTES = 60_000
+
+
+def quantize_udp_floats(value: Any) -> Any:
+    """Bound JSON float size without changing the lossless recording packet.
+
+    Six decimal places represent one micrometre for metre-valued coordinates,
+    far below ZED depth uncertainty.  Python's default JSON encoder otherwise
+    emits up to 17 significant digits for every BODY_38 coordinate and can
+    turn a valid four-view frame into a 60+ kB UDP datagram.
+    """
+    if isinstance(value, dict):
+        return {key: quantize_udp_floats(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [quantize_udp_floats(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return round(number, UDP_FLOAT_DECIMALS) if math.isfinite(number) else None
+    return value
+
+
+def _compact_agreement(value: Any) -> dict[str, Any]:
+    agreement = dict(value or {})
+    return {
+        key: agreement.get(key)
+        for key in (
+            "mpjpe_m", "p95_error_m", "pelvis_error_m",
+            "left_wrist_error_m", "right_wrist_error_m",
+        )
+        if key in agreement
+    }
+
+
 def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
-    """Remove analysis-only arrays so the real-time GMR datagram stays small."""
-    result = dict(packet)
-    multi = dict(result.get("multi_camera") or {})
+    """Build the small real-time BODY_38 contract consumed by GMR/Isaac.
+
+    The lossless packet intentionally contains four raw skeletons and rich
+    diagnostics.  Starting from ``dict(packet)`` made newly-added diagnostics
+    silently leak into the control datagram.  Use an allow-list here so future
+    analysis fields cannot stop the real-time control path again.
+    """
+    keep = (
+        "schema", "source_serial", "source_host_id", "sequence",
+        "timestamp_ns", "coordinate_system", "units", "body_id",
+        "unique_object_id", "tracking_state", "action_state",
+        "body_confidence", "root_position_m", "global_root_orientation_xyzw",
+        "keypoint_names", "keypoints_3d_raw_m", "keypoints_3d_m",
+        "keypoint_confidence", "local_orientation_per_joint_xyzw",
+        "pelvis_frame", "operator_selection", "calibration",
+        "occlusion_analysis", "perception_metrics", "human_state",
+        "control_mode_request", "latency_trace_ns", "transport_metrics",
+    )
+    result = {key: packet[key] for key in keep if key in packet}
+
+    fusion = dict(packet.get("fusion") or {})
+    result["fusion"] = {
+        key: fusion.get(key)
+        for key in (
+            "implementation", "reference_world_serial", "contributing_serials",
+            "excluded_pose_serials", "workspace_excluded_serials",
+            "best_orientation_serial", "metadata_source_serial",
+            "arm_orientation_sources", "arm_evidence",
+            "maximum_joint_spread_m", "capture_spread_ms", "capture_stdev_ms",
+            "selection_capture_spread_ms", "full_set_wait_applied_ms",
+            "arrival_spread_ms",
+        )
+        if key in fusion
+    }
+
+    multi = dict(packet.get("multi_camera") or {})
+    compact_multi = {
+        key: multi.get(key)
+        for key in (
+            "mode", "contributing_views", "contributing_serials",
+            "excluded_pose_serials", "workspace_excluded_serials",
+            "connected_serials", "configured_serials",
+            "camera_timestamp_delta_ms", "timestamp_basis", "camera_sync_ok",
+            "fused_quality_score", "best_single_quality_score",
+            "failure_codes", "arm_evidence",
+        )
+        if key in multi
+    }
+    compact_multi["cross_view_agreement"] = _compact_agreement(
+        multi.get("cross_view_agreement")
+    )
+    compact_multi["post_alignment_agreement"] = _compact_agreement(
+        multi.get("post_alignment_agreement")
+    )
+    fusion_metrics = dict(multi.get("fusion_metrics") or {})
+    compact_multi["fusion_metrics"] = {
+        key: fusion_metrics.get(key)
+        for key in (
+            "mean_camera_fused", "mean_stdev_between_camera_s",
+            "capture_range_between_camera_ms",
+        )
+        if key in fusion_metrics
+    }
     compact_views = []
     for view in multi.get("per_camera") or []:
-        item = dict(view)
-        item.pop("keypoints_3d_fusion_m", None)
-        item.pop("keypoint_confidence", None)
-        compact_views.append(item)
-    multi["per_camera"] = compact_views
-    multi.pop("camera_pose_fusion_from_local", None)
-    result["multi_camera"] = multi
-    return result
+        source_metrics = dict(view.get("source_metrics") or {})
+        compact_view = {
+            key: view.get(key)
+            for key in (
+                "serial_number", "body_id", "unique_object_id", "sequence",
+                "body_confidence", "source_timestamp_ns",
+                "normalized_capture_timestamp_ns", "source_clock_offset_ns",
+                "source_host_id", "receiver_timestamp_ns", "receiver_age_ms",
+                "quality_score", "accepted_for_fusion", "rejection_reason",
+                "pose_disagreement_to_medoid_m",
+                "dynamic_alignment_translation_m", "temporal_prediction_ms",
+                "temporal_prediction_joints",
+            )
+            if key in view
+        }
+        compact_view["source_metrics"] = {
+            key: source_metrics.get(key)
+            for key in (
+                "status", "body_fps", "rx_fps", "received_fps",
+                "capture_to_receive_ms", "received_latency_ms",
+                "corrected_capture_to_receive_ms", "network_queue_ms",
+                "source_host_id",
+            )
+            if key in source_metrics
+        }
+        compact_views.append(compact_view)
+    compact_multi["per_camera"] = compact_views
+    result["multi_camera"] = compact_multi
+    return quantize_udp_floats(result)
+
+
+def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Keep four raw camera skeletons for Rerun while bounding UDP JSON size."""
+    return quantize_udp_floats(packet)
 
 
 def draw_four_preview(
@@ -1935,6 +2055,7 @@ def main() -> int:
         item.serial: False for item in endpoints
     }
     last_preview_at = 0.0
+    analysis_fallback_warned = False
     started = time.monotonic()
     last_status = started
     if args.record:
@@ -2269,17 +2390,29 @@ def main() -> int:
                             compact, ensure_ascii=False, allow_nan=False,
                             separators=(",", ":"),
                         ).encode("utf-8")
-                        full_encoded = json.dumps(
-                            packet, ensure_ascii=False, allow_nan=False,
+                        analysis_encoded = json.dumps(
+                            analysis_live_packet(packet),
+                            ensure_ascii=False, allow_nan=False,
                             separators=(",", ":"),
                         ).encode("utf-8")
-                        if len(compact_encoded) > 60000:
+                        if len(compact_encoded) > UDP_SAFE_DATAGRAM_BYTES:
                             print(
-                                f"UYARI: kompakt fusion UDP paketi cok buyuk "
+                                f"HATA: kontrol fusion UDP paketi cok buyuk "
                                 f"({len(compact_encoded)} byte).",
                                 file=sys.stderr,
                             )
                         else:
+                            if (
+                                len(analysis_encoded) > UDP_SAFE_DATAGRAM_BYTES
+                                and not analysis_fallback_warned
+                            ):
+                                print(
+                                    "UYARI: ayrintili Rerun UDP paketi siniri asti; "
+                                    "kontrol-guvenli pakete dusuldu. Lossless JSONL "
+                                    "kaydi tam kalir.",
+                                    file=sys.stderr,
+                                )
+                                analysis_fallback_warned = True
                             # Control is deliberately sent before analysis and disk work.
                             if output_socket is not None:
                                 for target_name in ("gmr", "monitor", "ros"):
@@ -2290,8 +2423,9 @@ def main() -> int:
                                     if now - last_target_send[target_name] < 0.80 / target_hz:
                                         continue
                                     outgoing = (
-                                        full_encoded
-                                        if target_name == "monitor" and len(full_encoded) <= 60000
+                                        analysis_encoded
+                                        if target_name == "monitor"
+                                        and len(analysis_encoded) <= UDP_SAFE_DATAGRAM_BYTES
                                         else compact_encoded
                                     )
                                     try:
