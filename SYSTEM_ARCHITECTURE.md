@@ -40,6 +40,16 @@ Retargeting
 Önce RViz → sonra MuJoCo → en son fiziksel G1
 ```
 
+### Opsiyonel 4×ZED el katmanı
+
+El özelliği varsayılan kapalıdır ve mevcut BODY_38 kontrol datagramını
+değiştirmez. Her `zed_g1_skeleton.py` kaynağı yalnız LOCKED operatörün bilek
+ROI'lerinde 21-landmark çıkarıp ayrı `zed_operator_hand/v1` UDP kanalına yollar.
+`distributed_body38_fusion.py` saat-ofseti düzeltilmiş capture zamanında depth ve
+ışın adaylarını ortak BODY_38 fusion dünyasında birleştirir; palm-normalize şekli
+Dex3 analiz/simülasyon adaptörüne verir. Fiziksel DDS publisher yoktur. Kurulum,
+replay ve kabul kapıları `docs/DEX3_HAND_TRACKING_RUNBOOK_TR.md` içindedir.
+
 ## ROS 2 sözleşmesi (sonraki aşama)
 
 Algılama düğümü:

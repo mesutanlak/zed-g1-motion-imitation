@@ -1,0 +1,9 @@
+# Install only in each Windows ZED source environment when hand tracking is used.
+# MediaPipe Tasks supports Python 3.9-3.12; keep the existing pyzed environment
+# version and verify both imports before starting four cameras.
+mediapipe==0.10.35
+numpy>=2.0,<3
+# MediaPipe declares the contrib wheel. Pin both cv2 distributions to the same
+# <5 ABI as the existing ZED environment so pip cannot silently select 5.x.
+opencv-python>=4.10,<5
+opencv-contrib-python>=4.10,<5

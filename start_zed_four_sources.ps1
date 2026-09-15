@@ -19,6 +19,12 @@ param(
     [switch]$DisableCalibrationDistanceGate,
     [ValidateRange(1, 10)]
     [double]$PreviewHz = 8,
+    [switch]$HandTracking,
+    [string]$HandModel = "",
+    [ValidateSet("cpu", "gpu")]
+    [string]$HandDelegate = "cpu",
+    [ValidateRange(1, 30)]
+    [double]$HandInferenceFps = 12,
     [switch]$RecordLocal,
     [switch]$RecordSvo2,
     [string]$SvoRecordDir = ""
@@ -38,16 +44,16 @@ if ($DistanceMax -le $DistanceMin) {
 
 if ($Role -eq "Laptop") {
     $definitions = @(
-        @{ Serial = 39504762; BodyPort = 16000; PreviewPort = 16100 },
-        @{ Serial = 34760587; BodyPort = 16006; PreviewPort = 16106 }
+        @{ Serial = 39504762; BodyPort = 16000; PreviewPort = 16100; HandPort = 16200 },
+        @{ Serial = 34760587; BodyPort = 16006; PreviewPort = 16106; HandPort = 16206 }
     )
     $bodyTarget = $MainPcHost
     $previewTarget = $MainPcHost
 }
 else {
     $definitions = @(
-        @{ Serial = 31571870; BodyPort = 16002; PreviewPort = 16102 },
-        @{ Serial = 33773329; BodyPort = 16004; PreviewPort = 16104 }
+        @{ Serial = 31571870; BodyPort = 16002; PreviewPort = 16102; HandPort = 16202 },
+        @{ Serial = 33773329; BodyPort = 16004; PreviewPort = 16104; HandPort = 16204 }
     )
     $bodyTarget = "127.0.0.1"
     $previewTarget = "127.0.0.1"
@@ -108,6 +114,17 @@ foreach ($definition in $definitions) {
     }
     if ($CalibrationMode -and $DisableCalibrationDistanceGate) {
         $arguments += "-DisableDistanceGate"
+    }
+    if ($HandTracking) {
+        if (-not $HandModel) {
+            throw "-HandTracking icin -HandModel zorunludur."
+        }
+        $arguments += @(
+            "-HandTracking", "-HandModel", $HandModel,
+            "-HandDelegate", $HandDelegate,
+            "-HandInferenceFps", "$HandInferenceFps",
+            "-HandPort", "$($definition.HandPort)"
+        )
     }
     Start-Process -FilePath "powershell.exe" -ArgumentList $arguments
     Start-Sleep -Milliseconds 800

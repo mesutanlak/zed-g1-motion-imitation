@@ -597,6 +597,13 @@ def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -
     assert "operator_selection" in compact
     assert "occlusion_analysis" in compact
 
+    fused["hand_tracking"] = {"schema": "zed_operator_hands_fused/v1", "hands": []}
+    fused["dex3_targets"] = {"physical_robot_output_enabled": False}
+    assert "hand_tracking" not in compact_live_packet(fused)
+    hand_analysis = analysis_live_packet(fused)
+    assert hand_analysis["hand_tracking"]["schema"] == "zed_operator_hands_fused/v1"
+    assert hand_analysis["dex3_targets"]["physical_robot_output_enabled"] is False
+
 
 def test_udp_packets_stay_below_safe_datagram_size_with_four_raw_views() -> None:
     views = []

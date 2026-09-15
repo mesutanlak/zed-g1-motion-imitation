@@ -32,6 +32,12 @@ from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
 from motion_pipeline.metrics import PerceptionMetrics
 from motion_pipeline.operator_selector import OperatorSelector, OperatorState
 
+# Hand modules do not import MediaPipe until the feature is explicitly enabled.
+from hand_tracking.geometry import CameraIntrinsics
+from hand_tracking.mediapipe_backend import MediaPipeHandBackend
+from hand_tracking.pipeline import HandSourcePipeline
+from hand_tracking.roi import RoiConfig
+
 
 def _configure_windows_dll_search() -> list[Any]:
     """Keep os.add_dll_directory handles alive for the complete process."""
@@ -1085,6 +1091,24 @@ def parse_args() -> argparse.Namespace:
         help="BODY_38 UDP hedef portu (varsayılan: 15050)",
     )
     parser.add_argument(
+        "--hand-tracking", action=argparse.BooleanOptionalAction, default=False,
+        help="Kilitli operator bilek ROI'lerinde 21-landmark el takibini ac",
+    )
+    parser.add_argument(
+        "--hand-model", type=Path, default=None,
+        help="Resmi MediaPipe hand_landmarker.task yolu; otomatik indirilmez",
+    )
+    parser.add_argument(
+        "--hand-delegate", choices=("cpu", "gpu"), default="cpu",
+        help="MediaPipe delegate secimi (Windows icin CPU en uyumlu secenektir)",
+    )
+    parser.add_argument("--hand-stream-host", default=None)
+    parser.add_argument("--hand-stream-port", type=int, default=16200)
+    parser.add_argument("--hand-inference-fps", type=float, default=12.0)
+    parser.add_argument("--hand-roi-scale", type=float, default=1.45)
+    parser.add_argument("--hand-roi-min-px", type=int, default=96)
+    parser.add_argument("--hand-roi-max-px", type=int, default=420)
+    parser.add_argument(
         "--monitor-host",
         default=None,
         help=(
@@ -1292,11 +1316,18 @@ def main() -> int:
         or args.preview_stream_max_hz <= 0
         or args.preview_stream_width < 160
         or not 35 <= args.preview_jpeg_quality <= 90
+        or not 1 <= args.hand_stream_port <= 65535
+        or args.hand_inference_fps <= 0
+        or args.hand_roi_min_px < 32
+        or args.hand_roi_max_px < args.hand_roi_min_px
     ):
         print(
             "UDP portu, yayın hızı veya ağ önizleme ayarı geçersiz.",
             file=sys.stderr,
         )
+        return 2
+    if args.hand_tracking and args.hand_model is None:
+        print("--hand-tracking icin --hand-model zorunludur; model otomatik indirilmez.", file=sys.stderr)
         return 2
     if args.operator_acquire_frames < 1:
         print("--operator-acquire-frames en az 1 olmalı.", file=sys.stderr)
@@ -1382,6 +1413,40 @@ def main() -> int:
         zed.close()
         return 4
     print(f"Acik ZED seri numarasi: {source_serial}")
+
+    hand_pipeline: HandSourcePipeline | None = None
+    hand_socket: socket.socket | None = None
+    hand_target: tuple[str, int] | None = None
+    hand_depth = sl.Mat()
+    hand_packets_sent = 0
+    if args.hand_tracking:
+        try:
+            intrinsics = CameraIntrinsics.from_mapping(opened_camera["left_intrinsics"])
+            hand_pipeline = HandSourcePipeline(
+                source_serial, str(args.source_host_id), intrinsics,
+                lambda _side: MediaPipeHandBackend(
+                    args.hand_model, delegate=args.hand_delegate,
+                ),
+                roi_config=RoiConfig(
+                    forearm_scale=args.hand_roi_scale,
+                    minimum_px=args.hand_roi_min_px,
+                    maximum_px=args.hand_roi_max_px,
+                ),
+                inference_fps=args.hand_inference_fps,
+            )
+            destination_host = args.hand_stream_host or args.stream_host
+            if not destination_host:
+                raise ValueError("--hand-stream-host veya --stream-host gerekli")
+            hand_target = (destination_host, args.hand_stream_port)
+            hand_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            print(
+                f"21-landmark el kanali: {hand_target[0]}:{hand_target[1]} "
+                f"({args.hand_inference_fps:g} Hz, fiziksel robot cikisi KAPALI)"
+            )
+        except (FileNotFoundError, RuntimeError, ValueError, KeyError) as exc:
+            print(f"El takibi baslatilamadi: {exc}", file=sys.stderr)
+            zed.close()
+            return 7
 
     positional = sl.PositionalTrackingParameters()
     positional.set_as_static = True
@@ -1613,6 +1678,8 @@ def main() -> int:
             arm_optimizer.reset()
             locked_id = None
             low_pass.reset()
+            if hand_pipeline is not None:
+                hand_pipeline.reset(recreate_backends=True)
             print("R: Kisi kilidi, kalibrasyon ve kol hafizasi sifirlandi.")
         elif key == ord("s"):
             set_recording(not recording)
@@ -1978,6 +2045,38 @@ def main() -> int:
                         and args.distance_min <= distance_m <= args.distance_max
                     ),
                 }
+                # Run 21-landmark inference only for the already locked BODY_38
+                # operator.  Full RGB never leaves this camera process; only the
+                # compact, separately versioned hand datagram is transmitted.
+                if hand_pipeline is not None and hand_pipeline.due(timestamp_ns):
+                    depth_image = None
+                    depth_result = zed.retrieve_measure(hand_depth, sl.MEASURE.DEPTH)
+                    if depth_result == sl.ERROR_CODE.SUCCESS:
+                        depth_image = np.array(hand_depth.get_data(), copy=True)
+                    try:
+                        hand_packet = hand_pipeline.process(
+                            frame, depth_image,
+                            np.asarray(selected.keypoint_2d, dtype=np.float64),
+                            np.asarray(selected.keypoint, dtype=np.float64),
+                            body_id=int(selected.id),
+                            unique_operator_id=str(selected.unique_object_id),
+                            operator_state=selection.state.value,
+                            capture_timestamp_ns=timestamp_ns,
+                            sequence=frame_index,
+                            indices=IDX,
+                        )
+                        if hand_packet is not None:
+                            record["hand_tracking"] = hand_packet
+                            if hand_socket is not None and hand_target is not None:
+                                hand_socket.sendto(hand_pipeline.encode(hand_packet), hand_target)
+                                hand_packets_sent += 1
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        record["hand_tracking"] = {
+                            "schema": "zed_operator_hand/status/v1",
+                            "capture_timestamp_ns": timestamp_ns,
+                            "status": "REJECTED",
+                            "reason": str(exc),
+                        }
                 now = time.monotonic()
                 if (
                     stream_socket is not None
@@ -2329,6 +2428,10 @@ def main() -> int:
             stream_socket.close()
         if preview_socket is not None:
             preview_socket.close()
+        if hand_socket is not None:
+            hand_socket.close()
+        if hand_pipeline is not None:
+            hand_pipeline.close()
         zed.disable_body_tracking()
         zed.disable_positional_tracking()
         zed.close()

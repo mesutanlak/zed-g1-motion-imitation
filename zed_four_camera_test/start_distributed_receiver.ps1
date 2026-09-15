@@ -45,6 +45,14 @@ param(
     [double]$WorkspaceHysteresisM = 0.15,
     [ValidateRange(1, 30)]
     [double]$PreviewHz = 10,
+    [switch]$HandTracking,
+    [switch]$DisableDex3Retargeting,
+    [ValidateRange(10, 150)]
+    [double]$HandMaxAgeMs = 70,
+    [ValidateRange(5, 80)]
+    [double]$HandMaxSpreadMs = 40,
+    [switch]$DisableSingleViewHandDepth,
+    [string]$Dex3OfficialRoot = "",
     [string]$OutputDir = "",
     [string]$RecordStem = "four_body38_fusion",
     [switch]$Record,
@@ -97,6 +105,19 @@ foreach ($item in $Source) {
 foreach ($item in $PreviewSource) {
     $arguments += "--preview-source"
     $arguments += $item
+}
+if ($HandTracking) {
+    foreach ($item in $Source) {
+        if ($item -notmatch '^(\d+):(\d+)$') {
+            throw "Hand port turetmek icin Source SERIAL:PORT biciminde olmali: $item"
+        }
+        $handPort = [int]$Matches[2] + 200
+        $arguments += @("--hand-source", "$($Matches[1]):$handPort")
+    }
+    $arguments += @("--hand-tracking", "--hand-max-age-ms", "$HandMaxAgeMs", "--hand-max-spread-ms", "$HandMaxSpreadMs")
+    if ($DisableDex3Retargeting) { $arguments += "--no-dex3-retargeting" }
+    if ($DisableSingleViewHandDepth) { $arguments += "--no-hand-single-view-depth" }
+    if ($Dex3OfficialRoot) { $arguments += @("--dex3-official-root", $Dex3OfficialRoot) }
 }
 $arguments += "--minimum-sources"
 $arguments += "$MinimumSources"

@@ -29,6 +29,14 @@ param(
     [int]$PreviewWidth = 640,
     [ValidateRange(35, 90)]
     [int]$PreviewJpegQuality = 65,
+    [switch]$HandTracking,
+    [string]$HandModel = "",
+    [ValidateSet("cpu", "gpu")]
+    [string]$HandDelegate = "cpu",
+    [ValidateRange(1, 30)]
+    [double]$HandInferenceFps = 12,
+    [ValidateRange(1024, 65535)]
+    [int]$HandPort = 16200,
     [switch]$RecordLocal,
     [switch]$RecordSvo2,
     [string]$OutputDir = "",
@@ -83,6 +91,19 @@ if ($RecordSvo2) {
 }
 elseif ($RecordLocal) {
     $arguments += "--record"
+}
+if ($HandTracking) {
+    if (-not $HandModel) {
+        throw "-HandTracking icin -HandModel zorunludur; model otomatik indirilmez."
+    }
+    $arguments += @(
+        "--hand-tracking",
+        "--hand-model", $HandModel,
+        "--hand-delegate", $HandDelegate,
+        "--hand-stream-host", $TargetHost,
+        "--hand-stream-port", "$HandPort",
+        "--hand-inference-fps", "$HandInferenceFps"
+    )
 }
 & $python @arguments
 exit $LASTEXITCODE

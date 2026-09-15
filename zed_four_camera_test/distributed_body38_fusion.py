@@ -44,6 +44,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from motion_pipeline.calibration import to_pelvis_local
+from hand_tracking.contracts import validate_hand_packet
+from hand_tracking.fusion import CameraPose, fuse_hand_packets, interpolate_landmarks
+from hand_tracking.normalization import PalmNormalizer
+from hand_tracking.retargeting import Dex3Retargeter, OfficialDexRetargetingSolver
 
 
 BODY38_NAMES = (
@@ -1362,6 +1366,12 @@ def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
         compact_fusion_metrics["per_camera"] = fusion_metrics["per_camera"]
     compact_multi["fusion_metrics"] = compact_fusion_metrics
     result["multi_camera"] = compact_multi
+    # Hand data is analysis-only. It never enlarges the BODY_38 GMR/ROS control
+    # datagram. The sender already falls back to compact body when this exceeds
+    # the safe UDP size; lossless JSONL still retains every hand observation.
+    for key in ("hand_tracking", "dex3_targets"):
+        if key in packet:
+            result[key] = packet[key]
     return quantize_udp_floats(result)
 
 
@@ -1867,6 +1877,14 @@ def make_output_packet(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Iki-host, dort-ZED application BODY_38 fusion alicisi")
     parser.add_argument("--source", type=parse_endpoint, action="append", required=True, help="Her kamera icin SERIAL:UDP_PORT; dort kez verin.")
+    parser.add_argument("--hand-source", type=parse_endpoint, action="append", default=[], help="21-landmark kanali icin SERIAL:UDP_PORT; el takibinde dort kez verin.")
+    parser.add_argument("--hand-tracking", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dex3-retargeting", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hand-max-age-ms", type=float, default=70.0)
+    parser.add_argument("--hand-max-spread-ms", type=float, default=40.0)
+    parser.add_argument("--hand-single-view-depth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dex3-config", type=Path, default=REPOSITORY_ROOT / "config" / "g1_23dof_dex3.json")
+    parser.add_argument("--dex3-official-root", type=Path, default=None, help="Opsiyonel resmi unitreerobotics/xr_teleoperate checkout yolu")
     parser.add_argument("--preview-source", type=parse_endpoint, action="append", default=[], help="Canli JPEG icin SERIAL:UDP_PORT; arayuz icin dort kez verin.")
     parser.add_argument("--bind", default="0.0.0.0", help="Dinlenecek PC IPv4 adresi (varsayilan tum arayuzler).")
     parser.add_argument("--extrinsics", type=Path, default=None, help="Kalibre edilmis zed_body38_distributed_extrinsics/v1 JSON dosyasi.")
@@ -1907,6 +1925,7 @@ def main() -> int:
     args = parse_args()
     endpoints: list[InputEndpoint] = args.source
     preview_endpoints: list[InputEndpoint] = args.preview_source
+    hand_endpoints: list[InputEndpoint] = args.hand_source
     if len(endpoints) != 4 or len({item.serial for item in endpoints}) != 4 or len({item.port for item in endpoints}) != 4:
         print("HATA: tam dort farkli SERIAL:PORT kaynagi gerekli.", file=sys.stderr)
         return 2
@@ -1916,6 +1935,13 @@ def main() -> int:
         or len({item.port for item in preview_endpoints}) != 4
     ):
         print("HATA: onizleme icin ayni dort seriye ait dort farkli SERIAL:PORT gerekli.", file=sys.stderr)
+        return 2
+    if args.hand_tracking and (
+        len(hand_endpoints) != 4
+        or {item.serial for item in hand_endpoints} != {item.serial for item in endpoints}
+        or len({item.port for item in hand_endpoints}) != 4
+    ):
+        print("HATA: el takibi icin ayni dort seriye ait dort farkli --hand-source gerekli.", file=sys.stderr)
         return 2
     if preview_endpoints and not args.headless and cv2 is None:
         print("HATA: dortlu arayuz icin opencv-python kurulu olmali.", file=sys.stderr)
@@ -1937,6 +1963,8 @@ def main() -> int:
         or args.monitor_max_hz <= 0.0
         or args.ros_max_hz <= 0.0
         or args.preview_hz <= 0.0
+        or args.hand_max_age_ms <= 0.0
+        or args.hand_max_spread_ms <= 0.0
     ):
         print("HATA: confidence, max-sync-ms, source-timeout-ms veya max-joint-spread-m gecersiz.", file=sys.stderr)
         return 2
@@ -1970,6 +1998,14 @@ def main() -> int:
             selector.register(receiver, selectors.EVENT_READ, data=("preview", endpoint))
             sockets.append(receiver)
             print(f"ONIZLE | ZED {endpoint.serial} | {args.bind}:{endpoint.port}")
+        for endpoint in hand_endpoints:
+            receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            receiver.bind((args.bind, endpoint.port))
+            receiver.setblocking(False)
+            selector.register(receiver, selectors.EVENT_READ, data=("hand", endpoint))
+            sockets.append(receiver)
+            print(f"EL21 | ZED {endpoint.serial} | {args.bind}:{endpoint.port}")
     except OSError as exc:
         print(f"HATA: UDP portu acilamadi: {exc}", file=sys.stderr)
         for item in sockets:
@@ -2053,6 +2089,8 @@ def main() -> int:
                 "serial_numbers": [item.serial for item in endpoints],
                 "body_sources": [{"serial": item.serial, "port": item.port} for item in endpoints],
                 "preview_sources": [{"serial": item.serial, "port": item.port} for item in preview_endpoints],
+                "hand_sources": [{"serial": item.serial, "port": item.port} for item in hand_endpoints],
+                "hand_schema": "zed_operator_hand/v1" if args.hand_tracking else None,
                 "extrinsics_path": str(resolved_extrinsics) if resolved_extrinsics else None,
                 "extrinsics": extrinsic_document,
                 "operator_workspace": {
@@ -2070,6 +2108,14 @@ def main() -> int:
         print(f"4-ZED fusion kayit {'ACIK' if enabled else 'KAPALI'}: {record_path} ({recorded} kare, drop={record_dropped})", flush=True)
 
     histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=32) for item in endpoints}
+    hand_histories: dict[int, deque[dict[str, Any]]] = {item.serial: deque(maxlen=32) for item in endpoints}
+    palm_normalizer = PalmNormalizer()
+    try:
+        dex3_solver = OfficialDexRetargetingSolver(args.dex3_official_root) if args.dex3_official_root else None
+        dex3_retargeter = Dex3Retargeter(args.dex3_config, solver=dex3_solver) if args.hand_tracking and args.dex3_retargeting else None
+    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        print(f"HATA: Dex3 config yuklenemedi: {exc}", file=sys.stderr)
+        return 2
     clock_offsets = ClockOffsetEstimator(window=300, quantile=0.05)
     last_any_packet_ns: dict[int, int] = {}
     last_body_packet_ns: dict[int, int] = {}
@@ -2145,6 +2191,28 @@ def main() -> int:
                         if decoded is not None:
                             preview_frames[endpoint.serial] = decoded
                             preview_received_ns[endpoint.serial] = time.time_ns()
+                    continue
+                if kind == "hand":
+                    while True:
+                        try:
+                            payload, _sender = key.fileobj.recvfrom(65535)
+                        except BlockingIOError:
+                            break
+                        except OSError:
+                            break
+                        try:
+                            document = json.loads(payload.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            invalid_packets += 1
+                            continue
+                        valid, _reason = validate_hand_packet(document)
+                        if not valid or int(document.get("camera_serial", 0)) != endpoint.serial:
+                            invalid_packets += 1
+                            continue
+                        latest_body = histories[endpoint.serial][-1] if histories[endpoint.serial] else None
+                        offset_ns = latest_body.source_clock_offset_ns if latest_body is not None else 0
+                        document["_normalized_capture_timestamp_ns"] = int(document["capture_timestamp_ns"]) + int(offset_ns)
+                        hand_histories[endpoint.serial].append(document)
                     continue
                 while True:
                     try:
@@ -2387,6 +2455,86 @@ def main() -> int:
                         workspace_x_max_m=args.workspace_x_max_m,
                         full_set_wait_applied_ms=last_full_set_wait_applied_ms,
                     )
+                    if args.hand_tracking and extrinsics is not None:
+                        target_capture_ns = int(packet["timestamp_ns"])
+                        selected_hand_packets: list[dict[str, Any]] = []
+                        expected_operator_ids = {
+                            sample.serial: (sample.packet.get("operator_selection") or {}).get("locked_body_id")
+                            for sample in compensated_samples
+                        }
+                        for serial, items in hand_histories.items():
+                            if not items:
+                                continue
+                            normalized_items: list[dict[str, Any]] = []
+                            for source_item in items:
+                                aligned_item = dict(source_item)
+                                aligned_item["capture_timestamp_ns"] = int(source_item.get("_normalized_capture_timestamp_ns", source_item["capture_timestamp_ns"]))
+                                aligned_item["_source_capture_timestamp_ns"] = aligned_item["capture_timestamp_ns"]
+                                normalized_items.append(aligned_item)
+                            normalized_items.sort(key=lambda item: item["capture_timestamp_ns"])
+                            expected_id = expected_operator_ids.get(serial)
+                            normalized_items = [
+                                item for item in normalized_items
+                                if expected_id is not None
+                                and (item.get("operator") or {}).get("body_id") == expected_id
+                            ]
+                            if not normalized_items:
+                                continue
+                            past = [item for item in normalized_items if item["capture_timestamp_ns"] <= target_capture_ns]
+                            aligned = None
+                            if len(past) >= 2:
+                                aligned = interpolate_landmarks(
+                                    past[-2], past[-1], target_capture_ns,
+                                    maximum_prediction_ms=args.hand_max_age_ms,
+                                )
+                            elif past:
+                                aligned = past[-1]
+                            else:
+                                aligned = min(normalized_items, key=lambda item: abs(item["capture_timestamp_ns"] - target_capture_ns))
+                            if aligned is not None and abs(int(aligned["capture_timestamp_ns"]) - target_capture_ns) / 1e6 <= args.hand_max_age_ms:
+                                selected_hand_packets.append(aligned)
+                        camera_poses = {
+                            serial: CameraPose(value.rotation, value.translation)
+                            for serial, value in extrinsics.cameras.items()
+                        }
+                        fused_hands = fuse_hand_packets(
+                            selected_hand_packets, camera_poses,
+                            target_timestamp_ns=target_capture_ns,
+                            maximum_age_ms=args.hand_max_age_ms,
+                            maximum_capture_spread_ms=args.hand_max_spread_ms,
+                            single_view_depth=args.hand_single_view_depth,
+                        )
+                        fused_hands["per_camera"] = selected_hand_packets
+                        dex3_targets: dict[str, Any] = {"physical_robot_output_enabled": False}
+                        for hand in fused_hands["hands"]:
+                            side = hand["side"]
+                            normalized = None
+                            confidence = 0.0
+                            if hand.get("valid"):
+                                try:
+                                    normalized_hand = palm_normalizer.normalize(hand["landmarks_world_m"], side)
+                                    normalized = normalized_hand.landmarks
+                                    confidence = float(np.mean([item["confidence"] for item in hand["landmark_quality"]]))
+                                    hand["normalization"] = {
+                                        "landmarks": normalized.tolist(),
+                                        "wrist_world_m": normalized_hand.wrist_world_m.tolist(),
+                                        "rotation_world_from_palm": normalized_hand.rotation_world_from_palm.tolist(),
+                                        "scale_m": normalized_hand.scale_m,
+                                        "canonical": "+X thumbward, +Y wrist-to-middle, +Z right-handed normal",
+                                    }
+                                except ValueError as exc:
+                                    hand["valid"] = False
+                                    hand["rejection_reasons"].append(str(exc))
+                            if dex3_retargeter is not None:
+                                dex3_targets[side] = dex3_retargeter.update(side, normalized, target_capture_ns, confidence)
+                        if "left" in dex3_targets and "right" in dex3_targets:
+                            dex3_targets["q_left_dex3"] = dex3_targets["left"]["safe_q_rad"]
+                            dex3_targets["q_right_dex3"] = dex3_targets["right"]["safe_q_rad"]
+                            dex3_targets["q_body"] = None
+                            dex3_targets["q_target"] = None
+                            dex3_targets["composition_status"] = "AWAITING_SEPARATE_23DOF_BODY_RETARGET_TARGET"
+                        packet["hand_tracking"] = fused_hands
+                        packet["dex3_targets"] = dex3_targets
                     calibration_state = str(
                         (packet.get("calibration") or {}).get("state", "MISSING")
                     )

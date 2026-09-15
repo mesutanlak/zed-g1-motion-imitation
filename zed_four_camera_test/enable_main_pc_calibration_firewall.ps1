@@ -18,6 +18,10 @@ $rules = @(
     @{
         Name = "ZED-G1 Four Preview from Laptop"
         Ports = @(16100, 16106)
+    },
+    @{
+        Name = "ZED-G1 Four Hand Tracking from Laptop"
+        Ports = @(16200, 16206)
     }
 )
 
@@ -48,4 +52,4 @@ if ($norton.Count) {
     Write-Warning "Norton etkin: ayni UDP portlarini Norton Firewall icinde de 192.168.50.11 icin izinli yapin."
 }
 
-Write-Host "ANA PC ZED UDP kurallari hazir. Receiver acikken Get-NetUDPEndpoint ile 16000/16006/16100/16106 portlarini gorebilirsiniz."
+Write-Host "ANA PC ZED UDP kurallari hazir. Receiver acikken Get-NetUDPEndpoint ile 16000/16006/16100/16106/16200/16206 portlarini gorebilirsiniz."
