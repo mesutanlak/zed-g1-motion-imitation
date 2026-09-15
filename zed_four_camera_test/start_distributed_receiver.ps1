@@ -117,8 +117,10 @@ if ($HandTracking) {
         $officialReady = $false
         if ((Test-Path -LiteralPath $officialConfig -PathType Leaf) -and
             (Test-Path -LiteralPath $pythonCandidate -PathType Leaf)) {
-            & $pythonCandidate -c "import dex_retargeting, pinocchio, yaml" 2>$null
-            $officialReady = ($LASTEXITCODE -eq 0)
+            $probe = Start-Process -FilePath $pythonCandidate `
+                -ArgumentList @("-c", "import dex_retargeting, pinocchio, yaml") `
+                -WindowStyle Hidden -Wait -PassThru
+            $officialReady = ($probe.ExitCode -eq 0)
         }
         if ($officialReady) {
             $Dex3OfficialRoot = $officialCandidate
