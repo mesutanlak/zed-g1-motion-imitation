@@ -71,7 +71,11 @@ if ($FetchAssets) {
     $rest = $resolved.Substring(2).Replace("\", "/")
     $wslRoot = "/mnt/$drive$rest"
     Write-Warning "Resmi Unitree asset arsivi 1 GB'den buyuktur. Resmi fetch_assets.sh simdi calisacak."
-    & wsl.exe -d Ubuntu-22.04 -- bash -lc "cd '$wslRoot' && bash fetch_assets.sh"
+    & wsl.exe -d Ubuntu-22.04 -- bash -lc "command -v git-lfs >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y git-lfs unzip; }"
+    if ($LASTEXITCODE -ne 0) { throw "WSL git-lfs/unzip kurulumu basarisiz." }
+    # Git for Windows may checkout the official shell script with CRLF. Keep
+    # the pinned repository untouched and normalize only the stream Bash sees.
+    & wsl.exe -d Ubuntu-22.04 -- bash -lc "cd '$wslRoot' && sed 's/\r$//' fetch_assets.sh | bash"
     if ($LASTEXITCODE -ne 0) { throw "Resmi Unitree asset indirme/acma islemi basarisiz." }
 }
 
