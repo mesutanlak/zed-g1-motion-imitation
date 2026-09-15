@@ -1,7 +1,8 @@
 param(
     [string]$InstallRoot = "C:\g1il",
     [switch]$FetchAssets,
-    [switch]$SkipRetargetEnvironment
+    [switch]$SkipRetargetEnvironment,
+    [switch]$TryWindowsOfficialRetargeting
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,24 +19,27 @@ function Install-PinnedRepository {
         $arguments = @("clone")
         if ($Recursive) { $arguments += "--recursive" }
         $arguments += @($Source.url, $destination)
-        & git @arguments
+        # Native stdout is part of a PowerShell function's return stream.
+        # Send git progress to the host so $simRoot/$xrRoot receive only the
+        # explicit destination string returned at the end of this function.
+        & git @arguments | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "$Name clone basarisiz." }
     }
-    & git -C $destination fetch origin $Source.commit
+    & git -C $destination fetch origin $Source.commit | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "$Name pinned commit fetch basarisiz." }
-    & git -C $destination checkout --detach $Source.commit
+    & git -C $destination checkout --detach $Source.commit | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "$Name pinned commit checkout basarisiz." }
     if ($Recursive) {
-        & git -C $destination submodule update --init --recursive
+        & git -C $destination submodule update --init --recursive | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "$Name submodule kurulumu basarisiz." }
     }
-    return $destination
+    Write-Output $destination
 }
 
 $simRoot = Install-PinnedRepository "unitree_sim_isaaclab" $lock.sources.unitree_sim_isaaclab
 $xrRoot = Install-PinnedRepository "xr_teleoperate" $lock.sources.xr_teleoperate -Recursive
 
-if (-not $SkipRetargetEnvironment) {
+if (-not $SkipRetargetEnvironment -and $TryWindowsOfficialRetargeting) {
     $basePython = Join-Path $InstallRoot "env\Scripts\python.exe"
     if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
         throw "Isaac Python bulunamadi: $basePython"
@@ -52,6 +56,13 @@ if (-not $SkipRetargetEnvironment) {
     & $dexPython -m pip install $dexPackage
     if ($LASTEXITCODE -ne 0) { throw "Resmi dex-retargeting kurulumu basarisiz." }
     Write-Host "Izole resmi DexPilot Python: $dexPython"
+}
+elseif (-not $SkipRetargetEnvironment) {
+    Write-Warning (
+        "Resmi dex-retargeting Pinocchio bagimliligi Windows wheel saglamiyor. " +
+        "Canli sistem dusuk gecikmeli 21-landmark fallback kullanacak; " +
+        "deneysel Windows derlemesi icin -TryWindowsOfficialRetargeting verilebilir."
+    )
 }
 
 if ($FetchAssets) {

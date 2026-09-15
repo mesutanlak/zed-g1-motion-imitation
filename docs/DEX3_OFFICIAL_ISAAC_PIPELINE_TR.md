@@ -29,9 +29,12 @@ powershell -ExecutionPolicy Bypass -File .\install\install_unitree_dex3_sim.ps1 
 
 Resmi asset paketi 1 GB’den büyüktür. Script pinned Unitree repository’lerini
 `C:\g1il\repos` altına kurar, `xr_teleoperate` submodule’lerini alır ve resmi
-`fetch_assets.sh` ile USD paketini açar. Resmi DexPilot’ın NumPy/Torch
-sürümlerini ZED/MediaPipe ortamından ayırmak için `C:\g1il\envs\dex3` oluşturur.
-Fiziksel DDS kurulumu/başlatması yapmaz.
+`fetch_assets.sh` ile USD paketini açar. Resmi DexPilot’ın Pinocchio paketi
+Windows wheel sağlamadığından varsayılan canlı yol, aynı resmî Dex3 joint
+sözleşmesine yazan hafif 21-landmark retarget fallback’idir. Bu seçim üç
+metrelik algılamada daha düşük gecikmelidir. Deneysel yerel derleme ancak MSVC
+ortamı ayrıca hazırlanıp `-TryWindowsOfficialRetargeting` verilirse denenir.
+Fiziksel DDS kurulumu/başlatması yapılmaz.
 
 Kurulumdan sonra kaynak/commit/asset/joint sözleşmesini Isaac açmadan doğrulayın:
 

@@ -197,16 +197,22 @@ if (-not $Headless) {
     $receiverArguments.PreviewSource = $previewSource
 }
 if ($HandTracking) {
-    if (-not $Dex3OfficialRoot) {
+    if (-not $Dex3OfficialRoot -and -not $Dex3OfficialPython) {
         $officialCandidate = "C:\g1il\repos\xr_teleoperate"
-        if (Test-Path -LiteralPath (Join-Path $officialCandidate "assets\unitree_hand\unitree_dex3.yml")) {
-            $Dex3OfficialRoot = $officialCandidate
-        }
-    }
-    if (-not $Dex3OfficialPython) {
         $pythonCandidate = "C:\g1il\envs\dex3\Scripts\python.exe"
-        if (Test-Path -LiteralPath $pythonCandidate -PathType Leaf) {
+        $officialConfig = Join-Path $officialCandidate "assets\unitree_hand\unitree_dex3.yml"
+        $officialReady = $false
+        if ((Test-Path -LiteralPath $officialConfig -PathType Leaf) -and
+            (Test-Path -LiteralPath $pythonCandidate -PathType Leaf)) {
+            & $pythonCandidate -c "import dex_retargeting, pinocchio, yaml" 2>$null
+            $officialReady = ($LASTEXITCODE -eq 0)
+        }
+        if ($officialReady) {
+            $Dex3OfficialRoot = $officialCandidate
             $Dex3OfficialPython = $pythonCandidate
+        }
+        elseif (Test-Path -LiteralPath $officialConfig -PathType Leaf) {
+            Write-Warning "Resmi DexPilot Windows bagimliliklari kullanilabilir degil; dusuk gecikmeli yerel 21-landmark retarget fallback secildi."
         }
     }
     $receiverArguments.HandTracking = $true

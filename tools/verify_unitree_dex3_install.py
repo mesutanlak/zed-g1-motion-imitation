@@ -51,14 +51,25 @@ def main() -> int:
     else:
         errors.append(f"official retarget config missing: {config_path}")
     dex_python = args.install_root / "envs" / "dex3" / "Scripts" / "python.exe"
-    if not dex_python.is_file():
-        errors.append(f"isolated DexPilot Python missing: {dex_python}")
+    retarget_backend = "normalized_21_task_fallback"
+    if dex_python.is_file():
+        probe = subprocess.run(
+            [str(dex_python), "-c", "import dex_retargeting, pinocchio, yaml"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if probe.returncode == 0:
+            retarget_backend = "official_unitree_dexpilot"
     if errors:
         print("UNITREE_DEX3_VERIFY_FAILED")
         for error in errors:
             print(f"- {error}")
         return 2
-    print("UNITREE_DEX3_VERIFY_OK pinned_sources=2 asset=official dds=disabled")
+    print(
+        "UNITREE_DEX3_VERIFY_OK pinned_sources=2 asset=official "
+        f"retarget={retarget_backend} dds=disabled"
+    )
     return 0
 
 
