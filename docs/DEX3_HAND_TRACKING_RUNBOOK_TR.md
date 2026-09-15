@@ -151,6 +151,50 @@ Yalnız ekran videosu metrik depth, fabrika intrinsics'i veya kalibre edilmiş
 çoklu kamera capture timestamp'i içermez; ondan 3B multi-view fusion üretildiği
 iddia edilmez.
 
+## Sürekli Isaac + Rerun + dört kamera bağlantısı
+
+Canlı zincirde başlatma sırası önemlidir. Önce ana PC'de Rerun, sonra
+Isaac/GMR ve en son dört-kamera fusion receiver açılır. El verisi yalnız tam
+analiz paketinden `127.0.0.1:15052` Rerun kanalına gider; GMR/Isaac kontrol
+paketi BODY_38 olarak kompakt kalır. Dex3 hedefleri Rerun'da gösterilir ve
+JSONL kaydına yazılır, fiziksel robot el çıkışı etkinleştirilmez.
+
+Ana PC pencere 1 — Rerun:
+
+```powershell
+.\start_g1_rerun_analysis.ps1 -Mode live -LiveMaxHz 15 -GmrLogMaxHz 15
+```
+
+Ana PC pencere 2 — Isaac/GMR:
+
+```powershell
+.\start_g1_isaaclab_live.ps1 -Mode upper_body `
+  -ImitationMode kinematic_debug -InputFps 15 -AcceptNvidiaEula
+```
+
+Ana PC pencere 3 — sürekli dört-kamera fusion:
+
+```powershell
+.\start_zed_four_fusion_to_wsl.ps1 -Record -MinimumSources 3 `
+  -FusionHz 15 -PreviewHz 8 -WorkspaceXMinM 2 -WorkspaceXMaxM 4 `
+  -HandTracking -HandMaxAgeMs 70 -HandMaxSpreadMs 40
+```
+
+Kaynaklar iki hostta `start_zed_four_sources.ps1 -HandTracking` ile açık
+olmalıdır. Rerun canlı sahnesinde `world/skeleton/hands`, zaman serilerinde
+`world/metrics/dex3`; receiver kaydında `hand_tracking` ve `dex3_targets`
+alanları bulunur.
+
+Oturumdan sonra son fusion kaydını sayısal incelemek için:
+
+```powershell
+$Latest = Get-ChildItem ".\recordings\four_body38_fusion_*.jsonl" |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+& ".\.venv-zed\Scripts\python.exe" ".\tools\benchmark_hand_tracking.py" `
+  $Latest.FullName --output ".\recordings\hand_benchmark_latest.json"
+Get-Content ".\recordings\hand_benchmark_latest.json"
+```
+
 ## Replay, Rerun ve benchmark
 
 ```powershell

@@ -91,7 +91,7 @@ if ($DetailedJointEntities) {
     $arguments += "--detailed-joint-entities"
 }
 
-Write-Host "Bagimsiz Rerun BODY_38 analiz sistemi baslatiliyor..."
+Write-Host "Bagimsiz Rerun BODY_38 + Dex3 el analiz sistemi baslatiliyor..."
 Write-Host "Mod: $Mode | BODY_38 UDP: ${ListenHost}:$ListenPort | GMR: $GmrListenPort"
 Write-Host "Analiz hizi: ${LiveMaxHz} Hz | GMR telemetri kaydi: ${GmrLogMaxHz} Hz/sema"
 Write-Host "Mevcut analysis_panel dosyalari kullanilmiyor/degistirilmiyor."

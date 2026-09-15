@@ -97,6 +97,34 @@ def check_retarget_comparison_logging(output: Path) -> None:
             "safety": {"level": "GREEN", "reasons": [], "blend": 1.0},
         }
     )
+    landmarks = [
+        [3.0, 0.20 + index * 0.005, 1.30 + index * 0.004]
+        for index in range(21)
+    ]
+    app._log_hand_packet(
+        {
+            "timestamp_ns": 1_000_000_000,
+            "hand_tracking": {
+                "hands": [
+                    {
+                        "side": "left",
+                        "valid": True,
+                        "landmarks_world_m": landmarks,
+                        "landmark_quality": [
+                            {"camera_count": 2, "confidence": 0.9}
+                            for _ in range(21)
+                        ],
+                        "capture_spread_ms": 8.0,
+                        "rejection_reasons": [],
+                    }
+                ]
+            },
+            "dex3_targets": {
+                "physical_robot_output_enabled": False,
+                "left": {"safe_q_rad": [0.1] * 7},
+            },
+        }
+    )
     rr.disconnect()
     if not (output / "comparison_test.rrd").exists():
         raise AssertionError("comparison RRD was not written")

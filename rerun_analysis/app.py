@@ -35,6 +35,7 @@ from rerun_analysis.model import (  # noqa: E402
     joint_angle_names,
 )
 from rerun_analysis.session import AnalysisSessionWriter  # noqa: E402
+from hand_tracking.rerun_output import HAND_EDGES  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,7 +185,11 @@ def make_blueprint() -> rrb.Blueprint:
                     name="Takip kalitesi ve gecikme",
                     origin="/world/metrics/quality",
                 ),
-                column_shares=[3, 2],
+                rrb.TimeSeriesView(
+                    name="Dex3 el hedefleri (rad)",
+                    origin="/world/metrics/dex3",
+                ),
+                column_shares=[3, 2, 2],
             ),
             row_shares=[3, 2],
         ),
@@ -459,6 +464,126 @@ class RerunSkeletonApp:
         finally:
             sock.close()
 
+    def _log_hand_packet(self, source: dict[str, Any]) -> None:
+        """Log fused 21-landmark hands and safe Dex3 analysis targets."""
+        fused = source.get("hand_tracking") or {}
+        hands_by_side = {
+            str(hand.get("side")): hand
+            for hand in fused.get("hands", [])
+            if isinstance(hand, dict) and hand.get("side") in {"left", "right"}
+        }
+        for side, color in (("left", [80, 220, 120]), ("right", [255, 170, 50])):
+            root = f"/world/skeleton/hands/{side}"
+            hand = hands_by_side.get(side)
+            points_value = hand.get("landmarks_world_m") if hand else None
+            try:
+                points = np.asarray(points_value, dtype=np.float64)
+            except (TypeError, ValueError):
+                points = np.empty((0, 3), dtype=np.float64)
+            valid = bool(
+                hand
+                and hand.get("valid")
+                and points.shape == (21, 3)
+                and np.isfinite(points).all()
+            )
+            if not valid:
+                rr.log(root, rr.Clear(recursive=True))
+                continue
+            rr.log(
+                f"{root}/landmarks",
+                rr.Points3D(points, radii=0.008, colors=color),
+            )
+            rr.log(
+                f"{root}/bones",
+                rr.LineStrips3D(
+                    [[points[first], points[second]] for first, second in HAND_EDGES],
+                    radii=0.004,
+                    colors=color,
+                ),
+            )
+            normalization = hand.get("normalization") or {}
+            try:
+                origin = np.asarray(normalization["wrist_world_m"], dtype=np.float64)
+                rotation = np.asarray(
+                    normalization["rotation_world_from_palm"], dtype=np.float64
+                )
+                scale = float(normalization["scale_m"])
+                axes_valid = (
+                    origin.shape == (3,)
+                    and rotation.shape == (3, 3)
+                    and np.isfinite(origin).all()
+                    and np.isfinite(rotation).all()
+                    and np.isfinite(scale)
+                    and scale > 0.0
+                )
+            except (KeyError, TypeError, ValueError):
+                axes_valid = False
+            if axes_valid:
+                for axis, axis_color in enumerate(
+                    ([255, 0, 0], [0, 255, 0], [0, 128, 255])
+                ):
+                    rr.log(
+                        f"{root}/palm_axis_{axis}",
+                        rr.Arrows3D(
+                            origins=[origin],
+                            vectors=[rotation[:, axis] * scale],
+                            colors=[axis_color],
+                        ),
+                    )
+            qualities = hand.get("landmark_quality") or []
+            camera_counts = [
+                float(item["camera_count"])
+                for item in qualities
+                if isinstance(item, dict)
+                and isinstance(item.get("camera_count"), (int, float))
+            ]
+            confidences = [
+                float(item["confidence"])
+                for item in qualities
+                if isinstance(item, dict)
+                and isinstance(item.get("confidence"), (int, float))
+            ]
+            rr.log(
+                f"{root}/status",
+                rr.AnyValues(
+                    valid=True,
+                    capture_spread_ms=float(hand.get("capture_spread_ms", 0.0)),
+                    mean_camera_count=(
+                        float(np.mean(camera_counts)) if camera_counts else 0.0
+                    ),
+                    mean_confidence=(
+                        float(np.mean(confidences)) if confidences else 0.0
+                    ),
+                    rejection_reasons=json.dumps(
+                        hand.get("rejection_reasons") or [], ensure_ascii=False
+                    ),
+                ),
+            )
+
+        targets = source.get("dex3_targets") or {}
+        for side in ("left", "right"):
+            target = targets.get(side) or {}
+            values = target.get("safe_q_rad") or []
+            if not values:
+                rr.log(f"/world/metrics/dex3/{side}", rr.Clear(recursive=True))
+                continue
+            for index, value in enumerate(values):
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    rr.log(
+                        f"/world/metrics/dex3/{side}/q_{index}",
+                        rr.Scalars(float(value)),
+                    )
+        if targets:
+            rr.log(
+                "/world/skeleton/hands/output_safety",
+                rr.AnyValues(
+                    physical_robot_output_enabled=bool(
+                        targets.get("physical_robot_output_enabled", False)
+                    ),
+                    composition_status=str(targets.get("composition_status", "")),
+                ),
+            )
+
     def _log_packet(
         self,
         source: dict[str, Any],
@@ -471,6 +596,7 @@ class RerunSkeletonApp:
         frame = int(source.get("frame_index", source.get("sequence", 0)) or 0)
         rr.set_time("frame", sequence=frame)
         rr.set_time("source_time", timestamp=timestamp_ns / 1e9)
+        self._log_hand_packet(source)
         names = [str(name) for name in processed.get("keypoint_names", [])]
         points_list = processed.get("keypoints_3d_m", [])
         points = {

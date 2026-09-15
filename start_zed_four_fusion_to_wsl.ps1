@@ -20,6 +20,14 @@ param(
     [double]$WorkspaceXMaxM = 4.0,
     [ValidateRange(0.0, 1.0)]
     [double]$WorkspaceHysteresisM = 0.15,
+    [switch]$HandTracking,
+    [switch]$DisableDex3Retargeting,
+    [ValidateRange(10, 150)]
+    [double]$HandMaxAgeMs = 70,
+    [ValidateRange(5, 80)]
+    [double]$HandMaxSpreadMs = 40,
+    [switch]$DisableSingleViewHandDepth,
+    [string]$Dex3OfficialRoot = "",
     [string]$Extrinsics = "",
     [string]$FusionConfig = "",
     [long]$ReferenceSerial = 33773329,
@@ -186,6 +194,20 @@ $receiverArguments = @{
 if (-not $Headless) {
     $receiverArguments.PreviewSource = $previewSource
 }
+if ($HandTracking) {
+    $receiverArguments.HandTracking = $true
+    $receiverArguments.HandMaxAgeMs = $HandMaxAgeMs
+    $receiverArguments.HandMaxSpreadMs = $HandMaxSpreadMs
+    if ($DisableDex3Retargeting) {
+        $receiverArguments.DisableDex3Retargeting = $true
+    }
+    if ($DisableSingleViewHandDepth) {
+        $receiverArguments.DisableSingleViewHandDepth = $true
+    }
+    if ($Dex3OfficialRoot) {
+        $receiverArguments.Dex3OfficialRoot = $Dex3OfficialRoot
+    }
+}
 if (-not $NoAnalysisStream) {
     $receiverArguments.MonitorHost = $AnalysisHost
     $receiverArguments.MonitorPort = 15052
@@ -202,6 +224,9 @@ if ($Headless) { $receiverArguments.Headless = $true }
 Write-Host "GMR/Isaac: ${wslAddress}:15050 | Rerun: ${AnalysisHost}:15052 | ROS: ${wslAddress}:15054"
 Write-Host "Fusion: en az $MinimumSources/4 taze kamera, azami ${FusionHz}Hz | arayuz=${PreviewHz}Hz | dortlu tercih <=${PreferredFullSetSpreadMs}ms, bekleme <=${FullSetWaitMs}ms"
 Write-Host "Operator ortak-dunya kapisi: referans kamera X=${WorkspaceXMinM}-${WorkspaceXMaxM} m | cikis toleransi=${WorkspaceHysteresisM}m"
+if ($HandTracking) {
+    Write-Host "El katmani: ACIK | Rerun 21-landmark + Dex3 analiz hedefleri | fiziksel robot el cikisi KAPALI"
+}
 Write-Host "JSONL klasoru: $(Join-Path $project 'recordings')"
 Set-Location -LiteralPath $project
 & $receiver @receiverArguments
