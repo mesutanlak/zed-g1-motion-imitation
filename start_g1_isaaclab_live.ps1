@@ -44,7 +44,7 @@ param(
     [ValidateRange(0.1, 5.0)]
     [double]$UpperDampingScale = 2.0,
     [ValidateRange(1, 8)]
-    [int]$RenderInterval = 4,
+    [int]$RenderInterval = 8,
     [string]$ReferencePolicyPath = "",
     [string]$ReferencePolicyMetadata = "",
     [ValidateRange(0.0, 1.0)]
@@ -57,6 +57,8 @@ param(
     [ValidateRange(1.2, 2.2)]
     [double]$HumanHeightM = 1.80,
     [string]$InstallRoot = "C:\g1il",
+    [switch]$Dex3,
+    [string]$UnitreeSimRoot = "",
     [ValidateRange(0, 1000000)]
     [int]$MaxSteps = 0
 )
@@ -100,6 +102,12 @@ $resolvedInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
 $nativePython = Join-Path $resolvedInstallRoot "env\Scripts\python.exe"
 $nativeUrdf = Join-Path $resolvedInstallRoot "repos\unitree_ros\robots\g1_description\g1_23dof_rev_1_0.urdf"
 $nativeUsd = Join-Path $resolvedInstallRoot "cache\g1_23dof\g1_23dof_rev_1_0.usd"
+$nativeUnitreeSimRoot = if ([string]::IsNullOrWhiteSpace($UnitreeSimRoot)) {
+    Join-Path $resolvedInstallRoot "repos\unitree_sim_isaaclab"
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $UnitreeSimRoot))
+}
+$nativeDex3Usd = Join-Path $nativeUnitreeSimRoot "assets\robots\g1-29dof-dex3-base-fix-usd\g1_29dof_with_dex3_base_fix.usd"
 $nativePolicy = "$resolvedProject\policies\g1_23dof_velocity\policy.onnx"
 $nativePolicyCfg = "$resolvedProject\policies\g1_23dof_velocity\deploy.yaml"
 $wslHome = (& wsl.exe -d Ubuntu-22.04 -- bash -lc 'printf %s "$HOME"').Trim()
@@ -167,6 +175,9 @@ if (-not $Headless -and $driverVersion.Major -ge 595 -and -not $AllowUnvalidated
     Write-Host ""
     exit 3
 }
+if ($Dex3 -and -not (Test-Path -LiteralPath $nativeDex3Usd -PathType Leaf)) {
+    throw "Resmi Unitree Dex3 USD bulunamadi: $nativeDex3Usd`nOnce .\install\install_unitree_dex3_sim.ps1 calistirin."
+}
 
 if (-not $Headless -and $driverVersion.Major -ge 595 -and $AllowUnvalidatedDriver) {
     Write-Warning (
@@ -180,6 +191,7 @@ Write-Host "  ZED -> WSL/GMR : WSL_IP:15050"
 Write-Host "  WSL/GMR -> Isaac: ${windowsHost}:15051"
 Write-Host "  Mod: $Mode"
 Write-Host "  Imitation fizigi: $ImitationMode"
+Write-Host "  Asset: $(if ($Dex3) { 'Resmi Unitree G1-29DOF + Dex3 (DDS KAPALI)' } else { 'G1-23DOF' })"
 Write-Host "  NVIDIA surucu: $driverText"
     Write-Host "  Grafik API: D3D12"
 Write-Host "  Calisma profili: $RuntimeProfile"
@@ -311,6 +323,8 @@ try {
         "--telemetry-port", "15053",
         "--urdf", $nativeUrdf,
         "--usd", $nativeUsd,
+        "--asset-profile", $(if ($Dex3) { "g1_29dof_dex3" } else { "g1_23dof" }),
+        "--unitree-sim-root", $nativeUnitreeSimRoot,
         "--balance-policy", $nativePolicy,
         "--balance-config", $nativePolicyCfg,
         "--reference-policy", $nativeReferencePolicy,

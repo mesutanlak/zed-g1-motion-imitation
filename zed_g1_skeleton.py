@@ -1104,9 +1104,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hand-stream-host", default=None)
     parser.add_argument("--hand-stream-port", type=int, default=16200)
-    parser.add_argument("--hand-inference-fps", type=float, default=12.0)
+    parser.add_argument("--hand-inference-fps", type=float, default=8.0)
     parser.add_argument("--hand-roi-scale", type=float, default=1.45)
-    parser.add_argument("--hand-roi-min-px", type=int, default=96)
+    parser.add_argument("--hand-roi-min-px", type=int, default=160)
     parser.add_argument("--hand-roi-max-px", type=int, default=420)
     parser.add_argument(
         "--monitor-host",
@@ -1679,7 +1679,9 @@ def main() -> int:
             locked_id = None
             low_pass.reset()
             if hand_pipeline is not None:
-                hand_pipeline.reset(recreate_backends=True)
+                # IMAGE-mode ROI inference has no crop tracker state to
+                # recreate; generation reset safely discards in-flight work.
+                hand_pipeline.reset()
             print("R: Kisi kilidi, kalibrasyon ve kol hafizasi sifirlandi.")
         elif key == ord("s"):
             set_recording(not recording)
@@ -2052,7 +2054,9 @@ def main() -> int:
                     depth_image = None
                     depth_result = zed.retrieve_measure(hand_depth, sl.MEASURE.DEPTH)
                     if depth_result == sl.ERROR_CODE.SUCCESS:
-                        depth_image = np.array(hand_depth.get_data(), copy=True)
+                        # HandSourcePipeline copies only the two ROI slices
+                        # before queueing; avoid a full 720p depth copy here.
+                        depth_image = np.asarray(hand_depth.get_data())
                     try:
                         hand_packet = hand_pipeline.process(
                             frame, depth_image,

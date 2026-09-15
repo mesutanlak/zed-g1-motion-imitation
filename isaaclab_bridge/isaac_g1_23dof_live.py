@@ -7,6 +7,7 @@ the official Unitree ROS URDF.  It does not open Unitree DDS channels.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import socket
@@ -41,6 +42,9 @@ from motion_pipeline.reference_policy import (
     postprocess_action_numpy,
     residual_scale_vector,
 )
+from isaaclab_bridge.dex3_simulation import (
+    Dex3SimulationController, assert_neutral_only_joints_present,
+)
 
 G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M = {
     "left": (0.1079465665, 0.00163511945, 0.00202244863),
@@ -66,6 +70,18 @@ parser.add_argument(
     type=Path,
     default=None,
     help="Pre-converted official G1 23-DOF USD cache path",
+)
+parser.add_argument(
+    "--asset-profile",
+    choices=("g1_23dof", "g1_29dof_dex3"),
+    default="g1_23dof",
+    help="Use the existing official 23-DOF body or Unitree's official G1-29 + Dex3 asset",
+)
+parser.add_argument(
+    "--unitree-sim-root",
+    type=Path,
+    default=None,
+    help="Official unitreerobotics/unitree_sim_isaaclab checkout",
 )
 parser.add_argument(
     "--mode",
@@ -103,8 +119,8 @@ parser.add_argument(
     help="Maximum applied upper-body reference acceleration in rad/s^2",
 )
 parser.add_argument(
-    "--render-interval", type=int, default=4,
-    help="Render one frame per N physics steps (4 = 50 Hz at 200 Hz physics)",
+    "--render-interval", type=int, default=8,
+    help="Render one frame per N physics steps (8 = 25 Hz at 200 Hz physics)",
 )
 parser.add_argument(
     "--reference-max-jerk", type=float, default=35.0,
@@ -240,6 +256,7 @@ else:
         / "robots" / "g1_description" / "g1_23dof_rev_1_0.urdf"
     )
 DEFAULT_USD = INSTALL_ROOT / "cache" / "g1_23dof" / "g1_23dof_rev_1_0.usd"
+DEFAULT_UNITREE_SIM_ROOT = INSTALL_ROOT / "repos" / "unitree_sim_isaaclab"
 LOWER_BODY = {
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -717,15 +734,59 @@ def apply_fall_arrest(robot: Articulation, pelvis_body_id: int) -> None:
     )
 
 
-def design_scene(urdf_path: Path, usd_path: Path | None) -> Articulation:
+def _official_unitree_dex3_config(unitree_sim_root: Path):
+    source = unitree_sim_root / "robots" / "unitree.py"
+    asset = (
+        unitree_sim_root / "assets" / "robots" / "g1-29dof-dex3-base-fix-usd"
+        / "g1_29dof_with_dex3_base_fix.usd"
+    )
+    if not source.is_file() or not asset.is_file() or asset.stat().st_size < 1024:
+        raise FileNotFoundError(
+            "Official Unitree G1-29 + Dex3 source/asset missing. Run "
+            "install/install_unitree_dex3_sim.ps1 first."
+        )
+    previous_root = os.environ.get("PROJECT_ROOT")
+    os.environ["PROJECT_ROOT"] = str(unitree_sim_root)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "unitree_official_robot_config", source
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot import official Unitree config: {source}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cfg = module.G129_CFG_WITH_DEX3_BASE_FIX.copy()
+    finally:
+        if previous_root is None:
+            os.environ.pop("PROJECT_ROOT", None)
+        else:
+            os.environ["PROJECT_ROOT"] = previous_root
+    return cfg
+
+
+def design_scene(
+    urdf_path: Path,
+    usd_path: Path | None,
+    *,
+    asset_profile: str,
+    unitree_sim_root: Path,
+) -> Articulation:
     ground = sim_utils.GroundPlaneCfg()
     ground.func("/World/Ground", ground)
     light = sim_utils.DomeLightCfg(intensity=2500.0, color=(0.8, 0.8, 0.8))
     light.func("/World/Light", light)
 
-    cfg = UNITREE_G1_23DOF_CFG.copy()
+    if asset_profile == "g1_29dof_dex3":
+        cfg = _official_unitree_dex3_config(unitree_sim_root)
+    else:
+        cfg = UNITREE_G1_23DOF_CFG.copy()
     cfg.prim_path = "/World/G1"
-    if usd_path is not None and usd_path.is_file():
+    if asset_profile == "g1_29dof_dex3":
+        print(
+            "Using official unitreerobotics G1-29DOF + Dex3 USD (DDS disabled)",
+            flush=True,
+        )
+    elif usd_path is not None and usd_path.is_file():
         print(f"Using cached G1 USD: {usd_path}", flush=True)
         cfg.spawn = UnitreeUsdFileCfg(usd_path=str(usd_path))
     else:
@@ -750,7 +811,10 @@ def design_scene(urdf_path: Path, usd_path: Path | None) -> Articulation:
 def main() -> None:
     urdf_path = (args_cli.urdf or DEFAULT_URDF).expanduser().resolve()
     usd_path = (args_cli.usd or DEFAULT_USD).expanduser().resolve()
-    if not urdf_path.is_file():
+    unitree_sim_root = (
+        args_cli.unitree_sim_root or DEFAULT_UNITREE_SIM_ROOT
+    ).expanduser().resolve()
+    if args_cli.asset_profile == "g1_23dof" and not urdf_path.is_file():
         raise FileNotFoundError(f"Official G1 23-DOF URDF not found: {urdf_path}")
 
     configure_fabric_gpu_viewport()
@@ -764,14 +828,27 @@ def main() -> None:
         )
     )
     sim.set_camera_view([2.6, 2.2, 1.7], [0.0, 0.0, 0.8])
-    print("Spawning the official Unitree G1 23-DOF asset...", flush=True)
-    robot = design_scene(urdf_path, usd_path)
+    print(f"Spawning official Unitree asset: {args_cli.asset_profile}", flush=True)
+    robot = design_scene(
+        urdf_path, usd_path,
+        asset_profile=args_cli.asset_profile,
+        unitree_sim_root=unitree_sim_root,
+    )
     print("Resetting the scene and initializing physics...", flush=True)
     sim.reset()
     print("G1 scene initialization complete.", flush=True)
 
     names = list(robot.joint_names)
     index = {name: i for i, name in enumerate(names)}
+    dex3_controller = None
+    dex3_state = None
+    if args_cli.asset_profile == "g1_29dof_dex3":
+        assert_neutral_only_joints_present(names)
+        dex3_controller = Dex3SimulationController(names)
+        print(
+            "Dex3 local articulation controller ready: 14 joints, no DDS",
+            flush=True,
+        )
     nominal = robot.data.default_joint_pos.clone()
     desired = nominal.clone()
     balance = BalancePolicy(
@@ -1161,6 +1238,8 @@ def main() -> None:
                 ):
                     print("REJECTED_NONFINITE_GMR_PACKET", flush=True)
                 else:
+                    if dex3_controller is not None:
+                        dex3_controller.submit(newest.get("dex3_control"), now)
                     trajectory_start.copy_(gmr_interpolated)
                     trajectory_start_velocity.copy_(gmr_interpolated_velocity)
                     trajectory_started = now
@@ -1472,6 +1551,8 @@ def main() -> None:
                 previous_desired_velocity.zero_()
                 previous_desired_acceleration.zero_()
                 balance.reset()
+                if dex3_controller is not None:
+                    dex3_controller.reset()
                 if reference_policy is not None:
                     reference_policy.reset()
                 robot.reset()
@@ -1490,6 +1571,11 @@ def main() -> None:
                     )
                 resets += 1
 
+            if dex3_controller is not None:
+                # Only the 14 official hand joint indices are written. The
+                # 23 BODY_38/GMR targets above and six unsupported G1-29 body
+                # axes remain unchanged/neutral.
+                dex3_state = dex3_controller.write_targets(desired, now)
             desired = torch.max(
                 torch.min(desired, robot.data.soft_joint_pos_limits[:, :, 1]),
                 robot.data.soft_joint_pos_limits[:, :, 0],
@@ -1653,6 +1739,20 @@ def main() -> None:
                     latency.get("total_control_ms"),
                 )
                 telemetry["isaac_metrics"] = {
+                    "asset_profile": args_cli.asset_profile,
+                    "dex3_dds_enabled": False,
+                    "dex3_source_timestamp_ns": (
+                        dex3_state.source_timestamp_ns if dex3_state is not None else None
+                    ),
+                    "dex3_packet_age_ms": (
+                        dex3_state.packet_age_ms if dex3_state is not None else None
+                    ),
+                    "dex3_watchdog_left": (
+                        dex3_state.watchdog_left if dex3_state is not None else "DISABLED"
+                    ),
+                    "dex3_watchdog_right": (
+                        dex3_state.watchdog_right if dex3_state is not None else "DISABLED"
+                    ),
                     "joint_tracking_rmse_rad": joint_rmse,
                     "body_tracking_mpjpe_m": body_mpjpe,
                     "body_position_errors_m": body_position_errors_m,

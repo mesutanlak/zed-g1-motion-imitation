@@ -40,11 +40,23 @@ def interpolate_landmarks(
             p1 = np.asarray(hand["landmarks_px"], dtype=float)
             if p0.shape == p1.shape == (21, 2):
                 item["landmarks_px"] = (p1 + (p1 - p0) * ratio).tolist()
-                # Depth belongs to the original pixels and must not be moved by
-                # image-space prediction. Predicted landmarks contribute rays;
-                # fresh measurements still contribute robust depth.
-                item["camera_points_m"] = [None] * 21
-                item["depth_confidence"] = [0.0] * 21
+                # Predict the sparse 3-D palm anchors with the same bounded
+                # constant-velocity model. Fingertip depth remains absent and
+                # is reconstructed from multi-view rays or relative hand shape.
+                older_3d = older.get("camera_points_m") or [None] * 21
+                newer_3d = hand.get("camera_points_m") or [None] * 21
+                predicted_3d: list[list[float] | None] = []
+                for old_point, new_point in zip(older_3d, newer_3d):
+                    try:
+                        old_array = np.asarray(old_point, dtype=float)
+                        new_array = np.asarray(new_point, dtype=float)
+                        if old_array.shape == new_array.shape == (3,) and np.isfinite(old_array).all() and np.isfinite(new_array).all():
+                            predicted_3d.append((new_array + (new_array - old_array) * ratio).tolist())
+                        else:
+                            predicted_3d.append(None if new_point is None else list(new_point))
+                    except (TypeError, ValueError):
+                        predicted_3d.append(None)
+                item["camera_points_m"] = predicted_3d
         except (KeyError, TypeError, ValueError):
             pass
         item["temporal_prediction_ms"] = float(prediction_ms)
@@ -62,6 +74,51 @@ def _robust_depth_candidates(candidates: list[tuple[int, np.ndarray, float]], ga
     keep = distance <= max(gate_m, float(np.median(distance) * 2.5))
     result = [item for item, accepted in zip(candidates, keep) if accepted]
     return result if result else [candidates[int(np.argmin(distance))]]
+
+
+def _anchored_relative_shape(
+    hand: dict[str, Any], pose: CameraPose
+) -> np.ndarray | None:
+    """Anchor MediaPipe's relative metric shape to sparse ZED palm depth.
+
+    MediaPipe world landmarks are never treated as camera/world coordinates.
+    Only their relative vectors and scale are used; the absolute anchor comes
+    from ZED depth and the final orientation remains camera-relative.
+    """
+    try:
+        relative = np.asarray(hand.get("relative_landmarks_m"), dtype=float)
+        points = hand.get("camera_points_m") or [None] * 21
+    except (TypeError, ValueError):
+        return None
+    if relative.shape != (21, 3) or not np.isfinite(relative).all():
+        return None
+    anchors: list[tuple[int, np.ndarray]] = []
+    for index in (0, 2, 5, 9, 17):
+        try:
+            point = np.asarray(points[index], dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if point.shape == (3,) and np.isfinite(point).all():
+            anchors.append((index, point))
+    if not anchors:
+        return None
+    anchor_index, anchor_camera = anchors[0]
+    # MediaPipe: +x image-right, +y image-down, z relative depth. ZED camera:
+    # +X forward, +Y left, +Z up. This is an orientation adapter, not an
+    # absolute-coordinate interpretation.
+    delta_mp = relative - relative[anchor_index]
+    delta_camera = np.column_stack((-delta_mp[:, 2], -delta_mp[:, 0], -delta_mp[:, 1]))
+    ratios: list[float] = []
+    for index, point in anchors[1:]:
+        source_length = float(np.linalg.norm(delta_camera[index]))
+        target_length = float(np.linalg.norm(point - anchor_camera))
+        if source_length > 1.0e-5 and target_length > 1.0e-5:
+            ratios.append(target_length / source_length)
+    scale = float(np.clip(np.median(ratios) if ratios else 1.0, 0.60, 1.80))
+    camera_shape = anchor_camera + delta_camera * scale
+    return (
+        np.asarray(pose.rotation_camera_to_world, dtype=float) @ camera_shape.T
+    ).T + np.asarray(pose.translation_camera_to_world_m, dtype=float)
 
 
 def fuse_hand_packets(
@@ -105,6 +162,11 @@ def fuse_hand_packets(
             rejection_reasons.extend(f"CAPTURE_SPREAD:{serial}" for serial in sorted(excluded))
             observations = coherent
         fused = np.full((21, 3), np.nan)
+        relative_shapes = [
+            (serial, shape)
+            for serial, hand, _intrinsics, pose, _age_ms, _capture_ns in observations
+            if (shape := _anchored_relative_shape(hand, pose)) is not None
+        ]
         qualities: list[dict[str, Any]] = []
         for landmark_index in range(21):
             depth_candidates: list[tuple[int, np.ndarray, float]] = []
@@ -146,7 +208,10 @@ def fuse_hand_packets(
                         candidates.append((point, float(np.median(errors)), (ray_candidates[i][0], ray_candidates[j][0])))
                 if candidates:
                     point, residual, pair = min(candidates, key=lambda item: item[1])
-                    if residual <= 0.03:
+                    # BODY_38 calibration is centimetre-grade at three metres.
+                    # A relaxed 8 cm gate prevents needless hand loss while the
+                    # reported residual remains available for research filters.
+                    if residual <= 0.08:
                         fused[landmark_index] = point
                         used_serials = list(pair)
                         mode = "triangulated"
@@ -154,6 +219,13 @@ def fuse_hand_packets(
                 fused[landmark_index] = inliers[0][1]
                 used_serials = [inliers[0][0]]
                 mode = "single_depth"
+            if mode == "invalid" and relative_shapes:
+                fused[landmark_index] = np.median(
+                    np.stack([shape[landmark_index] for _serial, shape in relative_shapes]),
+                    axis=0,
+                )
+                used_serials = [serial for serial, _shape in relative_shapes]
+                mode = "relative_shape_anchored"
             reprojection_errors: list[float] = []
             if mode != "invalid":
                 for serial, hand, intrinsics, pose, _age_ms, _capture_ns in observations:
@@ -168,7 +240,9 @@ def fuse_hand_packets(
                         reprojection_errors.append(float(np.linalg.norm(projected - measured)))
                     except ValueError:
                         pass
-            confidence = 0.0 if mode == "invalid" else float(np.clip((len(used_serials) / 2.0) * np.exp(-(residual or 0.0) / 0.03), 0.0, 1.0))
+            confidence = 0.0 if mode == "invalid" else float(np.clip((len(used_serials) / 2.0) * np.exp(-(residual or 0.0) / 0.08), 0.0, 1.0))
+            if mode == "relative_shape_anchored":
+                confidence *= 0.65
             qualities.append({
                 "mode": mode, "camera_count": len(used_serials),
                 "serials": used_serials, "residual_m": residual,

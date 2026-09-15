@@ -60,7 +60,7 @@
       "maximum_acceleration_rad_s2": 20.0,
       "hold_s": 0.18,
       "fade_s": 0.55,
-      "minimum_confidence": 0.45
+      "minimum_confidence": 0.30
     },
     "body38_source_points": [
       "WRIST",
@@ -73,20 +73,20 @@
   "hand_tracking": {
     "enabled_by_default": false,
     "operator_distance_design_m": 3.0,
-    "inference_fps_per_camera": 12.0,
+    "inference_fps_per_camera": 8.0,
     "roi": {
       "forearm_scale": 1.45,
       "handward_offset": 0.32,
-      "minimum_px": 96,
+      "minimum_px": 160,
       "maximum_px": 420,
       "fallback_px": 180
     },
     "fusion": {
-      "maximum_capture_age_ms": 70.0,
+      "maximum_capture_age_ms": 120.0,
       "preferred_capture_spread_ms": 35.0,
-      "reject_capture_spread_above_ms": 40.0,
-      "depth_patch_radius_px": 3,
-      "maximum_wrist_depth_delta_m": 0.35,
+      "reject_capture_spread_above_ms": 70.0,
+      "depth_patch_radius_px": 4,
+      "maximum_wrist_depth_delta_m": 0.55,
       "single_view_depth_fallback": true
     },
     "transport": {

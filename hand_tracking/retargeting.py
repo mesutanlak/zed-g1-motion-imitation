@@ -3,13 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import subprocess
 import sys
+import threading
 from typing import Callable, Sequence
 
 import numpy as np
 
+from .contracts import DEX3_JOINT_ORDER
 
-DEX3_ORDER = ("thumb_0", "thumb_1", "thumb_2", "middle_0", "middle_1", "index_0", "index_1")
+DEX3_ORDER = DEX3_JOINT_ORDER
 
 
 def hand_task_vector(points: Sequence[Sequence[float]]) -> np.ndarray:
@@ -52,8 +55,36 @@ class OfficialDexRetargetingSolver:
     the official DexPilot objective.  No fake 25-point skeleton is created.
     """
 
-    def __init__(self, xr_teleoperate_root: str | Path) -> None:
+    def __init__(
+        self,
+        xr_teleoperate_root: str | Path,
+        python_executable: str | Path | None = None,
+    ) -> None:
         root = Path(xr_teleoperate_root).resolve()
+        self._process: subprocess.Popen[str] | None = None
+        self._process_lock = threading.Lock()
+        if python_executable is not None:
+            worker = Path(__file__).with_name("official_retarget_worker.py")
+            self._process = subprocess.Popen(
+                [str(Path(python_executable).resolve()), "-u", str(worker), "--root", str(root)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+                text=True, bufsize=1,
+            )
+            assert self._process.stdin is not None and self._process.stdout is not None
+            ready = ""
+            while True:
+                line = self._process.stdout.readline()
+                if not line:
+                    break
+                ready = line.strip()
+                if ready == "DEX3_WORKER_READY":
+                    break
+            if ready != "DEX3_WORKER_READY":
+                self.close()
+                raise RuntimeError(f"Resmi Dex3 worker baslatilamadi: {ready}")
+            self.backends = {}
+            self.output_indices = {}
+            return
         dex_source = root / "teleop" / "robot_control" / "dex-retargeting" / "src"
         config_path = root / "assets" / "unitree_hand" / "unitree_dex3.yml"
         if not dex_source.is_dir() or not config_path.is_file():
@@ -79,6 +110,25 @@ class OfficialDexRetargetingSolver:
             self.output_indices[side] = [backend.joint_names.index(name) for name in wanted]
 
     def __call__(self, normalized: np.ndarray, side: str, previous: np.ndarray) -> tuple[np.ndarray, dict]:
+        if self._process is not None:
+            request = json.dumps({
+                "side": side,
+                "normalized": np.asarray(normalized, dtype=float).tolist(),
+                "previous": np.asarray(previous, dtype=float).tolist(),
+            }, separators=(",", ":"))
+            with self._process_lock:
+                assert self._process.stdin is not None and self._process.stdout is not None
+                self._process.stdin.write(request + "\n")
+                self._process.stdin.flush()
+                while True:
+                    line = self._process.stdout.readline()
+                    if not line:
+                        raise RuntimeError("Resmi Dex3 worker beklenmedik bicimde kapandi")
+                    if line.startswith("DEX3_RESULT "):
+                        response = json.loads(line[len("DEX3_RESULT "):])
+                        if response.get("error"):
+                            raise RuntimeError(response["error"])
+                        return np.asarray(response["q"], dtype=float), dict(response["metrics"])
         p = np.asarray(normalized, dtype=float)
         # Official 25-point convention uses wrist/thumb/index/middle at
         # 0/4/9/14. Equivalent MediaPipe endpoints are 0/4/8/12.
@@ -93,6 +143,21 @@ class OfficialDexRetargetingSolver:
             "residual": None, "iterations": None, "time_ms": elapsed_ms,
         }
 
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+
 
 @dataclass(frozen=True)
 class SafetyConfig:
@@ -100,7 +165,7 @@ class SafetyConfig:
     maximum_acceleration_rad_s2: float = 20.0
     hold_s: float = 0.18
     fade_s: float = 0.55
-    minimum_confidence: float = 0.45
+    minimum_confidence: float = 0.30
 
 
 class Dex3SafetyFilter:
@@ -123,10 +188,13 @@ class Dex3SafetyFilter:
         dt = 1 / 30 if self.last_update_ns is None else float(np.clip((timestamp_ns - self.last_update_ns) / 1e9, 1e-3, 0.2))
         valid = raw is not None and confidence >= self.config.minimum_confidence
         if valid:
-            desired = np.clip(np.asarray(raw, dtype=float), self.minimum, self.maximum)
+            raw_array = np.asarray(raw, dtype=float)
+            desired = np.clip(raw_array, self.minimum, self.maximum)
+            joint_limit_clipped_count = int(np.count_nonzero(np.abs(raw_array - desired) > 1e-8))
             self.last_valid_ns = timestamp_ns
             state = "TRACKING"
         else:
+            joint_limit_clipped_count = 0
             lost_s = float("inf") if self.last_valid_ns is None else max(0.0, (timestamp_ns - self.last_valid_ns) / 1e9)
             if lost_s <= self.config.hold_s:
                 desired = self.position.copy()
@@ -137,12 +205,21 @@ class Dex3SafetyFilter:
                 state = "FADE_TO_NEUTRAL"
         requested_velocity = (desired - self.position) / dt
         max_dv = self.config.maximum_acceleration_rad_s2 * dt
-        velocity = np.clip(requested_velocity, self.velocity - max_dv, self.velocity + max_dv)
-        velocity = np.clip(velocity, -self.config.maximum_velocity_rad_s, self.config.maximum_velocity_rad_s)
+        acceleration_limited_velocity = np.clip(requested_velocity, self.velocity - max_dv, self.velocity + max_dv)
+        acceleration_limited_count = int(np.count_nonzero(np.abs(acceleration_limited_velocity - requested_velocity) > 1e-8))
+        velocity = np.clip(acceleration_limited_velocity, -self.config.maximum_velocity_rad_s, self.config.maximum_velocity_rad_s)
+        velocity_limited_count = int(np.count_nonzero(np.abs(velocity - acceleration_limited_velocity) > 1e-8))
         position = np.clip(self.position + velocity * dt, self.minimum, self.maximum)
-        saturated = bool(np.any(np.abs(position - desired) > 1e-8) or (raw is not None and np.any(np.asarray(raw) != np.clip(np.asarray(raw), self.minimum, self.maximum))))
+        saturated = bool(np.any(np.abs(position - desired) > 1e-8) or joint_limit_clipped_count)
         self.position, self.velocity, self.last_update_ns = position, velocity, timestamp_ns
-        return position.copy(), {"watchdog": state, "saturated": saturated, "confidence": float(confidence)}
+        return position.copy(), {
+            "watchdog": state,
+            "saturated": saturated,
+            "confidence": float(confidence),
+            "joint_limit_clipped_count": joint_limit_clipped_count,
+            "velocity_limited_count": velocity_limited_count,
+            "acceleration_limited_count": acceleration_limited_count,
+        }
 
 
 class Dex3Retargeter:
@@ -189,5 +266,21 @@ def compose_targets(q_body: Sequence[float], q_left: Sequence[float], q_right: S
         "q_body": body.tolist(), "q_left_dex3": left.tolist(),
         "q_right_dex3": right.tolist(),
         "q_target": np.concatenate((body, left, right)).tolist(),
+        "physical_robot_output_enabled": False,
+    }
+
+
+def dex3_control_contract(timestamp_ns: int, left: dict, right: dict) -> dict:
+    """Build the compact, versioned and explicitly DDS-free hand contract."""
+    return {
+        "schema": "unitree_g1_dex3_control/v1",
+        "timestamp_ns": int(timestamp_ns),
+        "joint_order_per_hand": list(DEX3_ORDER),
+        "q_left": [float(value) for value in left["safe_q_rad"]],
+        "q_right": [float(value) for value in right["safe_q_rad"]],
+        "confidence_left": float((left.get("safety") or {}).get("confidence", 0.0)),
+        "confidence_right": float((right.get("safety") or {}).get("confidence", 0.0)),
+        "watchdog_left": str((left.get("safety") or {}).get("watchdog", "FADE_TO_NEUTRAL")),
+        "watchdog_right": str((right.get("safety") or {}).get("watchdog", "FADE_TO_NEUTRAL")),
         "physical_robot_output_enabled": False,
     }

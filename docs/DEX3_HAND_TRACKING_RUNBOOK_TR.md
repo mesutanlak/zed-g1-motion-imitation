@@ -1,5 +1,9 @@
 # 4×ZED BODY_38 kilitli el takibi ve Dex3-1 runbook
 
+> Resmi G1-29DOF + Dex3 Isaac entegrasyonu ve güncel performans profili için
+> `docs/DEX3_OFFICIAL_ISAAC_PIPELINE_TR.md` esas alınmalıdır. Bu dosyanın kalan
+> kısmı ayrıntılı/geriye dönük paket ve replay açıklaması olarak korunur.
+
 Bu ek katman mevcut G1 23-DOF gövde yolunu değiştirmez. Varsayılanı kapalıdır.
 Kaynak süreçler tam RGB görüntüyü ağdan göndermez; yalnız BODY_38 ile **LOCKED**
 durumdaki operatörün bilek ROI'lerinde MediaPipe çalıştırır ve ayrı UDP
@@ -97,7 +101,7 @@ Set-Location "C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation"
   -PreviewSource "39504762:16100","31571870:16102","33773329:16104","34760587:16106" `
   -Extrinsics ".\config\zed_four\active_distributed_body38_extrinsics.json" `
   -MinimumSources 2 -MaxSyncMs 80 -PreferredFullSetSpreadMs 40 `
-  -MaxTemporalPredictionMs 70 -HandTracking -HandMaxAgeMs 70 -HandMaxSpreadMs 40 `
+  -MaxTemporalPredictionMs 70 -HandTracking -HandMaxAgeMs 120 -HandMaxSpreadMs 70 `
   -Record -OutputDir ".\recordings"
 ```
 
@@ -115,7 +119,7 @@ Set-Location "C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation"
   -Fps 15 -DepthMode neural-light -FrameIntegrityMode off `
   -DistanceMin 1.0 -DistanceMax 5.25 `
   -HandTracking -HandModel "C:\ZED_G1\models\hand_landmarker.task" `
-  -HandDelegate cpu -HandInferenceFps 12 -RecordSvo2
+  -HandDelegate cpu -HandInferenceFps 8 -RecordSvo2
 ```
 
 Laptopta iki uzak kamera:
@@ -126,11 +130,11 @@ Set-Location "C:\Users\mesut\OneDrive\Masaüstü\ZED_G1\zed-g1-motion-imitation"
   -Fps 15 -DepthMode neural-light -FrameIntegrityMode off `
   -DistanceMin 1.0 -DistanceMax 5.25 `
   -HandTracking -HandModel "C:\ZED_G1\models\hand_landmarker.task" `
-  -HandDelegate cpu -HandInferenceFps 12 -RecordSvo2
+  -HandDelegate cpu -HandInferenceFps 8 -RecordSvo2
 ```
 
 Operatör yaklaşık 3 m'de tutulur. ROI boyutu sabit piksel değildir: önkolun
-görüntü uzunluğu ×1,45, ele doğru %32 offset, 96–420 px kapısı kullanır. İkinci
+görüntü uzunluğu ×1,45, ele doğru %32 offset, 160–420 px kapısı kullanır. İkinci
 kişi varsa kaynak BODY_38 kilidi değişmeden el de değişmez. `R`, kişi kilidiyle
 birlikte el association belleğini sıfırlar. Kilit kaybolunca başka ele atlanmaz;
 merkez watchdog kısa hold sonrası nötre fade eder.
@@ -144,7 +148,7 @@ Her SVO2 ait olduğu fiziksel kamerada veya pyzed kurulu Windows makinede:
   --svo-input "C:\ZED_G1\recordings\zed_body38_39504762_SESSION.svo2" `
   --serial 39504762 --headless --record `
   --hand-tracking --hand-model "C:\ZED_G1\models\hand_landmarker.task" `
-  --hand-stream-host 127.0.0.1 --hand-stream-port 16200 --hand-inference-fps 12
+  --hand-stream-host 127.0.0.1 --hand-stream-port 16200 --hand-inference-fps 8
 ```
 
 Yalnız ekran videosu metrik depth, fabrika intrinsics'i veya kalibre edilmiş
@@ -154,22 +158,22 @@ iddia edilmez.
 ## Sürekli Isaac + Rerun + dört kamera bağlantısı
 
 Canlı zincirde başlatma sırası önemlidir. Önce ana PC'de Rerun, sonra
-Isaac/GMR ve en son dört-kamera fusion receiver açılır. El verisi yalnız tam
-analiz paketinden `127.0.0.1:15052` Rerun kanalına gider; GMR/Isaac kontrol
-paketi BODY_38 olarak kompakt kalır. Dex3 hedefleri Rerun'da gösterilir ve
-JSONL kaydına yazılır, fiziksel robot el çıkışı etkinleştirilmez.
+Isaac/GMR ve en son dört-kamera fusion receiver açılır. Elin tam 21-landmark
+verisi `127.0.0.1:15052` Rerun kanalına gider. `15050` kontrol paketine yalnız
+14 hedef ve watchdog içeren küçük `dex3_control/v1` alanı eklenir; BODY_38 IK
+sözleşmesi değişmez. Fiziksel robot el çıkışı etkinleştirilmez.
 
 Ana PC pencere 1 — Rerun:
 
 ```powershell
-.\start_g1_rerun_analysis.ps1 -Mode live -LiveMaxHz 15 -GmrLogMaxHz 15
+.\start_g1_rerun_analysis.ps1 -Mode live -LiveMaxHz 10 -GmrLogMaxHz 10
 ```
 
 Ana PC pencere 2 — Isaac/GMR:
 
 ```powershell
 .\start_g1_isaaclab_live.ps1 -Mode upper_body `
-  -ImitationMode kinematic_debug -InputFps 15 -AcceptNvidiaEula
+  -ImitationMode kinematic_debug -InputFps 15 -Dex3 -AcceptNvidiaEula
 ```
 
 Ana PC pencere 3 — sürekli dört-kamera fusion:
@@ -177,7 +181,7 @@ Ana PC pencere 3 — sürekli dört-kamera fusion:
 ```powershell
 .\start_zed_four_fusion_to_wsl.ps1 -Record -MinimumSources 3 `
   -FusionHz 15 -PreviewHz 8 -WorkspaceXMinM 2 -WorkspaceXMaxM 4 `
-  -HandTracking -HandMaxAgeMs 70 -HandMaxSpreadMs 40
+  -HandTracking -HandMaxAgeMs 120 -HandMaxSpreadMs 70
 ```
 
 Kaynaklar iki hostta `start_zed_four_sources.ps1 -HandTracking` ile açık

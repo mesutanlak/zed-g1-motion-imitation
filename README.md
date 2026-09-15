@@ -41,6 +41,8 @@ robota motor komutu göndermez.
 
 ## Resmî kaynaklar
 
+- [Resmi Unitree G1-29DOF + Dex3, DDS'siz Isaac ve optimize el hattı](docs/DEX3_OFFICIAL_ISAAC_PIPELINE_TR.md)
+
 - [Stereolabs Body Tracking](https://www.stereolabs.com/docs/development/zed-sdk/modules/body-tracking)
 - [Using the Body Tracking API](https://www.stereolabs.com/docs/development/zed-sdk/modules/body-tracking/using-the-api)
 - [Stereolabs Tutorial 8](https://github.com/stereolabs/zed-sdk/tree/master/tutorials/tutorial%208%20-%20body%20tracking/python)

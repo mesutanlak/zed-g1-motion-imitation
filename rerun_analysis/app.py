@@ -50,11 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmr-listen-host", default="0.0.0.0")
     parser.add_argument("--gmr-listen-port", type=int, default=15053)
     parser.add_argument(
-        "--live-max-hz", type=float, default=15.0,
+        "--live-max-hz", type=float, default=10.0,
         help="Canli BODY_38 analiz/render hizi; kontrol akisini etkilemez",
     )
     parser.add_argument(
-        "--gmr-log-max-hz", type=float, default=15.0,
+        "--gmr-log-max-hz", type=float, default=10.0,
         help="Her GMR telemetri semasi icin azami kayit hizi",
     )
     parser.add_argument(
@@ -437,8 +437,15 @@ class RerunSkeletonApp:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         sock.bind((self.args.gmr_listen_host, self.args.gmr_listen_port))
         sock.settimeout(0.2)
+        drain_deadline = None
         try:
-            while not self.stop_event.is_set():
+            while True:
+                if self.stop_event.is_set() and drain_deadline is None:
+                    # Isaac telemetry trails the source stream slightly. Drain
+                    # the socket before quality_summary is finalized.
+                    drain_deadline = time.monotonic() + 0.60
+                if drain_deadline is not None and time.monotonic() >= drain_deadline:
+                    break
                 try:
                     payload, _ = sock.recvfrom(2_000_000)
                 except socket.timeout:
@@ -461,6 +468,11 @@ class RerunSkeletonApp:
                         continue
                     self._last_gmr_log_s[schema] = now
                     self._log_gmr_packet(packet)
+                    if drain_deadline is not None:
+                        drain_deadline = min(
+                            time.monotonic() + 0.20,
+                            drain_deadline + 0.10,
+                        )
         finally:
             sock.close()
 
@@ -1002,7 +1014,7 @@ class RerunSkeletonApp:
         self.stop_event.set()
         self.worker.join(timeout=3.0)
         if self.gmr_worker.is_alive():
-            self.gmr_worker.join(timeout=1.0)
+            self.gmr_worker.join(timeout=2.0)
         self.writer.close()
         rr.disconnect()
         print(f"Rerun RRD: {self.rrd_path}")

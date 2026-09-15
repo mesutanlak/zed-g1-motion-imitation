@@ -78,3 +78,31 @@ class HandAssociator:
         selected["association_score"] = float(best[0])
         selected["projected_wrist_distance_px"] = float(best[3])
         return selected
+
+    def rejection_reason(
+        self,
+        side: str,
+        candidates: list[dict[str, Any]],
+        projected_wrist_px: np.ndarray,
+        timestamp_ns: int,
+    ) -> str:
+        """Return a measurable detector/association failure category."""
+        if not candidates:
+            previous = self._previous.get(side)
+            if previous is not None and (timestamp_ns - previous[1]) / 1e6 <= self.config.maximum_gap_ms:
+                return "DETECTOR_TRACK_LOST"
+            return "MEDIAPIPE_NO_HAND"
+        wrist = np.asarray(projected_wrist_px, dtype=float)
+        valid = []
+        for candidate in candidates:
+            points = np.asarray(candidate.get("landmarks_px"), dtype=float)
+            if points.shape == (21, 2) and np.isfinite(points).all():
+                valid.append(points)
+        if not valid:
+            return "INVALID_LANDMARKS"
+        if all(float(np.linalg.norm(points[0] - wrist)) > self.config.maximum_wrist_distance_px for points in valid):
+            return "WRIST_TOO_FAR"
+        labels = [str(item.get("handedness_label") or "").lower() for item in candidates]
+        if labels and all(label and label != side for label in labels):
+            return "HANDEDNESS_MISMATCH"
+        return "ASSOCIATION_REJECTED"

@@ -48,6 +48,7 @@ from motion_pipeline.mirror_rescue import (
     KinematicEvaluation,
     MirrorContinuationRescue,
 )
+from hand_tracking.contracts import validate_dex3_control
 
 
 MAX_VELOCITY_RAD_S = np.asarray(
@@ -1350,6 +1351,9 @@ def main() -> int:
             human_visualization = retarget_human_visualization_positions(
                 adapted.human_data
             )
+            dex3_control = frame.get("dex3_control")
+            if not validate_dex3_control(dex3_control)[0]:
+                dex3_control = None
             packet = {
                 "schema": "zed_gmr_g1_23dof_live/v1",
                 "sequence": int(frame.get("sequence", accepted)),
@@ -1370,6 +1374,9 @@ def main() -> int:
                 "source_control_mode_request": frame.get(
                     "control_mode_request"
                 ),
+                # Versioned 14-value hand extension. GMR never interprets or
+                # modifies it; the 23-DOF BODY_38 IK above remains identical.
+                "dex3_control": dex3_control,
                 "valid_targets": adapted.valid_targets,
                 "memory_targets": adapted.used_memory_targets,
                 "raw_fallback_targets": adapted.raw_fallback_targets,

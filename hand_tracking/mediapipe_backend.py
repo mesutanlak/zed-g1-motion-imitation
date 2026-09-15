@@ -14,9 +14,9 @@ class MediaPipeHandBackend:
         self,
         model_path: str | Path,
         *,
-        minimum_detection_confidence: float = 0.45,
-        minimum_presence_confidence: float = 0.45,
-        minimum_tracking_confidence: float = 0.45,
+        minimum_detection_confidence: float = 0.30,
+        minimum_presence_confidence: float = 0.30,
+        minimum_tracking_confidence: float = 0.30,
         delegate: str = "cpu",
     ) -> None:
         path = Path(model_path)
@@ -47,24 +47,24 @@ class MediaPipeHandBackend:
             base_kwargs["delegate"] = delegate_value
         options = mp.tasks.vision.HandLandmarkerOptions(
             base_options=base_options(**base_kwargs),
-            running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            num_hands=2,
+            # Each instance receives one BODY_38 wrist ROI. IMAGE mode avoids
+            # carrying tracker state across a crop coordinate system that moves
+            # and rescales every frame.
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            num_hands=1,
             min_hand_detection_confidence=minimum_detection_confidence,
             min_hand_presence_confidence=minimum_presence_confidence,
             min_tracking_confidence=minimum_tracking_confidence,
         )
         self._landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
-        self._last_timestamp_ms = -1
 
     def close(self) -> None:
         self._landmarker.close()
 
     def detect(self, rgb_crop: np.ndarray, timestamp_ns: int) -> tuple[list[dict[str, Any]], float]:
-        timestamp_ms = max(self._last_timestamp_ms + 1, int(timestamp_ns // 1_000_000))
-        self._last_timestamp_ms = timestamp_ms
         image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb_crop))
         started = time.perf_counter()
-        result = self._landmarker.detect_for_video(image, timestamp_ms)
+        result = self._landmarker.detect(image)
         inference_ms = (time.perf_counter() - started) * 1000.0
         candidates: list[dict[str, Any]] = []
         for index, landmarks in enumerate(result.hand_landmarks):
@@ -86,5 +86,10 @@ class MediaPipeHandBackend:
                 "presence_confidence": None,
                 "tracking_confidence": None,
                 "confidence_thresholds": dict(self._confidence_gates),
+                "relative_landmarks_m": (
+                    [[float(item.x), float(item.y), float(item.z)] for item in result.hand_world_landmarks[index]]
+                    if index < len(result.hand_world_landmarks)
+                    else None
+                ),
             })
         return candidates, inference_ms

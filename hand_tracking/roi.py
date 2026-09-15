@@ -11,7 +11,7 @@ import numpy as np
 class RoiConfig:
     forearm_scale: float = 1.45
     handward_offset: float = 0.32
-    minimum_px: int = 96
+    minimum_px: int = 160
     maximum_px: int = 420
     fallback_px: int = 180
 
@@ -21,6 +21,7 @@ def clipped_hand_roi(
     elbow_px: Sequence[float] | None,
     image_size: tuple[int, int],
     config: RoiConfig,
+    hand_keypoints_px: Sequence[Sequence[float]] | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Build a wrist ROI extended away from the elbow, clipped to the image."""
     width, height = map(int, image_size)
@@ -34,7 +35,23 @@ def clipped_hand_roi(
     else:
         vector = np.zeros(2)
         forearm_px = 0.0
-    size = config.fallback_px if forearm_px < 8.0 else forearm_px * config.forearm_scale
+    # BODY_38 already exposes four coarse hand points.  At the intended three
+    # metre distance they are a better crop-size cue than the forearm alone;
+    # include their spread while keeping the wrist/elbow direction as the
+    # handward crop centre.  MediaPipe then sees only this zoomed square.
+    hand_extent_px = 0.0
+    if hand_keypoints_px is not None:
+        try:
+            coarse = np.asarray(hand_keypoints_px, dtype=float).reshape(-1, 2)
+            coarse = coarse[np.isfinite(coarse).all(axis=1)]
+            if coarse.size:
+                hand_extent_px = float(
+                    2.4 * np.max(np.linalg.norm(coarse - wrist, axis=1))
+                )
+        except (TypeError, ValueError):
+            hand_extent_px = 0.0
+    forearm_size = config.fallback_px if forearm_px < 8.0 else forearm_px * config.forearm_scale
+    size = max(forearm_size, hand_extent_px)
     size = int(round(np.clip(size, config.minimum_px, config.maximum_px)))
     direction = vector / forearm_px if forearm_px >= 8.0 else np.zeros(2)
     center = wrist + direction * size * config.handward_offset

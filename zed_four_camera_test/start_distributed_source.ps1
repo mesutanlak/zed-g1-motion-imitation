@@ -34,7 +34,7 @@ param(
     [ValidateSet("cpu", "gpu")]
     [string]$HandDelegate = "cpu",
     [ValidateRange(1, 30)]
-    [double]$HandInferenceFps = 12,
+    [double]$HandInferenceFps = 8,
     [ValidateRange(1024, 65535)]
     [int]$HandPort = 16200,
     [switch]$RecordLocal,

@@ -906,11 +906,11 @@ class AnalysisSessionWriter:
             self.flush()
 
     def flush(self) -> None:
-        for stream in (
-            self._json, self._frames, self._joints, self._angles,
-            self._imitation_json, self._imitation_csv,
-        ):
+        for stream in (self._json, self._frames, self._joints, self._angles):
             stream.flush()
+        with self._imitation_lock:
+            self._imitation_json.flush()
+            self._imitation_csv.flush()
         # Keep the manifest useful even if the viewer, WSLg, or the parent
         # PowerShell is terminated without reaching ``close``. At 15/30 FPS
         # this is updated every 1.0/0.5 second by ``write``.

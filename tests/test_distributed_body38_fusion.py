@@ -25,6 +25,7 @@ from zed_four_camera_test.distributed_body38_fusion import (
     covariance_weight,
     load_extrinsics,
     make_output_packet,
+    research_record_packet,
     prepare_aligned_views,
     synchronized_samples,
     temporal_compensate_samples,
@@ -599,6 +600,17 @@ def test_four_view_packet_contains_analysis_data_but_control_copy_is_compact() -
 
     fused["hand_tracking"] = {"schema": "zed_operator_hands_fused/v1", "hands": []}
     fused["dex3_targets"] = {"physical_robot_output_enabled": False}
+    fused["dex3_control"] = {
+        "schema": "unitree_g1_dex3_control/v1", "timestamp_ns": 1,
+        "joint_order_per_hand": [
+            "thumb_0", "thumb_1", "thumb_2",
+            "middle_0", "middle_1", "index_0", "index_1",
+        ],
+        "q_left": [0.0] * 7, "q_right": [0.0] * 7,
+        "confidence_left": 0.8, "confidence_right": 0.8,
+        "physical_robot_output_enabled": False,
+    }
+    assert compact_live_packet(fused)["dex3_control"]["q_left"] == [0.0] * 7
     assert "hand_tracking" not in compact_live_packet(fused)
     hand_analysis = analysis_live_packet(fused)
     assert hand_analysis["hand_tracking"]["schema"] == "zed_operator_hands_fused/v1"
@@ -651,6 +663,7 @@ def test_udp_packets_stay_below_safe_datagram_size_with_four_raw_views() -> None
 
     assert len(compact_payload) < 30_000
     assert len(analysis_payload) < 60_000
+    assert len(json.dumps(research_record_packet(fused), separators=(",", ":"))) < len(analysis_payload)
     assert all(
         len(view["keypoints_3d_fusion_m"]) == 38
         for view in analysis["multi_camera"]["per_camera"]

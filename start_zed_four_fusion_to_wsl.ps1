@@ -23,11 +23,12 @@ param(
     [switch]$HandTracking,
     [switch]$DisableDex3Retargeting,
     [ValidateRange(10, 150)]
-    [double]$HandMaxAgeMs = 70,
+    [double]$HandMaxAgeMs = 120,
     [ValidateRange(5, 80)]
-    [double]$HandMaxSpreadMs = 40,
+    [double]$HandMaxSpreadMs = 70,
     [switch]$DisableSingleViewHandDepth,
     [string]$Dex3OfficialRoot = "",
+    [string]$Dex3OfficialPython = "",
     [string]$Extrinsics = "",
     [string]$FusionConfig = "",
     [long]$ReferenceSerial = 33773329,
@@ -190,11 +191,24 @@ $receiverArguments = @{
     WorkspaceHysteresisM = $WorkspaceHysteresisM
     PreviewHz = $PreviewHz
     RecordStem = "four_body38_fusion"
+    RecordDetail = "research"
 }
 if (-not $Headless) {
     $receiverArguments.PreviewSource = $previewSource
 }
 if ($HandTracking) {
+    if (-not $Dex3OfficialRoot) {
+        $officialCandidate = "C:\g1il\repos\xr_teleoperate"
+        if (Test-Path -LiteralPath (Join-Path $officialCandidate "assets\unitree_hand\unitree_dex3.yml")) {
+            $Dex3OfficialRoot = $officialCandidate
+        }
+    }
+    if (-not $Dex3OfficialPython) {
+        $pythonCandidate = "C:\g1il\envs\dex3\Scripts\python.exe"
+        if (Test-Path -LiteralPath $pythonCandidate -PathType Leaf) {
+            $Dex3OfficialPython = $pythonCandidate
+        }
+    }
     $receiverArguments.HandTracking = $true
     $receiverArguments.HandMaxAgeMs = $HandMaxAgeMs
     $receiverArguments.HandMaxSpreadMs = $HandMaxSpreadMs
@@ -206,6 +220,9 @@ if ($HandTracking) {
     }
     if ($Dex3OfficialRoot) {
         $receiverArguments.Dex3OfficialRoot = $Dex3OfficialRoot
+    }
+    if ($Dex3OfficialPython) {
+        $receiverArguments.Dex3OfficialPython = $Dex3OfficialPython
     }
 }
 if (-not $NoAnalysisStream) {
@@ -225,7 +242,8 @@ Write-Host "GMR/Isaac: ${wslAddress}:15050 | Rerun: ${AnalysisHost}:15052 | ROS:
 Write-Host "Fusion: en az $MinimumSources/4 taze kamera, azami ${FusionHz}Hz | arayuz=${PreviewHz}Hz | dortlu tercih <=${PreferredFullSetSpreadMs}ms, bekleme <=${FullSetWaitMs}ms"
 Write-Host "Operator ortak-dunya kapisi: referans kamera X=${WorkspaceXMinM}-${WorkspaceXMaxM} m | cikis toleransi=${WorkspaceHysteresisM}m"
 if ($HandTracking) {
-    Write-Host "El katmani: ACIK | Rerun 21-landmark + Dex3 analiz hedefleri | fiziksel robot el cikisi KAPALI"
+    $retargetLabel = if ($Dex3OfficialRoot) { "resmi Unitree xr_teleoperate" } else { "yerel fallback" }
+    Write-Host "El katmani: ACIK | retarget=$retargetLabel | Isaac kompakt Dex3 + Rerun 21-landmark | fiziksel robot el cikisi KAPALI"
 }
 Write-Host "JSONL klasoru: $(Join-Path $project 'recordings')"
 Set-Location -LiteralPath $project

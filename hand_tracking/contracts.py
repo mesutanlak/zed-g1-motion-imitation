@@ -18,6 +18,11 @@ HAND_LANDMARK_NAMES = (
 HAND_SCHEMA = "zed_operator_hand/v1"
 FUSED_HAND_SCHEMA = "zed_operator_hands_fused/v1"
 UDP_SAFE_BYTES = 60_000
+DEX3_CONTROL_SCHEMA = "unitree_g1_dex3_control/v1"
+DEX3_JOINT_ORDER = (
+    "thumb_0", "thumb_1", "thumb_2",
+    "middle_0", "middle_1", "index_0", "index_1",
+)
 
 
 @dataclass(frozen=True)
@@ -105,4 +110,32 @@ def validate_hand_packet(packet: Any) -> tuple[bool, str | None]:
             json.dumps(hand, allow_nan=False)
         except (TypeError, ValueError):
             return False, "NONFINITE_OR_NON_JSON"
+    return True, None
+
+
+def validate_dex3_control(value: Any) -> tuple[bool, str | None]:
+    if not isinstance(value, dict) or value.get("schema") != DEX3_CONTROL_SCHEMA:
+        return False, "SCHEMA"
+    if value.get("physical_robot_output_enabled") is not False:
+        return False, "PHYSICAL_OUTPUT_MUST_BE_FALSE"
+    if not isinstance(value.get("timestamp_ns"), int):
+        return False, "TIMESTAMP"
+    if tuple(value.get("joint_order_per_hand") or ()) != DEX3_JOINT_ORDER:
+        return False, "JOINT_ORDER"
+    for side in ("left", "right"):
+        try:
+            q = np.asarray(value[f"q_{side}"], dtype=float)
+        except (KeyError, TypeError, ValueError):
+            return False, f"Q_{side.upper()}"
+        if q.shape != (7,) or not np.isfinite(q).all():
+            return False, f"Q_{side.upper()}"
+        try:
+            confidence = float(value[f"confidence_{side}"])
+        except (KeyError, TypeError, ValueError):
+            return False, f"CONFIDENCE_{side.upper()}"
+        if not np.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            return False, f"CONFIDENCE_{side.upper()}"
+        watchdog = value.get(f"watchdog_{side}")
+        if not isinstance(watchdog, str) or not watchdog:
+            return False, f"WATCHDOG_{side.upper()}"
     return True, None

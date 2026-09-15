@@ -48,14 +48,17 @@ param(
     [switch]$HandTracking,
     [switch]$DisableDex3Retargeting,
     [ValidateRange(10, 150)]
-    [double]$HandMaxAgeMs = 70,
+    [double]$HandMaxAgeMs = 120,
     [ValidateRange(5, 80)]
-    [double]$HandMaxSpreadMs = 40,
+    [double]$HandMaxSpreadMs = 70,
     [switch]$DisableSingleViewHandDepth,
     [string]$Dex3OfficialRoot = "",
+    [string]$Dex3OfficialPython = "",
     [string]$OutputDir = "",
     [string]$RecordStem = "four_body38_fusion",
     [switch]$Record,
+    [ValidateSet("minimal", "research", "full")]
+    [string]$RecordDetail = "research",
     [switch]$Headless,
     [ValidateRange(0, 86400)]
     [double]$Duration = 0
@@ -107,6 +110,18 @@ foreach ($item in $PreviewSource) {
     $arguments += $item
 }
 if ($HandTracking) {
+    if (-not $Dex3OfficialRoot) {
+        $officialCandidate = "C:\g1il\repos\xr_teleoperate"
+        if (Test-Path -LiteralPath (Join-Path $officialCandidate "assets\unitree_hand\unitree_dex3.yml")) {
+            $Dex3OfficialRoot = $officialCandidate
+        }
+    }
+    if (-not $Dex3OfficialPython) {
+        $pythonCandidate = "C:\g1il\envs\dex3\Scripts\python.exe"
+        if (Test-Path -LiteralPath $pythonCandidate -PathType Leaf) {
+            $Dex3OfficialPython = $pythonCandidate
+        }
+    }
     foreach ($item in $Source) {
         if ($item -notmatch '^(\d+):(\d+)$') {
             throw "Hand port turetmek icin Source SERIAL:PORT biciminde olmali: $item"
@@ -118,6 +133,7 @@ if ($HandTracking) {
     if ($DisableDex3Retargeting) { $arguments += "--no-dex3-retargeting" }
     if ($DisableSingleViewHandDepth) { $arguments += "--no-hand-single-view-depth" }
     if ($Dex3OfficialRoot) { $arguments += @("--dex3-official-root", $Dex3OfficialRoot) }
+    if ($Dex3OfficialPython) { $arguments += @("--dex3-official-python", $Dex3OfficialPython) }
 }
 $arguments += "--minimum-sources"
 $arguments += "$MinimumSources"
@@ -168,6 +184,7 @@ if ($CalibrationRecord) {
     $arguments += $CalibrationRecord
 }
 $arguments += @("--preview-hz", "$PreviewHz", "--record-stem", $RecordStem)
+$arguments += @("--record-detail", $RecordDetail)
 if ($OutputDir) {
     $arguments += @("--output-dir", $OutputDir)
 }

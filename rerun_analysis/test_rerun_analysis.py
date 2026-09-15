@@ -200,6 +200,12 @@ def main() -> int:
         )
         if quality.get("schema") != "zed_g1_quality_summary/v1":
             raise AssertionError(quality)
+        with (session / "imitation_comparison.jsonl").open(encoding="utf-8") as stream:
+            imitation_rows = sum(1 for line in stream if line.strip())
+        if quality.get("imitation_frames") != imitation_rows:
+            raise AssertionError(
+                (quality.get("imitation_frames"), imitation_rows)
+            )
         with (session / "frames.csv").open(encoding="utf-8-sig") as stream:
             frame_fields = next(csv.reader(stream))
         for field in (

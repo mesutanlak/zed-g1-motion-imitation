@@ -47,7 +47,9 @@ from motion_pipeline.calibration import to_pelvis_local
 from hand_tracking.contracts import validate_hand_packet
 from hand_tracking.fusion import CameraPose, fuse_hand_packets, interpolate_landmarks
 from hand_tracking.normalization import PalmNormalizer
-from hand_tracking.retargeting import Dex3Retargeter, OfficialDexRetargetingSolver
+from hand_tracking.retargeting import (
+    Dex3Retargeter, OfficialDexRetargetingSolver, dex3_control_contract,
+)
 
 
 BODY38_NAMES = (
@@ -1245,6 +1247,7 @@ def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "pelvis_frame", "operator_selection", "calibration",
         "occlusion_analysis", "perception_metrics", "human_state",
         "control_mode_request", "latency_trace_ns", "transport_metrics",
+        "dex3_control",
     )
     result = {key: packet[key] for key in keep if key in packet}
 
@@ -1324,6 +1327,60 @@ def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
     return quantize_udp_floats(result)
 
 
+def compact_hand_analysis(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep paper-grade metrics without repeating four raw landmark arrays."""
+    root = dict(value or {})
+    fused_hands = []
+    for source_hand in root.get("hands") or []:
+        hand = dict(source_hand)
+        normalization = dict(hand.get("normalization") or {})
+        normalization.pop("landmarks", None)
+        if normalization:
+            hand["normalization"] = normalization
+        fused_hands.append(hand)
+    per_camera = []
+    for camera in root.get("per_camera") or []:
+        summary = {
+            key: camera.get(key)
+            for key in (
+                "camera_serial", "source_host_id", "sequence",
+                "capture_timestamp_ns", "image_size", "operator",
+                "transport_metrics",
+            )
+            if key in camera
+        }
+        summary_hands = []
+        for hand in camera.get("hands") or []:
+            hand_summary = {
+                key: hand.get(key)
+                for key in (
+                    "side", "roi_xywh", "candidate_count", "inference_ms",
+                    "rejection_reason", "depth_valid_count",
+                    "handedness_label", "handedness_score",
+                    "handedness_mismatch", "association_score",
+                    "projected_wrist_distance_px",
+                )
+                if key in hand
+            }
+            if "depth_valid_count" not in hand_summary:
+                hand_summary["depth_valid_count"] = sum(
+                    item is not None for item in (hand.get("camera_points_m") or [])
+                )
+            summary_hands.append(hand_summary)
+        summary["hands"] = summary_hands
+        per_camera.append(summary)
+    return {
+        key: item
+        for key, item in {
+            "schema": root.get("schema"),
+            "capture_timestamp_ns": root.get("capture_timestamp_ns"),
+            "hands": fused_hands,
+            "per_camera": per_camera,
+        }.items()
+        if item is not None
+    }
+
+
 def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the bounded four-view packet consumed by live Rerun.
 
@@ -1369,9 +1426,22 @@ def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
     # Hand data is analysis-only. It never enlarges the BODY_38 GMR/ROS control
     # datagram. The sender already falls back to compact body when this exceeds
     # the safe UDP size; lossless JSONL still retains every hand observation.
-    for key in ("hand_tracking", "dex3_targets"):
-        if key in packet:
-            result[key] = packet[key]
+    if "hand_tracking" in packet:
+        result["hand_tracking"] = compact_hand_analysis(packet["hand_tracking"])
+    if "dex3_targets" in packet:
+        result["dex3_targets"] = packet["dex3_targets"]
+    return quantize_udp_floats(result)
+
+
+def research_record_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Persist fused signals and measured metrics, not display-only geometry."""
+    result = compact_live_packet(packet)
+    if "hand_tracking" in packet:
+        result["hand_tracking"] = compact_hand_analysis(packet["hand_tracking"])
+    if "dex3_targets" in packet:
+        result["dex3_targets"] = packet["dex3_targets"]
+    if "reprocessing" in packet:
+        result["reprocessing"] = packet["reprocessing"]
     return quantize_udp_floats(result)
 
 
@@ -1880,11 +1950,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-source", type=parse_endpoint, action="append", default=[], help="21-landmark kanali icin SERIAL:UDP_PORT; el takibinde dort kez verin.")
     parser.add_argument("--hand-tracking", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dex3-retargeting", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--hand-max-age-ms", type=float, default=70.0)
-    parser.add_argument("--hand-max-spread-ms", type=float, default=40.0)
+    parser.add_argument("--hand-max-age-ms", type=float, default=120.0)
+    parser.add_argument("--hand-max-spread-ms", type=float, default=70.0)
     parser.add_argument("--hand-single-view-depth", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dex3-config", type=Path, default=REPOSITORY_ROOT / "config" / "g1_23dof_dex3.json")
     parser.add_argument("--dex3-official-root", type=Path, default=None, help="Opsiyonel resmi unitreerobotics/xr_teleoperate checkout yolu")
+    parser.add_argument("--dex3-official-python", type=Path, default=None, help="Resmi DexPilot icin izole Python ortami")
     parser.add_argument("--preview-source", type=parse_endpoint, action="append", default=[], help="Canli JPEG icin SERIAL:UDP_PORT; arayuz icin dort kez verin.")
     parser.add_argument("--bind", default="0.0.0.0", help="Dinlenecek PC IPv4 adresi (varsayilan tum arayuzler).")
     parser.add_argument("--extrinsics", type=Path, default=None, help="Kalibre edilmis zed_body38_distributed_extrinsics/v1 JSON dosyasi.")
@@ -1913,6 +1984,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-record", type=Path, default=None, help="Dortlu senkron ham BODY_38 karelerini JSONL olarak kaydet.")
     parser.add_argument("--calibration-max-hz", type=float, default=12.0)
     parser.add_argument("--record", action="store_true", help="Fusion JSONL kaydini baslangicta ac.")
+    parser.add_argument(
+        "--record-detail", choices=("minimal", "research", "full"),
+        default="research",
+        help="research: tekrarli ham el dizileri olmadan makale olcumleri",
+    )
     parser.add_argument("--output-dir", type=Path, default=REPOSITORY_ROOT / "recordings")
     parser.add_argument("--record-stem", default="four_body38_fusion")
     parser.add_argument("--headless", action="store_true")
@@ -2091,6 +2167,7 @@ def main() -> int:
                 "preview_sources": [{"serial": item.serial, "port": item.port} for item in preview_endpoints],
                 "hand_sources": [{"serial": item.serial, "port": item.port} for item in hand_endpoints],
                 "hand_schema": "zed_operator_hand/v1" if args.hand_tracking else None,
+                "record_detail": args.record_detail,
                 "extrinsics_path": str(resolved_extrinsics) if resolved_extrinsics else None,
                 "extrinsics": extrinsic_document,
                 "operator_workspace": {
@@ -2110,8 +2187,14 @@ def main() -> int:
     histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=32) for item in endpoints}
     hand_histories: dict[int, deque[dict[str, Any]]] = {item.serial: deque(maxlen=32) for item in endpoints}
     palm_normalizer = PalmNormalizer()
+    dex3_solver = None
     try:
-        dex3_solver = OfficialDexRetargetingSolver(args.dex3_official_root) if args.dex3_official_root else None
+        dex3_solver = (
+            OfficialDexRetargetingSolver(
+                args.dex3_official_root, args.dex3_official_python
+            )
+            if args.dex3_official_root else None
+        )
         dex3_retargeter = Dex3Retargeter(args.dex3_config, solver=dex3_solver) if args.hand_tracking and args.dex3_retargeting else None
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"HATA: Dex3 config yuklenemedi: {exc}", file=sys.stderr)
@@ -2533,6 +2616,11 @@ def main() -> int:
                             dex3_targets["q_body"] = None
                             dex3_targets["q_target"] = None
                             dex3_targets["composition_status"] = "AWAITING_SEPARATE_23DOF_BODY_RETARGET_TARGET"
+                            packet["dex3_control"] = dex3_control_contract(
+                                target_capture_ns,
+                                dex3_targets["left"],
+                                dex3_targets["right"],
+                            )
                         packet["hand_tracking"] = fused_hands
                         packet["dex3_targets"] = dex3_targets
                     calibration_state = str(
@@ -2648,7 +2736,14 @@ def main() -> int:
                             last_output_bundle = output_marker
                             if recording:
                                 try:
-                                    record_queue.put_nowait(packet)
+                                    record_item = (
+                                        packet
+                                        if args.record_detail == "full"
+                                        else compact_live_packet(packet)
+                                        if args.record_detail == "minimal"
+                                        else research_record_packet(packet)
+                                    )
+                                    record_queue.put_nowait(record_item)
                                 except queue.Full:
                                     record_dropped += 1
 
@@ -2724,6 +2819,8 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if dex3_solver is not None:
+            dex3_solver.close()
         if record_file is not None:
             record_file.close()
         if output_socket is not None:

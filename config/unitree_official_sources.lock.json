@@ -1,0 +1,21 @@
+{
+  "schema": "unitree_official_sources_lock/v1",
+  "verified_date": "2026-09-15",
+  "sources": {
+    "unitree_sim_isaaclab": {
+      "url": "https://github.com/unitreerobotics/unitree_sim_isaaclab.git",
+      "commit": "e30c25b1dffdf92ada1d6c8c1fe9a47bdde0fecc",
+      "required_symbol": "robots.unitree.G129_CFG_WITH_DEX3_BASE_FIX",
+      "asset": "assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd"
+    },
+    "xr_teleoperate": {
+      "url": "https://github.com/unitreerobotics/xr_teleoperate.git",
+      "commit": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "required_config": "assets/unitree_hand/unitree_dex3.yml"
+    }
+  },
+  "runtime_safety": {
+    "dds_enabled": false,
+    "physical_robot_output_enabled": false
+  }
+}
