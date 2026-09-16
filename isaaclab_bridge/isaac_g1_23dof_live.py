@@ -127,6 +127,15 @@ parser.add_argument(
     help="Maximum applied upper-body reference jerk in rad/s^3",
 )
 parser.add_argument(
+    "--reference-stationary-deadband-scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Isaac-only sub-degree stationary target latch; 0 disables it and "
+        "1 is the recommended four-camera profile"
+    ),
+)
+parser.add_argument(
     "--stale-return-delay",
     type=float,
     default=0.25,
@@ -299,6 +308,24 @@ POLICY_ORDER = (
 UPPER_BODY = set(POLICY_ORDER) - LOWER_BODY
 if tuple(name for name in POLICY_ORDER if name in UPPER_BODY) != UPPER_POLICY_JOINTS:
     raise RuntimeError("Live upper-body order differs from the reference-policy contract")
+
+# Conservative Isaac-display deadbands in radians. These sit after GMR/IK and
+# therefore cannot change kinematics or collision feasibility. Shoulder and
+# elbow thresholds remain below one degree; the noisier uncalibrated wrist
+# roll receives just over one degree.
+REFERENCE_STATIONARY_DEADBAND_RAD = {
+    "waist_yaw_joint": 0.006,
+    "left_shoulder_pitch_joint": 0.010,
+    "left_shoulder_roll_joint": 0.010,
+    "left_shoulder_yaw_joint": 0.010,
+    "left_elbow_joint": 0.012,
+    "left_wrist_roll_joint": 0.018,
+    "right_shoulder_pitch_joint": 0.010,
+    "right_shoulder_roll_joint": 0.010,
+    "right_shoulder_yaw_joint": 0.010,
+    "right_elbow_joint": 0.012,
+    "right_wrist_roll_joint": 0.018,
+}
 
 
 def configure_fabric_gpu_viewport() -> None:
@@ -1087,6 +1114,13 @@ def main() -> None:
         dtype=torch.long,
         device=robot.device,
     )
+    upper_joint_names = tuple(
+        name for name in POLICY_ORDER if name in UPPER_BODY
+    )
+    reference_stationary_deadband = np.asarray(
+        [REFERENCE_STATIONARY_DEADBAND_RAD[name] for name in upper_joint_names],
+        dtype=np.float64,
+    ) * max(0.0, float(args_cli.reference_stationary_deadband_scale))
     reference_position = desired.clone()
     reference_velocity = torch.zeros_like(desired)
     reference_acceleration = torch.zeros_like(desired)
@@ -1108,6 +1142,7 @@ def main() -> None:
         max_velocity=float(args_cli.reference_max_velocity),
         max_acceleration=float(args_cli.reference_max_acceleration),
         max_jerk=float(args_cli.reference_max_jerk),
+        stationary_deadband=reference_stationary_deadband,
     )
     last_reference_wall_time = time.monotonic()
     max_command_delta = 0.0
@@ -1781,6 +1816,19 @@ def main() -> None:
                     "reference_max_acceleration_rad_s2": float(args_cli.reference_max_acceleration),
                     "reference_max_jerk_rad_s3": float(
                         args_cli.reference_max_jerk
+                    ),
+                    "reference_stationary_deadband_scale": float(
+                        max(0.0, args_cli.reference_stationary_deadband_scale)
+                    ),
+                    "reference_stationary_deadband_rad": (
+                        reference_stationary_deadband.astype(float).tolist()
+                    ),
+                    "reference_stationary_held_joint_count": int(
+                        np.count_nonzero(
+                            kinematic_reference.last_stationary_held
+                        )
+                        if args_cli.imitation_mode == "kinematic_debug"
+                        else 0
                     ),
                     "reference_step_dt_s": float(reference_step_dt),
                     "reference_limits_basis": (

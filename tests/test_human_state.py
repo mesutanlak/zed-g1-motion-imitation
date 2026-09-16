@@ -176,6 +176,57 @@ def test_low_latency_reference_step_brakes_at_target() -> None:
     assert abs(positions[-1] - 2.0) < 1.0e-3
 
 
+def test_low_latency_reference_stationary_latch_rejects_jitter_without_bias() -> None:
+    motion = LowLatencyReferenceMotion(
+        np.zeros(2), response_hz=5.5,
+        max_velocity=0.85, max_acceleration=4.0, max_jerk=35.0,
+        stationary_deadband=np.asarray([0.010, 0.018]),
+    )
+    # Deliberately provide noisy feed-forward velocities too. A camera target
+    # that remains inside the stationary latch must not move Isaac.
+    for frame in range(80):
+        sign = -1.0 if frame % 2 else 1.0
+        sample = motion.update(
+            np.asarray([sign * 0.007, sign * 0.014]),
+            np.asarray([sign * 0.25, sign * 0.35]),
+            1.0 / 25.0,
+        )
+    assert np.allclose(sample.position, 0.0)
+    assert np.allclose(sample.velocity, 0.0)
+    assert np.all(motion.last_stationary_held)
+
+    # A real command crosses the threshold and latches the complete target,
+    # so the deadband cannot leave a permanent angular offset.
+    for _ in range(100):
+        sample = motion.update(
+            np.asarray([0.20, -0.25]), np.zeros(2), 1.0 / 25.0
+        )
+    assert np.allclose(sample.position, [0.20, -0.25], atol=1.0e-3)
+    assert np.allclose(motion.target_anchor, [0.20, -0.25])
+
+
+def test_low_latency_reference_stationary_latch_validates_shape() -> None:
+    with np.testing.assert_raises(ValueError):
+        LowLatencyReferenceMotion(
+            np.zeros(2), stationary_deadband=np.zeros(3)
+        )
+
+
+def test_low_latency_jerk_limited_static_step_does_not_limit_cycle() -> None:
+    motion = LowLatencyReferenceMotion(
+        np.zeros(1), response_hz=5.5,
+        max_velocity=0.85, max_acceleration=4.0, max_jerk=35.0,
+    )
+    samples = [
+        motion.update(np.asarray([0.25]), np.zeros(1), 1.0 / 25.0)
+        for _ in range(100)
+    ]
+    tail = np.asarray([item.position[0] for item in samples[-20:]])
+    assert np.max(np.abs(tail - 0.25)) < 1.0e-9
+    assert abs(samples[-1].velocity[0]) < 1.0e-9
+    assert abs(samples[-1].acceleration[0]) < 1.0e-9
+
+
 def test_unitree_live_envelope_caps_velocity_acceleration_and_jerk() -> None:
     motion = LowLatencyReferenceMotion(
         np.zeros(3), response_hz=5.0,

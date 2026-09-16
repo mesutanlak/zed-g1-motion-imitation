@@ -9,3 +9,4 @@
 *.npz binary
 *.onnx binary
 *.docx binary
+*.step binary

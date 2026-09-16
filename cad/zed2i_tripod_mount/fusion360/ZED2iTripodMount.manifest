@@ -1,0 +1,10 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "script",
+  "author": "OpenAI Codex",
+  "description": {
+    "": "Creates a parametric ZED 2i to 1/4-20 tripod adapter plate."
+  },
+  "version": "1.0.0",
+  "supportedOS": "windows|mac"
+}

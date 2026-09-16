@@ -39,6 +39,8 @@ param(
     [double]$ReferenceMaxAcceleration = 4.0,
     [ValidateRange(1.0, 500.0)]
     [double]$ReferenceMaxJerk = 35.0,
+    [ValidateRange(0.0, 3.0)]
+    [double]$ReferenceStationaryDeadbandScale = 1.0,
     [ValidateRange(0.1, 5.0)]
     [double]$UpperStiffnessScale = 2.0,
     [ValidateRange(0.1, 5.0)]
@@ -199,7 +201,7 @@ Write-Host "  Alt beden: $StanceMode"
 Write-Host "  Canli takip: ${InputFps} Hz, adaptive cutoff=${UpperMinCutoffHz}-${UpperCutoffHz} Hz, beta=$UpperVelocityBeta, stationary deadband=$StationaryDeadbandScale, blend=$MimicBlend"
 Write-Host "  Insan boyu / GMR olcegi: ${HumanHeightM} m"
 Write-Host "  Ust govde PD olcegi: Kp=$UpperStiffnessScale Kd=$UpperDampingScale"
-Write-Host "  Isaac referans profili: Unitree G1 fiziksel zarf | mode=$ReferenceTrackingMode response=${ReferenceResponseHz}Hz vel<=${ReferenceMaxVelocity}rad/s acc<=${ReferenceMaxAcceleration}rad/s2 jerk<=${ReferenceMaxJerk}rad/s3"
+Write-Host "  Isaac referans profili: Unitree G1 fiziksel zarf | mode=$ReferenceTrackingMode response=${ReferenceResponseHz}Hz vel<=${ReferenceMaxVelocity}rad/s acc<=${ReferenceMaxAcceleration}rad/s2 jerk<=${ReferenceMaxJerk}rad/s3 stationary=$ReferenceStationaryDeadbandScale"
 Write-Host "  Isaac zamanlama: 200 Hz fizik, render her $RenderInterval adim (~$([math]::Round(200.0 / $RenderInterval)) Hz GUI)"
 if (Test-Path -LiteralPath $nativeReferencePolicy) {
     Write-Host "  Kontrol: Dual ZED veya Isaac penceresinde P = Normal IK <-> Policy Powered"
@@ -342,6 +344,7 @@ try {
         "--reference-max-velocity", "$ReferenceMaxVelocity",
         "--reference-max-acceleration", "$ReferenceMaxAcceleration",
         "--reference-max-jerk", "$ReferenceMaxJerk",
+        "--reference-stationary-deadband-scale", "$ReferenceStationaryDeadbandScale",
         "--render-interval", "$RenderInterval",
         "--kit_args=$kitSettings"
     )

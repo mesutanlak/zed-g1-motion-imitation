@@ -1,0 +1,12 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "script",
+  "id": "cfd2d0f6-b921-4fc1-8af7-b144d277c507",
+  "author": "OpenAI Codex",
+  "description": {
+    "": "Creates a printable ZED 2i corner-stand tilt head and cable strain relief."
+  },
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac"
+}

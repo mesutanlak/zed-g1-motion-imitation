@@ -105,6 +105,7 @@ class LowLatencyReferenceMotion:
         max_velocity: float = 5.0,
         max_acceleration: float = 30.0,
         max_jerk: float | None = None,
+        stationary_deadband: float | np.ndarray = 0.0,
     ) -> None:
         self.position = np.asarray(initial_position, dtype=np.float64).copy()
         self.velocity = np.zeros_like(self.position)
@@ -117,6 +118,21 @@ class LowLatencyReferenceMotion:
             if max_jerk is None
             else float(max(0.1, max_jerk))
         )
+        deadband = np.asarray(stationary_deadband, dtype=np.float64)
+        try:
+            deadband = np.broadcast_to(deadband, self.position.shape)
+        except ValueError as exc:
+            raise ValueError(
+                "Stationary deadband must be scalar or match reference shape"
+            ) from exc
+        if not np.isfinite(deadband).all() or np.any(deadband < 0.0):
+            raise ValueError("Stationary deadband must be finite and non-negative")
+        self.stationary_deadband = deadband.copy()
+        # This latch is intentionally downstream of GMR/IK. It rejects only
+        # sub-degree command chatter in Isaac and never changes IK geometry,
+        # joint limits, collision handling or an accepted target pose.
+        self.target_anchor = self.position.copy()
+        self.last_stationary_held = np.zeros_like(self.position, dtype=bool)
 
     def reset(self, position: np.ndarray) -> None:
         value = np.asarray(position, dtype=np.float64)
@@ -125,6 +141,8 @@ class LowLatencyReferenceMotion:
         self.position = value.copy()
         self.velocity.fill(0.0)
         self.acceleration.fill(0.0)
+        self.target_anchor = value.copy()
+        self.last_stationary_held.fill(False)
 
     def update(
         self,
@@ -145,6 +163,21 @@ class LowLatencyReferenceMotion:
         ):
             raise ValueError("Reference target and velocity must be finite and shape-stable")
         dt = float(np.clip(dt, 1.0e-4, 0.05))
+        if np.any(self.stationary_deadband > 0.0):
+            target_delta = target_value - self.target_anchor
+            active = np.abs(target_delta) > self.stationary_deadband
+            # When real motion crosses the threshold, latch the complete
+            # target. Unlike subtractive deadbands this leaves no permanent
+            # angular bias after an intentional movement.
+            self.target_anchor[active] = target_value[active]
+            target_value = self.target_anchor.copy()
+            target_velocity_value = np.where(
+                active, target_velocity_value, 0.0
+            )
+            self.last_stationary_held = ~active
+        else:
+            self.target_anchor = target_value.copy()
+            self.last_stationary_held.fill(False)
         error = target_value - self.position
         tau = 1.0 / (2.0 * np.pi * self.response_hz)
         requested_velocity = target_velocity_value + error / tau
@@ -230,6 +263,16 @@ class LowLatencyReferenceMotion:
         self.position = self.position + step
         if np.any(crosses_target):
             self.position[crosses_target] = target_value[crosses_target]
+            # A stationary target has no momentum to preserve. Keeping the
+            # pre-crossing velocity here made the next update leave the target
+            # again, producing a visible limit-cycle (small Isaac shake) even
+            # after GMR/IK had stopped. Moving feed-forward trajectories retain
+            # their velocity and therefore keep the original low-latency path.
+            stationary_crossing = crosses_target & (
+                np.abs(target_velocity_value) <= 1.0e-9
+            )
+            self.velocity[stationary_crossing] = 0.0
+            self.acceleration[stationary_crossing] = 0.0
         if lower is not None and upper is not None:
             clipped = np.clip(self.position, lower, upper)
             hit = np.abs(clipped - self.position) > 1.0e-12
