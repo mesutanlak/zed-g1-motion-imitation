@@ -1,0 +1,25 @@
+{
+  "pcb_mm": [
+    21.6,
+    17.2,
+    2.25
+  ],
+  "body_bounds_mm": [
+    54.0,
+    28.5,
+    13.0
+  ],
+  "cover_bounds_mm": [
+    34.79999923706055,
+    31.399999618530273,
+    18.000000000000007
+  ],
+  "body_volume_cm3": 5.923609248546985,
+  "cover_volume_cm3": 4.35225440987471,
+  "checks": {
+    "components_body_overlap_mm3": 0.0,
+    "header_body_overlap_mm3": 0.0,
+    "cover_body_overlap_mm3": 0.0,
+    "pcb_body_intentional_snap_overlap_mm3": 2.2185068740845963
+  }
+}

@@ -28,6 +28,20 @@ izleyin. ZED360/native ağ Fusion tanı adı ayrı olarak
 [zed_four_camera_test/README_TR.md](zed_four_camera_test/README_TR.md)
 içindedir.
 
+İki kola takılacak BNO055, MPU6050 ve Xsens sensörleriyle dirsek açısı ölçümü,
+Raspberry Pi bağlantısı, zaman eşleştirme ve dört kamera BODY_38 akışına aşamalı
+entegrasyon için [IMU kol füzyon yol haritasını](docs/IMU_KOL_FUSION_YOL_HARITASI_TR.md)
+izleyin. Raspberry Pi 4B'de tek kol için iki Adafruit BNO055'i ilk kez bağlayıp
+okumak için [uygulamalı başlangıç rehberini](imu_capture/README_TR.md) kullanın.
+İki HW-290 kartının altı yüz kalibrasyonu, dirsek açısı ve UDP yayını
+[HW-290 kullanım rehberinde](docs/HW290_ELBOW_V3_KULLANIM_TR.md); BODY_38 ile
+güvenli birleştirme adımları ise [füzyon rehberinde](docs/HW290_ZED_FUSION_V4_TR.md)
+yer alır. Baskıya hazır vidasız HW-290 yuvası
+[artifacts/hw290_snapfit_v1](artifacts/hw290_snapfit_v1), Raspberry Pi ve
+breadboard göğüs taşıyıcıları da
+[artifacts/pi4_breadboard_chest_snap_v1](artifacts/pi4_breadboard_chest_snap_v1)
+altındadır.
+
 > Fiziksel robot güvenliği: Bu depo doğrudan gerçek G1 motor kontrolü için
 > hazır değildir. Varsayılan akış simülasyon ve üst gövde takibidir. Sim2real
 > öncesinde tork/hız limitleri, watchdog, self-collision, düşme engelleme,

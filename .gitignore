@@ -11,6 +11,10 @@ __pycache__/
 .codex_analysis/
 .codex_smoke/
 .codex_video_frames/
+.tmp_video_frames/
+
+# Local CAD rendering environments are reproducible from requirements.txt.
+artifacts/**/_deps/
 
 # Secrets and machine-local configuration
 .env

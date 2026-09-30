@@ -1,0 +1,49 @@
+{
+  "meshes": [
+    {
+      "file": "01_Raspberry_Pi4_acik_gecmeli_gogus_tabani_1_adet.stl",
+      "bounds_mm": [
+        117.0,
+        64.0,
+        11.95
+      ],
+      "volume_cm3": 14.829,
+      "triangles": 3198,
+      "watertight": true,
+      "single_shell": true
+    },
+    {
+      "file": "02_Breadboard_160x52_5_gecmeli_gogus_tabani_1_adet.stl",
+      "bounds_mm": [
+        193.0,
+        57.6,
+        13.35
+      ],
+      "volume_cm3": 29.483,
+      "triangles": 930,
+      "watertight": true,
+      "single_shell": true
+    }
+  ],
+  "assembly_checks": {
+    "pi_reference_collision_mm3": 0.0,
+    "breadboard_reference_collision_mm3": 0.0,
+    "pi_hole_grid_mm": [
+      58.0,
+      49.0
+    ],
+    "pi_board_mm": [
+      85.0,
+      56.0,
+      1.6
+    ],
+    "breadboard_mm": [
+      160.0,
+      52.5,
+      9.0
+    ],
+    "pi_snap_vertical_clearance_mm": 0.25,
+    "breadboard_side_clearance_each_mm": 0.25,
+    "breadboard_end_clearance_each_mm": 0.3
+  }
+}

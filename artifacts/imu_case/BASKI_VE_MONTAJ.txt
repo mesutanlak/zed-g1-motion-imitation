@@ -1,0 +1,22 @@
+IMU KASA - MENTESELI KAPAK
+
+Dosyalar
+- IMU_case_menteseli.stl: Orijinal kasaya menteşe ve iki kilit karşılığı eklenmiş baskı parçası.
+- IMU_kapak_baski_konumu.stl: Düz dış yüzeyi tabla üzerinde basılacak kapak.
+- IMU_kapak_montaj_konumu.stl: Yalnızca CAD içinde kapalı konumda kontrol/önizleme için.
+- IMU_mentese_pimi_baski.stl: Düz alt yüzeyli, başlıklı, 1,85 mm gövdeli basılabilir menteşe pimi.
+- IMU_pim_uc_kapagi_baski.stl: Pimin çıkmasını önleyen, uçtan bastırılarak takılan küçük kapak.
+- IMU_menteseli_onizleme.png: Kapalı ve açık konum görseli.
+
+Ölçüler ve montaj
+- Kapağın yerleşim dudağı, 35 x 21,5 mm iç açıklığa her yanda yaklaşık 0,35 mm boşlukla girer.
+- Menteşe deliği nominal 2,1 mm'dir; tasarlanan basılabilir pimin gövdesi 1,85 mm'dir.
+- Pimi başı solda kalacak şekilde menteşeden geçirin. Sağda kalan uca küçük kilit kapağını bastırarak takın.
+- Baskı sonrası delikler dar çıkarsa 2 mm matkapla elde dikkatlice temizleyin.
+- Ön taraftaki iki esnek tırnağı kasadaki karşılıklarına geçirerek kapatın. Açmak için tırnakları hafifçe dışa çekin.
+
+Baskı önerisi
+- PETG, 0,2 mm katman, en az 3 duvar.
+- Kasa mevcut tabanı alta gelecek şekilde; kapak 'baski_konumu' dosyasındaki yönüyle basılır.
+- İnce pimi düz yüzeyi tabla üzerinde, brim ile ve dolu (%100) basın. Uç kapağını kapalı düz yüzeyi tabla üzerinde basın.
+- İlk baskıda tırnakların esnekliğini ve kapağın oturmasını elle kontrol edin. Yazıcı ayarlarına göre küçük tolerans düzeltmesi gerekebilir.
