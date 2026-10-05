@@ -12,6 +12,16 @@
       "url": "https://github.com/unitreerobotics/xr_teleoperate.git",
       "commit": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
       "required_config": "assets/unitree_hand/unitree_dex3.yml"
+    },
+    "unitree_ros": {
+      "url": "https://github.com/unitreerobotics/unitree_ros.git",
+      "commit": "ac7714828e1a4cc2a8ddd5c78a1305475b913a73",
+      "required_asset": "robots/g1_description/g1_29dof_with_hand_rev_1_0.urdf"
+    },
+    "unitree_sdk2_python": {
+      "url": "https://github.com/unitreerobotics/unitree_sdk2_python.git",
+      "commit": "65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5",
+      "required_example": "example/g1/high_level/g1_arm7_sdk_dds_example.py"
     }
   },
   "runtime_safety": {

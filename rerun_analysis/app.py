@@ -45,6 +45,15 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--input", type=Path, help="JSONL kaydını oynat")
     source.add_argument("--demo", action="store_true", help="Sentetik doğrulama")
+    parser.add_argument(
+        "--imitation-input",
+        type=Path,
+        default=None,
+        help=(
+            "JSONL oynatmada aynı oturumun imitation_comparison.jsonl dosyasını "
+            "GMR/Isaac katmanlarıyla birleştir"
+        ),
+    )
     parser.add_argument("--listen-host", default="0.0.0.0")
     parser.add_argument("--listen-port", type=int, default=15052)
     parser.add_argument("--gmr-listen-host", default="0.0.0.0")
@@ -87,6 +96,34 @@ def source_packets(path: Path) -> Iterable[dict[str, Any]]:
                 payload = payload["source_packet"]
             if "keypoint_names" in payload:
                 yield payload
+
+
+def load_imitation_packets(
+    path: Path,
+) -> dict[int, dict[str, dict[str, Any]]]:
+    """Index recorded GMR/Isaac telemetry for synchronized offline replay."""
+
+    indexed: dict[int, dict[str, dict[str, Any]]] = {}
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            packet = payload.get("telemetry_packet", payload)
+            if not isinstance(packet, dict):
+                continue
+            schema = str(packet.get("schema") or "")
+            if schema not in {
+                "zed_gmr_g1_23dof_live/v1",
+                "zed_gmr_g1_23dof_isaac_telemetry/v1",
+            }:
+                continue
+            try:
+                sequence = int(packet["sequence"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            indexed.setdefault(sequence, {})[schema] = packet
+    return indexed
 
 
 def demo_packets() -> Iterable[dict[str, Any]]:
@@ -223,6 +260,11 @@ class RerunSkeletonApp:
         self._logged_joint_names: set[str] = set()
         self.latest_gmr: dict[str, Any] = {}
         self._last_gmr_log_s: dict[str, float] = {}
+        self.offline_imitation = (
+            load_imitation_packets(args.imitation_input)
+            if args.imitation_input is not None
+            else {}
+        )
         self.stop_event = threading.Event()
         self.status_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=3)
         source = (
@@ -260,10 +302,47 @@ class RerunSkeletonApp:
         self.worker = threading.Thread(target=self._run_source, daemon=True)
         self.gmr_worker = threading.Thread(target=self._run_gmr_telemetry, daemon=True)
 
-    def _log_gmr_packet(self, packet: dict[str, Any]) -> None:
-        self.latest_gmr = packet
+    def _log_gmr_packet(
+        self,
+        packet: dict[str, Any],
+        *,
+        log_geometry: bool = True,
+        write_imitation: bool = True,
+    ) -> None:
+        """Log one retarget frame without duplicating echoed Isaac geometry."""
+
         frame = int(packet.get("sequence", 0) or 0)
         rr.set_time("frame", sequence=frame)
+        timestamp_ns = int(
+            packet.get("source_timestamp_ns")
+            or packet.get("timestamp_ns")
+            or time.time_ns()
+        )
+        rr.set_time("source_time", timestamp=timestamp_ns / 1e9)
+
+        # Isaac telemetry echoes the complete GMR packet so measured metrics
+        # remain self-contained.  Redrawing that copy doubled the geometry
+        # traffic, produced duplicate CSV/JSONL rows and could make the last
+        # (G1 SAFE) layer visually lag under load.  Keep only Isaac/system
+        # measurements from the echoed packet.
+        if not log_geometry:
+            latency = latency_breakdown_ms(packet.get("latency_trace_ns") or {})
+            for name, value in {
+                **latency,
+                **(packet.get("isaac_metrics") or {}),
+                **(packet.get("system_metrics") or {}),
+            }.items():
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    rr.log(
+                        f"/world/metrics/system/{name}",
+                        rr.Scalars(float(value)),
+                    )
+            writer = getattr(self, "writer", None)
+            if write_imitation and writer is not None:
+                writer.write_imitation(packet)
+            return
+
+        self.latest_gmr = packet
         skeleton = packet.get("g1_skeleton") or {}
         edges = skeleton.get("edges") or []
         for variant, color, lateral_offset in (
@@ -359,6 +438,71 @@ class RerunSkeletonApp:
                         labels=[label], show_labels=True,
                     ),
                 )
+        # BODY FK has only a wrist endpoint. Draw the compact 3-finger Dex3
+        # target beside G1 SAFE so a fist remains directly observable after
+        # MediaPipe -> retarget -> safety filtering, rather than only as seven
+        # time-series values.
+        dex3_control = packet.get("dex3_control") or {}
+        safe_positions = skeleton.get("safe_positions_m") or {}
+        for side, side_sign, color in (
+            ("left", 1.0, [80, 230, 120]),
+            ("right", -1.0, [80, 230, 120]),
+        ):
+            q = np.asarray(dex3_control.get(f"q_{side}") or [], dtype=float)
+            endpoint = safe_positions.get(f"{side}_hand_endpoint")
+            root = f"/comparison/g1_safe/dex3_{side}"
+            if (
+                q.shape != (7,)
+                or not np.isfinite(q).all()
+                or not isinstance(endpoint, (list, tuple))
+                or len(endpoint) != 3
+            ):
+                rr.log(root, rr.Clear(recursive=True))
+                continue
+            origin = np.asarray(endpoint, dtype=float)
+            origin[1] += 0.80
+            curls = {
+                "thumb": float(np.clip(np.mean(np.abs(q[1:3]) / [1.0, 1.7]), 0.0, 1.0)),
+                "middle": float(np.clip(np.mean(np.abs(q[3:5]) / [1.5, 1.75]), 0.0, 1.0)),
+                "index": float(np.clip(np.mean(np.abs(q[5:7]) / [1.5, 1.75]), 0.0, 1.0)),
+            }
+            bases = {
+                "thumb": origin + [0.008, -side_sign * 0.030, -0.006],
+                "middle": origin + [0.018, -side_sign * 0.002, 0.0],
+                "index": origin + [0.014, side_sign * 0.027, 0.0],
+            }
+            points = [origin]
+            strips = []
+            for finger in ("thumb", "middle", "index"):
+                base = bases[finger]
+                curl = curls[finger]
+                first_angle = 0.75 * curl
+                second_angle = first_angle + 1.15 * curl
+                lateral = (
+                    -side_sign * 0.45 if finger == "thumb"
+                    else side_sign * (0.08 if finger == "index" else 0.0)
+                )
+                direction1 = np.asarray(
+                    [np.cos(first_angle), lateral, -np.sin(first_angle)], dtype=float
+                )
+                direction1 /= np.linalg.norm(direction1)
+                joint = base + direction1 * (0.032 if finger == "thumb" else 0.040)
+                direction2 = np.asarray(
+                    [np.cos(second_angle), lateral, -np.sin(second_angle)], dtype=float
+                )
+                direction2 /= np.linalg.norm(direction2)
+                tip = joint + direction2 * (0.028 if finger == "thumb" else 0.035)
+                strips.extend([[origin, base], [base, joint], [joint, tip]])
+                points.extend([base, joint, tip])
+            rr.log(f"{root}/bones", rr.LineStrips3D(strips, radii=0.006, colors=color))
+            rr.log(f"{root}/joints", rr.Points3D(points, radii=0.009, colors=color))
+            rr.log(
+                f"{root}/status",
+                rr.AnyValues(
+                    watchdog=str(dex3_control.get(f"watchdog_{side}", "UNKNOWN")),
+                    confidence=float(dex3_control.get(f"confidence_{side}", 0.0)),
+                ),
+            )
         joint_names = packet.get("joint_names") or []
         for variant, key in (
             ("raw_q", "raw_joint_position_rad"),
@@ -428,7 +572,7 @@ class RerunSkeletonApp:
             if isinstance(value, (int, float)) and np.isfinite(value):
                 rr.log(f"/world/metrics/gmr/{name}", rr.Scalars(float(value)))
         writer = getattr(self, "writer", None)
-        if writer is not None:
+        if write_imitation and writer is not None:
             writer.write_imitation(packet)
 
     def _run_gmr_telemetry(self) -> None:
@@ -467,7 +611,22 @@ class RerunSkeletonApp:
                     ):
                         continue
                     self._last_gmr_log_s[schema] = now
-                    self._log_gmr_packet(packet)
+                    if schema == "zed_gmr_g1_23dof_live/v1":
+                        # Lowest-latency raw/safe geometry: render once.
+                        self._log_gmr_packet(
+                            packet,
+                            log_geometry=True,
+                            write_imitation=False,
+                        )
+                    else:
+                        # Isaac echoes the GMR payload with measured tracking
+                        # metrics.  Persist that synchronized, richer row but
+                        # do not redraw the duplicate geometry.
+                        self._log_gmr_packet(
+                            packet,
+                            log_geometry=False,
+                            write_imitation=True,
+                        )
                     if drain_deadline is not None:
                         drain_deadline = min(
                             time.monotonic() + 0.20,
@@ -479,6 +638,13 @@ class RerunSkeletonApp:
     def _log_hand_packet(self, source: dict[str, Any]) -> None:
         """Log fused 21-landmark hands and safe Dex3 analysis targets."""
         fused = source.get("hand_tracking") or {}
+        # Hand inference is intentionally slower than BODY_38. A body packet
+        # without a new hand result means "no update", not "both hands lost".
+        # Keep the previous geometry until a new hand packet explicitly marks
+        # that side rejected.
+        if not fused and not source.get("dex3_targets"):
+            return
+        raw_single_camera = fused.get("schema") == "zed_operator_hand/v1"
         hands_by_side = {
             str(hand.get("side")): hand
             for hand in fused.get("hands", [])
@@ -487,20 +653,40 @@ class RerunSkeletonApp:
         for side, color in (("left", [80, 220, 120]), ("right", [255, 170, 50])):
             root = f"/world/skeleton/hands/{side}"
             hand = hands_by_side.get(side)
-            points_value = hand.get("landmarks_world_m") if hand else None
+            points_value = None
+            if hand:
+                points_value = (
+                    hand.get("relative_landmarks_m")
+                    if raw_single_camera
+                    else hand.get("landmarks_world_m")
+                )
             try:
                 points = np.asarray(points_value, dtype=np.float64)
             except (TypeError, ValueError):
                 points = np.empty((0, 3), dtype=np.float64)
-            valid = bool(
+            valid_flag = bool(
                 hand
-                and hand.get("valid")
+                and (
+                    hand.get("rejection_reason") is None
+                    if raw_single_camera
+                    else hand.get("valid")
+                )
+            )
+            valid = bool(
+                valid_flag
                 and points.shape == (21, 3)
                 and np.isfinite(points).all()
             )
             if not valid:
                 rr.log(root, rr.Clear(recursive=True))
                 continue
+            if raw_single_camera:
+                # MediaPipe world landmarks describe the hand in a local metric
+                # frame. Center them on the wrist and place both hands beside the
+                # BODY_38 skeleton; this is a shape/debug view, not world fusion.
+                points = points - points[0]
+                points = points[:, [2, 0, 1]] * np.asarray([-1.0, -1.0, -1.0])
+                points += np.asarray([0.0, 0.45 if side == "left" else -0.45, 1.35])
             rr.log(
                 f"{root}/landmarks",
                 rr.Points3D(points, radii=0.008, colors=color),
@@ -513,7 +699,7 @@ class RerunSkeletonApp:
                     colors=color,
                 ),
             )
-            normalization = hand.get("normalization") or {}
+            normalization = {} if raw_single_camera else (hand.get("normalization") or {})
             try:
                 origin = np.asarray(normalization["wrist_world_m"], dtype=np.float64)
                 rotation = np.asarray(
@@ -559,6 +745,14 @@ class RerunSkeletonApp:
                 f"{root}/status",
                 rr.AnyValues(
                     valid=True,
+                    source_schema=str(fused.get("schema", "")),
+                    coordinate_note=(
+                        "mediapipe_local_shape_debug"
+                        if raw_single_camera
+                        else "zed_world_fused"
+                    ),
+                    depth_valid_count=int(hand.get("depth_valid_count", 0) or 0),
+                    inference_ms=float(hand.get("inference_ms", 0.0) or 0.0),
                     capture_spread_ms=float(hand.get("capture_spread_ms", 0.0)),
                     mean_camera_count=(
                         float(np.mean(camera_counts)) if camera_counts else 0.0
@@ -978,6 +1172,28 @@ class RerunSkeletonApp:
                 processed, states = self.conditioner.process(source, config)
                 derived = self.analyzer.analyze(processed)
                 self._log_packet(source, processed, derived, states, config)
+                frame = int(
+                    source.get("frame_index", source.get("sequence", 0)) or 0
+                )
+                recorded_telemetry = self.offline_imitation.get(frame, {})
+                gmr_packet = recorded_telemetry.get(
+                    "zed_gmr_g1_23dof_live/v1"
+                )
+                if gmr_packet is not None:
+                    self._log_gmr_packet(
+                        gmr_packet,
+                        log_geometry=True,
+                        write_imitation=False,
+                    )
+                isaac_packet = recorded_telemetry.get(
+                    "zed_gmr_g1_23dof_isaac_telemetry/v1"
+                )
+                if isaac_packet is not None:
+                    self._log_gmr_packet(
+                        isaac_packet,
+                        log_geometry=False,
+                        write_imitation=True,
+                    )
                 if config.capture_enabled:
                     self.writer.write(source, processed, derived, config, states)
                 latest = {

@@ -33,19 +33,59 @@ class NormalizedTaskSolver:
 
     def __call__(self, normalized: np.ndarray, side: str, previous: np.ndarray) -> tuple[np.ndarray, dict]:
         p = np.asarray(normalized, dtype=float)
-        def flex(mcp: int, pip: int, tip: int) -> float:
-            direct = np.linalg.norm(p[tip] - p[mcp])
-            chain = np.linalg.norm(p[pip] - p[mcp]) + np.linalg.norm(p[tip] - p[pip])
-            return float(np.clip(1.0 - direct / max(chain, 1e-6), 0.0, 1.0))
-        thumb = flex(2, 3, 4)
-        index = flex(5, 6, 8)
-        middle = flex(9, 10, 12)
-        pinch = float(np.clip(1.0 - np.linalg.norm(p[4] - p[8]) / 1.15, 0.0, 1.0))
-        base = np.array([pinch * 0.8, thumb, thumb, middle, middle, index, index], dtype=float)
-        sign = np.array([1, 1, 1, -1, -1, -1, -1], dtype=float) if side == "left" else np.array([1, 1, 1, 1, 1, 1, 1], dtype=float)
-        raw = base * sign
+        if p.shape != (21, 3) or not np.isfinite(p).all():
+            raise ValueError("expected finite 21x3 normalized landmarks")
+
+        def bend(first: int, centre: int, last: int) -> float:
+            incoming = p[first] - p[centre]
+            outgoing = p[last] - p[centre]
+            denominator = max(float(np.linalg.norm(incoming) * np.linalg.norm(outgoing)), 1.0e-8)
+            straight_angle = float(np.arccos(np.clip(np.dot(incoming, outgoing) / denominator, -1.0, 1.0)))
+            return float(np.clip(np.pi - straight_angle, 0.0, np.pi))
+
+        def finger_curl(wrist: int, mcp: int, pip: int, dip: int, tip: int) -> float:
+            # A closed fist bends at MCP, PIP and DIP.  Endpoint shortening
+            # alone barely changes for a clean arc and produced near-zero Dex3
+            # targets, so use the actual five-finger joint geometry.
+            total = 0.45 * bend(wrist, mcp, pip) + bend(mcp, pip, dip) + bend(pip, dip, tip)
+            return float(np.clip(total / 2.75, 0.0, 1.0))
+
+        thumb = float(np.clip((bend(1, 2, 3) + bend(2, 3, 4)) / 2.2, 0.0, 1.0))
+        index = finger_curl(0, 5, 6, 7, 8)
+        middle = finger_curl(0, 9, 10, 11, 12)
+        ring = finger_curl(0, 13, 14, 15, 16)
+        pinky = finger_curl(0, 17, 18, 19, 20)
+        grouped = float(np.clip(np.median([middle, ring, pinky]), 0.0, 1.0))
+        pinch = float(np.clip(1.0 - np.linalg.norm(p[4] - p[8]) / 1.10, 0.0, 1.0))
+        opposition = float(np.clip(0.65 * pinch + 0.35 * thumb, 0.0, 1.0))
+        if side == "left":
+            raw = np.array([
+                0.80 * opposition, 0.95 * thumb, 1.60 * thumb,
+                -1.42 * grouped, -1.68 * grouped,
+                -1.42 * index, -1.68 * index,
+            ])
+        else:
+            raw = np.array([
+                0.80 * opposition, 0.72 * thumb, -1.60 * thumb,
+                1.42 * grouped, 1.68 * grouped,
+                1.42 * index, 1.68 * index,
+            ])
         residual = float(np.linalg.norm(hand_task_vector(p)))
-        return raw, {"backend": "normalized_21_task_fallback", "residual": residual, "iterations": 1}
+        fist_score = float(np.mean([index, middle, ring, pinky]))
+        pose = "FIST" if fist_score >= 0.62 else "OPEN" if fist_score <= 0.22 else "PARTIAL"
+        return raw, {
+            "backend": "normalized_21_angle_task_v2",
+            "residual": residual,
+            "iterations": 1,
+            "pose": pose,
+            "fist_score": fist_score,
+            "pinch_score": pinch,
+            "human_finger_curl": {
+                "thumb": thumb, "index": index, "middle": middle,
+                "ring": ring, "pinky": pinky,
+            },
+            "dex3_grouped_curl": grouped,
+        }
 
 
 class OfficialDexRetargetingSolver:
@@ -161,11 +201,17 @@ class OfficialDexRetargetingSolver:
 
 @dataclass(frozen=True)
 class SafetyConfig:
-    maximum_velocity_rad_s: float = 4.0
-    maximum_acceleration_rad_s2: float = 20.0
-    hold_s: float = 0.18
-    fade_s: float = 0.55
+    maximum_velocity_rad_s: float = 2.5
+    maximum_acceleration_rad_s2: float = 10.0
+    hold_s: float = 0.65
+    fist_hold_s: float = 1.5
+    fade_s: float = 1.0
     minimum_confidence: float = 0.30
+    measurement_deadband_rad: float = 0.07
+    measurement_min_alpha: float = 0.06
+    measurement_max_alpha: float = 0.82
+    measurement_full_scale_rad: float = 0.55
+    settle_epsilon_rad: float = 0.002
 
 
 class Dex3SafetyFilter:
@@ -175,29 +221,70 @@ class Dex3SafetyFilter:
         self.neutral = np.asarray(neutral, dtype=float)
         self.config = config
         self.position = self.neutral.copy()
+        self.last_desired = self.neutral.copy()
         self.velocity = np.zeros(7)
         self.last_valid_ns: int | None = None
         self.last_update_ns: int | None = None
+        self.last_pose = "UNKNOWN"
 
     def reset(self) -> None:
         self.position = self.neutral.copy()
+        self.last_desired = self.neutral.copy()
         self.velocity.fill(0.0)
         self.last_valid_ns = self.last_update_ns = None
+        self.last_pose = "UNKNOWN"
 
-    def update(self, raw: Sequence[float] | None, timestamp_ns: int, confidence: float) -> tuple[np.ndarray, dict]:
+    def update(
+        self,
+        raw: Sequence[float] | None,
+        timestamp_ns: int,
+        confidence: float,
+        pose: str | None = None,
+    ) -> tuple[np.ndarray, dict]:
         dt = 1 / 30 if self.last_update_ns is None else float(np.clip((timestamp_ns - self.last_update_ns) / 1e9, 1e-3, 0.2))
         valid = raw is not None and confidence >= self.config.minimum_confidence
         if valid:
             raw_array = np.asarray(raw, dtype=float)
-            desired = np.clip(raw_array, self.minimum, self.maximum)
-            joint_limit_clipped_count = int(np.count_nonzero(np.abs(raw_array - desired) > 1e-8))
+            clipped = np.clip(raw_array, self.minimum, self.maximum)
+            measurement_delta = clipped - self.last_desired
+            deadband = max(0.0, self.config.measurement_deadband_rad)
+            span = max(
+                self.config.measurement_full_scale_rad - deadband,
+                1.0e-6,
+            )
+            motion = np.clip((np.abs(measurement_delta) - deadband) / span, 0.0, 1.0)
+            alpha_reference = (
+                self.config.measurement_min_alpha
+                + (self.config.measurement_max_alpha - self.config.measurement_min_alpha)
+                * motion
+            )
+            measurement_dt = (
+                0.1
+                if self.last_valid_ns is None
+                else float(np.clip((timestamp_ns - self.last_valid_ns) / 1e9, 0.02, 0.30))
+            )
+            alpha = 1.0 - np.power(1.0 - alpha_reference, measurement_dt / 0.1)
+            alpha = np.where(np.abs(measurement_delta) <= deadband, 0.0, alpha)
+            desired = self.last_desired + alpha * measurement_delta
+            self.last_desired = desired.copy()
+            joint_limit_clipped_count = int(np.count_nonzero(np.abs(raw_array - clipped) > 1e-8))
             self.last_valid_ns = timestamp_ns
+            self.last_pose = str(pose or "UNKNOWN")
             state = "TRACKING"
         else:
             joint_limit_clipped_count = 0
             lost_s = float("inf") if self.last_valid_ns is None else max(0.0, (timestamp_ns - self.last_valid_ns) / 1e9)
-            if lost_s <= self.config.hold_s:
-                desired = self.position.copy()
+            hold_s = (
+                self.config.fist_hold_s
+                if self.last_pose == "FIST"
+                else self.config.hold_s
+            )
+            if lost_s <= hold_s:
+                # Continue the bounded trajectory toward the last measured
+                # pose. Holding the current position here used to brake the
+                # fingers on every 30 Hz body frame between 10 Hz hand frames,
+                # so a fist could never close.
+                desired = self.last_desired.copy()
                 state = "HOLD"
             else:
                 alpha = np.clip(dt / max(self.config.fade_s, 1e-3), 0.0, 1.0)
@@ -210,6 +297,18 @@ class Dex3SafetyFilter:
         velocity = np.clip(acceleration_limited_velocity, -self.config.maximum_velocity_rad_s, self.config.maximum_velocity_rad_s)
         velocity_limited_count = int(np.count_nonzero(np.abs(velocity - acceleration_limited_velocity) > 1e-8))
         position = np.clip(self.position + velocity * dt, self.minimum, self.maximum)
+        # Stop exactly at the target. A pure acceleration limiter otherwise
+        # crosses a static target with non-zero velocity and oscillates forever,
+        # which appeared as constant finger motion in Isaac.
+        old_error = desired - self.position
+        new_error = desired - position
+        crossed = (old_error * new_error <= 0.0) & (
+            np.abs(old_error) > self.config.settle_epsilon_rad
+        )
+        settled = np.abs(old_error) <= self.config.settle_epsilon_rad
+        stop = crossed | settled
+        position = np.where(stop, desired, position)
+        velocity = np.where(stop, 0.0, velocity)
         saturated = bool(np.any(np.abs(position - desired) > 1e-8) or joint_limit_clipped_count)
         self.position, self.velocity, self.last_update_ns = position, velocity, timestamp_ns
         return position.copy(), {
@@ -219,6 +318,7 @@ class Dex3SafetyFilter:
             "joint_limit_clipped_count": joint_limit_clipped_count,
             "velocity_limited_count": velocity_limited_count,
             "acceleration_limited_count": acceleration_limited_count,
+            "last_pose": self.last_pose,
         }
 
 
@@ -246,7 +346,12 @@ class Dex3Retargeter:
         solver_metrics = {"backend": "none", "residual": None, "iterations": 0}
         if normalized is not None and confidence > 0.0:
             raw, solver_metrics = self.solver(normalized, side, self.filters[side].position.copy())
-        safe, safety_metrics = self.filters[side].update(raw, timestamp_ns, confidence)
+        safe, safety_metrics = self.filters[side].update(
+            raw,
+            timestamp_ns,
+            confidence,
+            str(solver_metrics.get("pose")) if raw is not None else None,
+        )
         return {
             "joint_order": list(DEX3_ORDER),
             "raw_q_rad": None if raw is None else np.asarray(raw, dtype=float).tolist(),

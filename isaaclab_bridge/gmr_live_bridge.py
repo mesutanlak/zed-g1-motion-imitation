@@ -101,6 +101,13 @@ G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M = {
     "left": np.asarray([0.1079465665, 0.00163511945, 0.00202244863], dtype=np.float64),
     "right": np.asarray([0.1079465665, -0.00163511945, 0.00202244863], dtype=np.float64),
 }
+# Conservative open-hand reach measured from Unitree's official G1-29/Dex3
+# kinematic chain: wrist pitch 0.038 + wrist yaw 0.046 + palm mount 0.0415 +
+# finger base 0.0777 + proximal 0.0458 + distal tip 0.050 = 0.299 m.
+G1_DEX3_OPEN_HAND_ENDPOINT_OFFSET_LOCAL_M = {
+    "left": np.asarray([0.2990, 0.0030, 0.0], dtype=np.float64),
+    "right": np.asarray([0.2990, -0.0030, 0.0], dtype=np.float64),
+}
 G1_SKELETON_EDGES = (
     ("pelvis", "torso_link"),
     ("pelvis", "left_hip_roll_link"), ("left_hip_roll_link", "left_knee_link"),
@@ -561,6 +568,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--stale-after", type=float, default=0.35)
+    parser.add_argument(
+        "--end-effector-profile",
+        choices=("g1_23dof", "g1_29dof_dex3"),
+        default="g1_23dof",
+        help="Collision envelope matching the official Isaac articulation asset",
+    )
     return parser.parse_args()
 
 
@@ -603,6 +616,7 @@ def forward_g1_skeleton(
     model: mujoco.MjModel,
     base_qpos: np.ndarray,
     joint_values: np.ndarray,
+    hand_endpoint_offsets: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, list[float]], int]:
     data = mujoco.MjData(model)
     data.qpos[:] = np.asarray(base_qpos, dtype=np.float64)
@@ -616,6 +630,7 @@ def forward_g1_skeleton(
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
         if body_id >= 0:
             positions[name] = data.xpos[body_id].astype(float).tolist()
+    endpoint_offsets = hand_endpoint_offsets or G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M
     for side in ("left", "right"):
         wrist_name = f"{side}_wrist_roll_rubber_hand"
         wrist_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, wrist_name)
@@ -624,7 +639,7 @@ def forward_g1_skeleton(
         endpoint = (
             data.xpos[wrist_id]
             + data.xmat[wrist_id].reshape(3, 3)
-            @ G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side]
+            @ endpoint_offsets[side]
         )
         positions[f"{side}_hand_endpoint"] = endpoint.astype(float).tolist()
     self_contacts = 0
@@ -643,6 +658,7 @@ def forward_g1_skeleton(
 
 def retarget_human_visualization_positions(
     human_data: dict[str, tuple[np.ndarray, np.ndarray]],
+    hand_endpoint_offsets: dict[str, np.ndarray] | None = None,
 ) -> dict[str, list[float]]:
     """Return GMR task points plus the physical rubber-hand endpoint.
 
@@ -654,6 +670,7 @@ def retarget_human_visualization_positions(
         name: np.asarray(value[0], dtype=float).tolist()
         for name, value in human_data.items()
     }
+    endpoint_offsets = hand_endpoint_offsets or G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M
     for side in ("left", "right"):
         elbow = np.asarray(positions.get(f"{side}_elbow", []), dtype=np.float64)
         wrist = np.asarray(positions.get(f"{side}_wrist", []), dtype=np.float64)
@@ -664,7 +681,7 @@ def retarget_human_visualization_positions(
         if norm <= 1.0e-8 or not np.isfinite(direction).all():
             continue
         endpoint_length = float(
-            np.linalg.norm(G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side])
+            np.linalg.norm(endpoint_offsets[side])
         )
         positions[f"{side}_hand_endpoint"] = (
             wrist + direction * (endpoint_length / norm)
@@ -741,6 +758,11 @@ def limb_direction_metrics(
 
 def main() -> int:
     args = parse_args()
+    hand_endpoint_offsets = (
+        G1_DEX3_OPEN_HAND_ENDPOINT_OFFSET_LOCAL_M
+        if args.end_effector_profile == "g1_29dof_dex3"
+        else G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M
+    )
     sys.path.insert(0, str(args.gmr_root.resolve()))
     from general_motion_retargeting import params
 
@@ -1080,7 +1102,7 @@ def main() -> int:
 
             def evaluate_arm_candidate(candidate_q: np.ndarray) -> KinematicEvaluation:
                 candidate_skeleton, _ = forward_g1_skeleton(
-                    gmr.model, qpos, candidate_q
+                    gmr.model, qpos, candidate_q, hand_endpoint_offsets
                 )
                 return KinematicEvaluation(
                     candidate_skeleton,
@@ -1220,7 +1242,7 @@ def main() -> int:
                     * (filtered[13:23] - feasibility.safe_q[13:23])
                 )
             raw_skeleton, raw_self_collisions = forward_g1_skeleton(
-                gmr.model, qpos, raw
+                gmr.model, qpos, raw, hand_endpoint_offsets
             )
             # The bilateral continuity governor is the actual candidate sent
             # across the feasibility boundary. Evaluate collision on that
@@ -1230,7 +1252,7 @@ def main() -> int:
             raw_self_collisions_for_safety = raw_self_collisions
             if bilateral_front:
                 collision_skeleton, raw_self_collisions_for_safety = forward_g1_skeleton(
-                    gmr.model, qpos, filtered
+                    gmr.model, qpos, filtered, hand_endpoint_offsets
                 )
             raw_collision_report = upper_body_capsule_report(collision_skeleton)
             limb_direction_error, end_effector_error = limb_direction_metrics(
@@ -1275,7 +1297,7 @@ def main() -> int:
 
             def evaluate_body_barrier(joint_position):
                 skeleton, contacts = forward_g1_skeleton(
-                    gmr.model, qpos, joint_position
+                    gmr.model, qpos, joint_position, hand_endpoint_offsets
                 )
                 return upper_body_capsule_report(skeleton), contacts
 
@@ -1311,7 +1333,7 @@ def main() -> int:
                 if float(value) < float(low) or float(value) > float(high)
             ]
             safe_skeleton, safe_self_collisions = forward_g1_skeleton(
-                gmr.model, qpos, safe
+                gmr.model, qpos, safe, hand_endpoint_offsets
             )
             last_update = now
             accepted += 1
@@ -1349,7 +1371,7 @@ def main() -> int:
                 }
             )
             human_visualization = retarget_human_visualization_positions(
-                adapted.human_data
+                adapted.human_data, hand_endpoint_offsets
             )
             dex3_control = frame.get("dex3_control")
             if not validate_dex3_control(dex3_control)[0]:
@@ -1411,6 +1433,10 @@ def main() -> int:
                     "soft_contact_pairs": list(raw_collision_report.soft_risk_pairs),
                     "soft_contact_margin_m": raw_collision_report.soft_pair_margins_m,
                     "arm_reference_blend": feasibility_result.arm_blend,
+                    "end_effector_profile": args.end_effector_profile,
+                    "hand_collision_reach_m": float(
+                        np.linalg.norm(hand_endpoint_offsets["left"])
+                    ),
                 },
                 "g1_skeleton": {
                     "body_names": list(G1_SKELETON_BODIES),

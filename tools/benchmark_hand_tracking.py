@@ -72,11 +72,15 @@ def summarize(path: Path) -> dict[str, Any]:
             )
             if not hands_root:
                 continue
+            raw_single_camera = hands_root.get("schema") == "zed_operator_hand/v1"
             timestamp = int(hands_root.get("capture_timestamp_ns") or packet.get("timestamp_ns") or 0)
             trace = packet.get("latency_trace_ns") or {}
             if trace.get("t2_windows_udp_send_ns") and trace.get("t0_capture_ns"):
                 latency.append((trace["t2_windows_udp_send_ns"] - trace["t0_capture_ns"]) / 1e6)
-            for camera in hands_root.get("per_camera", []):
+            camera_packets = (
+                [hands_root] if raw_single_camera else hands_root.get("per_camera", [])
+            )
+            for camera in camera_packets:
                 serial = str(camera.get("camera_serial"))
                 camera_timestamps.setdefault(serial, []).append(int(camera.get("capture_timestamp_ns", 0)))
                 counts = camera_detector.setdefault(serial, Counter())
@@ -89,6 +93,11 @@ def summarize(path: Path) -> dict[str, Any]:
                         counts[f"reason:{reason}"] += 1
                     else:
                         counts[f"{side}_detected"] += 1
+                    attempts = int(hand.get("detector_attempts", 1) or 1)
+                    if attempts > 1:
+                        counts[f"{side}_focus_retry_attempted"] += 1
+                    if hand.get("focus_retry"):
+                        counts[f"{side}_focus_retry_recovered"] += 1
                     if hand.get("inference_ms") is not None:
                         inference.setdefault(serial, []).append(float(hand["inference_ms"]))
                     depth_count = _depth_count(hand)
@@ -102,7 +111,14 @@ def summarize(path: Path) -> dict[str, Any]:
             }
             if len(hands) == 2:
                 frame_total += 1
-                valid_now = {side: bool(hands[side].get("valid")) for side in ("left", "right")}
+                valid_now = {
+                    side: bool(
+                        hands[side].get("rejection_reason") is None
+                        if raw_single_camera
+                        else hands[side].get("valid")
+                    )
+                    for side in ("left", "right")
+                }
                 both_valid += int(all(valid_now.values()))
                 either_valid += int(any(valid_now.values()))
                 for side in ("left", "right"):
@@ -163,6 +179,8 @@ def summarize(path: Path) -> dict[str, Any]:
                     statistics.mean(camera_depth_detected.get(f"{serial}:{side}", []))
                     if camera_depth_detected.get(f"{serial}:{side}") else None
                 ),
+                "focus_retry_attempted": counts[f"{side}_focus_retry_attempted"],
+                "focus_retry_recovered": counts[f"{side}_focus_retry_recovered"],
             }
         per_camera[serial] = {
             "samples": len(values),

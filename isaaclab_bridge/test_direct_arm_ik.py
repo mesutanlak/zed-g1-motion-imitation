@@ -13,10 +13,23 @@ from g1_dof_projection import (
     official_g1_23dof_xml,
 )
 from gmr_live_bridge import (
+    G1_DEX3_OPEN_HAND_ENDPOINT_OFFSET_LOCAL_M,
     G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M,
     forward_g1_skeleton,
     retarget_human_visualization_positions,
 )
+
+
+def test_official_dex3_profile_uses_complete_open_hand_reach() -> None:
+    assert np.isclose(
+        np.linalg.norm(G1_DEX3_OPEN_HAND_ENDPOINT_OFFSET_LOCAL_M["left"]),
+        0.299015,
+        atol=1.0e-4,
+    )
+    assert (
+        np.linalg.norm(G1_DEX3_OPEN_HAND_ENDPOINT_OFFSET_LOCAL_M["left"])
+        > 2.7 * np.linalg.norm(G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M["left"])
+    )
 
 
 def _retargeter():

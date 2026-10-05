@@ -6,6 +6,9 @@ içeren araştırma projesidir.
 
 Yeni bilgisayar kurulumu için önce [INSTALL_TR.md](INSTALL_TR.md) belgesini
 izleyin. Otomatik kurulum ve doğrulama betikleri `install/` klasöründedir.
+Yerel Ubuntu 24.04 + ROS 2 Jazzy + Isaac Sim 6.1 / Isaac Lab 3.0 geçişi için
+[Ubuntu 24.04 yerel kurulum rehberini](docs/UBUNTU_24_04_NATIVE_KURULUM_TR.md)
+kullanın; mevcut Windows/WSL başlatıcıları korunur.
 Windows/WSL, ZED SDK, Isaac Lab, tek/çift kamera, Rerun, ROS 2/RViz ve MuJoCo'yu
 tek akışta kurmak için ayrıntılı
 [yeni bilgisayar kurulum ve çalıştırma rehberini](docs/YENI_BILGISAYAR_KURULUM_VE_CALISTIRMA_TR.md)
@@ -27,6 +30,12 @@ arayüzü, Isaac/GMR, Rerun, JSONL kaydı ve yeniden kalibrasyon akışı için
 izleyin. ZED360/native ağ Fusion tanı adı ayrı olarak
 [zed_four_camera_test/README_TR.md](zed_four_camera_test/README_TR.md)
 içindedir.
+
+Dört-kamera düzenindeki laptop rolünü Windows'tan Ubuntu 24.04'e geçirmek,
+ZED SDK/Python ortamını sıfırdan kurmak, statik Ethernet'i ayarlamak, yeni
+extrinsic almak ve iki Ubuntu hostta sistemi çalıştırmak için
+[Ubuntu laptop dört-kamera kurulum rehberini](docs/UBUNTU_LAPTOP_FOUR_CAMERA_KURULUM_TR.md)
+kullanın.
 
 > Fiziksel robot güvenliği: Bu depo doğrudan gerçek G1 motor kontrolü için
 > hazır değildir. Varsayılan akış simülasyon ve üst gövde takibidir. Sim2real

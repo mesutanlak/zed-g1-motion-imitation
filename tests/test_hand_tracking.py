@@ -16,14 +16,16 @@ from hand_tracking.geometry import (
     CameraIntrinsics, deproject_pixel, project_world_point, robust_depth_patch,
     transform_point_camera_to_world, triangulate_rays,
 )
-from hand_tracking.normalization import PalmNormalizer
+from hand_tracking.normalization import PalmNormalizer, PalmSE3Filter
 from hand_tracking.outputs import HandBodyTargetJoiner
 from hand_tracking.pipeline import HandSourcePipeline
 from hand_tracking.retargeting import (
-    Dex3Retargeter, compose_targets, dex3_control_contract,
+    Dex3Retargeter, Dex3SafetyFilter, NormalizedTaskSolver, SafetyConfig,
+    compose_targets, dex3_control_contract,
 )
 from hand_tracking.roi import RoiConfig, clipped_hand_roi, crop_to_full, full_to_crop
 from hand_tracking.mediapipe_backend import MediaPipeHandBackend
+from hand_tracking.single_camera import SingleCameraDex3Pipeline
 from tools.benchmark_hand_tracking import summarize
 
 
@@ -39,6 +41,20 @@ def hand_shape() -> np.ndarray:
         p[start] = bases[start]
         for index in range(start + 1, end + 1):
             p[index] = p[index - 1] + [0, 0.025, 0.002 * (index - start)]
+    return p
+
+
+def fist_shape() -> np.ndarray:
+    p = hand_shape()
+    for start in (5, 9, 13, 17):
+        mcp = p[start].copy()
+        p[start + 1] = mcp + [0.0, 0.018, 0.0]
+        p[start + 2] = p[start + 1] + [0.012, 0.002, -0.012]
+        p[start + 3] = p[start + 2] + [0.002, -0.016, -0.010]
+    p[1] = [-0.035, 0.025, 0.010]
+    p[2] = [-0.025, 0.040, 0.005]
+    p[3] = [-0.008, 0.035, -0.005]
+    p[4] = [0.002, 0.022, -0.008]
     return p
 
 
@@ -153,6 +169,31 @@ def test_left_right_canonical_palm_frame_is_scale_invariant_and_right_handed() -
     assert np.isclose(left.scale_m, right.scale_m * 2)
 
 
+def test_se3_palm_filter_keeps_rotation_on_so3_and_smooths_shape() -> None:
+    normalizer = PalmNormalizer()
+    temporal = PalmSE3Filter(pose_cutoff_hz=4.0, shape_cutoff_hz=4.0)
+    first = temporal.update(normalizer.normalize(hand_shape(), "right"), 1_000_000_000)
+    moved = hand_shape().copy()
+    moved[:, 2] += np.linspace(0.0, 0.02, 21)
+    second_raw = normalizer.normalize(moved + [0.02, 0.0, 0.0], "right")
+    second = temporal.update(second_raw, 1_020_000_000)
+    assert np.linalg.det(second.rotation_world_from_palm) > 0.999
+    assert np.linalg.norm(second.landmarks - first.landmarks) < np.linalg.norm(
+        second_raw.landmarks - first.landmarks
+    )
+
+
+def test_angle_solver_maps_five_finger_fist_to_visible_dex3_flexion() -> None:
+    solver = NormalizedTaskSolver()
+    open_q, open_metrics = solver(hand_shape(), "right", np.zeros(7))
+    fist_q, fist_metrics = solver(fist_shape(), "right", np.zeros(7))
+    assert open_metrics["pose"] == "OPEN"
+    assert fist_metrics["pose"] == "FIST"
+    assert fist_metrics["fist_score"] > 0.9
+    assert np.mean(np.abs(fist_q[3:])) > 1.3
+    assert np.mean(np.abs(fist_q[3:])) > 5.0 * np.mean(np.abs(open_q[3:]))
+
+
 def test_dex3_joint_order_limits_slew_and_independent_watchdogs() -> None:
     retargeter = Dex3Retargeter(ROOT / "config" / "g1_23dof_dex3.json", solver=lambda p, side, previous: (np.full(7, 99.0), {"residual": 0.0, "iterations": 1}))
     points = hand_shape()
@@ -178,6 +219,29 @@ def test_dex3_joint_order_limits_slew_and_independent_watchdogs() -> None:
     assert validate_dex3_control(control)[1] == "PHYSICAL_OUTPUT_MUST_BE_FALSE"
 
 
+def test_dex3_filter_settles_without_overshoot_and_rejects_micro_jitter() -> None:
+    filt = Dex3SafetyFilter(
+        [-2.0] * 7, [2.0] * 7, [0.0] * 7,
+        SafetyConfig(hold_s=1.0, measurement_deadband_rad=0.035),
+    )
+    target = np.asarray([0.8, 0.6, 1.2, 1.3, 1.5, 1.3, 1.5])
+    positions = []
+    timestamp = 1_000_000_000
+    for frame in range(90):
+        raw = target if frame % 3 == 0 else None
+        confidence = 1.0 if raw is not None else 0.0
+        q, _metrics = filt.update(raw, timestamp, confidence, "FIST" if raw is not None else None)
+        positions.append(q.copy())
+        timestamp += 33_333_333
+    positions = np.asarray(positions)
+    assert np.max(positions - target) <= 1.0e-9
+    assert np.linalg.norm(positions[-1] - positions[-2]) < 1.0e-9
+    before = filt.last_desired.copy()
+    jitter = before + np.asarray([0.01, -0.02, 0.015, -0.01, 0.02, -0.015, 0.01])
+    filt.update(jitter, timestamp, 1.0, "FIST")
+    assert np.allclose(filt.last_desired, before)
+
+
 def test_dex3_control_contract_rejects_wrong_joint_order() -> None:
     side = {
         "safe_q_rad": [0.0] * 7,
@@ -188,6 +252,51 @@ def test_dex3_control_contract_rejects_wrong_joint_order() -> None:
         reversed(packet["joint_order_per_hand"])
     )
     assert validate_dex3_control(packet) == (False, "JOINT_ORDER")
+
+
+def test_single_camera_mediapipe_shape_produces_safe_dex3_control() -> None:
+    pipeline = SingleCameraDex3Pipeline(ROOT / "config" / "g1_23dof_dex3.json")
+    packet = valid_packet()
+    shape = hand_shape().tolist()
+    packet["hands"] = [
+        {
+            "side": side,
+            "relative_landmarks_m": shape,
+            "landmark_confidence": [0.9] * 21,
+            "rejection_reason": None,
+        }
+        for side in ("left", "right")
+    ]
+    targets, control = pipeline.update(packet, 1_000_000_000)
+    assert targets["physical_robot_output_enabled"] is False
+    assert targets["left"]["safety"]["watchdog"] == "TRACKING"
+    assert targets["right"]["safety"]["watchdog"] == "TRACKING"
+    assert validate_dex3_control(control) == (True, None)
+    assert control["physical_robot_output_enabled"] is False
+
+
+def test_single_camera_control_advances_between_roi_inference_frames() -> None:
+    pipeline = SingleCameraDex3Pipeline(ROOT / "config" / "g1_23dof_dex3.json")
+    packet = valid_packet()
+    packet["hands"] = [
+        {
+            "side": side,
+            "relative_landmarks_m": fist_shape().tolist(),
+            "landmark_confidence": [0.95] * 21,
+            "rejection_reason": None,
+        }
+        for side in ("left", "right")
+    ]
+    _targets, first = pipeline.update(packet, 1_000_000_000)
+    values = [float(np.linalg.norm(first["q_right"]))]
+    for frame in range(1, 6):
+        _targets, control = pipeline.advance(1_000_000_000 + frame * 33_333_333)
+        assert validate_dex3_control(control) == (True, None)
+        values.append(float(np.linalg.norm(control["q_right"])))
+    assert values[-1] > values[0] * 2.0
+    assert control["watchdog_right"] == "HOLD"
+    _targets, held_fist = pipeline.advance(1_800_000_000)
+    assert held_fist["watchdog_right"] == "HOLD"
 
 
 def test_json_contract_rejects_nonfinite_and_udp_has_safe_size() -> None:
@@ -231,6 +340,37 @@ class MockBackend:
             "detection_confidence": 0.9, "presence_confidence": 0.9,
             "tracking_confidence": 0.9,
         }], 2.0
+
+
+def test_roi_focus_retry_recovers_a_small_distant_hand() -> None:
+    class SizeSensitiveBackend(MockBackend):
+        def detect(self, rgb: np.ndarray, timestamp_ns: int):
+            if rgb.shape[1] > 110:
+                return [], 1.0
+            return super().detect(rgb, timestamp_ns)
+
+    intrinsics = CameraIntrinsics(700, 700, 640, 360, 1280, 720)
+    pipeline = HandSourcePipeline(
+        1, "host", intrinsics, lambda side: SizeSensitiveBackend(),
+        roi_config=RoiConfig(minimum_px=128, maximum_px=128),
+        inference_fps=30, asynchronous=False,
+    )
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    depth = np.full((720, 1280), 3.0, dtype=np.float32)
+    points2d = np.zeros((38, 2)); points3d = np.zeros((38, 3))
+    indices = {"LEFT_WRIST": 16, "RIGHT_WRIST": 17, "LEFT_ELBOW": 14, "RIGHT_ELBOW": 15}
+    points2d[16], points2d[14] = [500, 350], [450, 350]
+    points2d[17], points2d[15] = [780, 350], [830, 350]
+    points3d[16] = points3d[17] = [3, 0, 0]
+    packet = pipeline.process(
+        image, depth, points2d, points3d, body_id=9,
+        unique_operator_id="u9", operator_state="LOCKED",
+        capture_timestamp_ns=1_000_000_000, sequence=1, indices=indices,
+    )
+    assert packet is not None
+    assert all(hand["rejection_reason"] is None for hand in packet["hands"])
+    assert all(hand["detector_attempts"] == 2 for hand in packet["hands"])
+    assert all(hand["focus_retry"] is True for hand in packet["hands"])
 
 
 def test_mock_backend_end_to_end_two_hand_source_packet_and_fusion() -> None:
@@ -365,3 +505,23 @@ def test_benchmark_reads_fused_jsonl_metrics(tmp_path: Path) -> None:
     assert report["landmark_camera_count_mean"] == 2.0
     assert report["hand_valid_coverage_percent"] == 50.0
     assert report["solver_ms"]["p95"] == 1.2
+
+
+def test_benchmark_reads_raw_single_camera_hand_packet(tmp_path: Path) -> None:
+    packet = valid_packet()
+    right = dict(packet["hands"][0])
+    right["side"] = "right"
+    packet["hands"].append(right)
+    for hand in packet["hands"]:
+        hand["inference_ms"] = 7.5
+        hand["depth_valid_count"] = 5
+        hand["rejection_reason"] = None
+    path = tmp_path / "raw_hand.jsonl"
+    path.write_text(
+        json.dumps({"timestamp_ns": 1_000_000_000, "hand_tracking": packet}) + "\n",
+        encoding="utf-8",
+    )
+    report = summarize(path)
+    assert report["frames"] == 1
+    assert report["coverage"]["both_hands_percent"] == 100.0
+    assert report["per_camera_inference"][str(packet["camera_serial"])]["p95_ms"] == 7.5

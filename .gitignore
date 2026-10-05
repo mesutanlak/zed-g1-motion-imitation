@@ -53,6 +53,9 @@ outputs/
 datasets/reference_motion/
 policies/g1_reference_upper_body/
 
+# Downloaded MediaPipe task models are machine-local third-party artifacts.
+models/*.task
+
 # Office temporary files
 ~$*
 

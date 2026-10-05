@@ -11,6 +11,14 @@ preview_hz=10
 record=0
 headless=0
 skip_gmr_check=0
+hand_tracking=0
+hand_max_age_ms="120"
+hand_max_spread_ms="70"
+disable_dex3_retargeting=0
+disable_single_view_hand_depth=0
+dex3_official_root=""
+dex3_official_python=""
+record_detail="research"
 
 usage() {
   cat <<'EOF'
@@ -19,6 +27,10 @@ Kullanim: ./start_zed_four_fusion_ubuntu.sh [secenekler]
   --reference-serial 33773329
   --minimum-sources 2|3|4
   --fps 1..15 --preview-hz HZ
+  --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
+  --disable-dex3-retargeting --disable-single-view-hand-depth
+  --dex3-official-root PATH --dex3-official-python PATH
+  --record-detail minimal|research|full
   --record --headless --skip-gmr-check
 EOF
 }
@@ -30,6 +42,14 @@ while (($#)); do
     --minimum-sources) minimum_sources="${2:?}"; shift 2 ;;
     --fps) fps="${2:?}"; shift 2 ;;
     --preview-hz) preview_hz="${2:?}"; shift 2 ;;
+    --hand-tracking) hand_tracking=1; shift ;;
+    --hand-max-age-ms) hand_max_age_ms="${2:?}"; shift 2 ;;
+    --hand-max-spread-ms) hand_max_spread_ms="${2:?}"; shift 2 ;;
+    --disable-dex3-retargeting) disable_dex3_retargeting=1; shift ;;
+    --disable-single-view-hand-depth) disable_single_view_hand_depth=1; shift ;;
+    --dex3-official-root) dex3_official_root="${2:?}"; shift 2 ;;
+    --dex3-official-python) dex3_official_python="${2:?}"; shift 2 ;;
+    --record-detail) record_detail="${2:?}"; shift 2 ;;
     --record) record=1; shift ;;
     --headless) headless=1; shift ;;
     --skip-gmr-check) skip_gmr_check=1; shift ;;
@@ -40,6 +60,7 @@ done
 
 [[ -x "$zed_python" ]] || { echo "ZED Python bulunamadi: $zed_python" >&2; exit 1; }
 case "$minimum_sources" in 2|3|4) ;; *) echo "--minimum-sources 2, 3 veya 4 olmali." >&2; exit 2 ;; esac
+case "$record_detail" in minimal|research|full) ;; *) echo "--record-detail minimal, research veya full olmali." >&2; exit 2 ;; esac
 
 if [[ -z "$extrinsics" ]]; then
   inbox="$project/four json"
@@ -85,7 +106,19 @@ args=(
   --fps "$fps"
   --minimum-sources "$minimum_sources"
   --preview-hz "$preview_hz"
+  --record-detail "$record_detail"
 )
+if (( hand_tracking )); then
+  args+=(
+    --hand-tracking
+    --hand-max-age-ms "$hand_max_age_ms"
+    --hand-max-spread-ms "$hand_max_spread_ms"
+  )
+  (( disable_dex3_retargeting )) && args+=(--disable-dex3-retargeting)
+  (( disable_single_view_hand_depth )) && args+=(--disable-single-view-hand-depth)
+  [[ -n "$dex3_official_root" ]] && args+=(--dex3-official-root "$dex3_official_root")
+  [[ -n "$dex3_official_python" ]] && args+=(--dex3-official-python "$dex3_official_python")
+fi
 (( record )) && args+=(--record)
 (( headless )) && args+=(--headless)
 

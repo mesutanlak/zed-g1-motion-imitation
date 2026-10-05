@@ -1,4 +1,4 @@
-# Install only in each Windows ZED source environment when hand tracking is used.
+# Install only in each Windows or native Ubuntu ZED source environment when hand tracking is used.
 # MediaPipe Tasks supports Python 3.9-3.12; keep the existing pyzed environment
 # version and verify both imports before starting four cameras.
 mediapipe==0.10.35

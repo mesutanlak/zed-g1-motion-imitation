@@ -37,6 +37,7 @@ from hand_tracking.geometry import CameraIntrinsics
 from hand_tracking.mediapipe_backend import MediaPipeHandBackend
 from hand_tracking.pipeline import HandSourcePipeline
 from hand_tracking.roi import RoiConfig
+from hand_tracking.single_camera import SingleCameraDex3Pipeline
 
 
 def _configure_windows_dll_search() -> list[Any]:
@@ -1105,9 +1106,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-stream-host", default=None)
     parser.add_argument("--hand-stream-port", type=int, default=16200)
     parser.add_argument("--hand-inference-fps", type=float, default=8.0)
+    parser.add_argument("--hand-detection-confidence", type=float, default=0.20)
+    parser.add_argument("--hand-presence-confidence", type=float, default=0.20)
+    parser.add_argument("--hand-tracking-confidence", type=float, default=0.20)
     parser.add_argument("--hand-roi-scale", type=float, default=1.45)
-    parser.add_argument("--hand-roi-min-px", type=int, default=160)
+    parser.add_argument("--hand-roi-min-px", type=int, default=128)
     parser.add_argument("--hand-roi-max-px", type=int, default=420)
+    parser.add_argument(
+        "--hand-focus-retry-scale", type=float, default=0.65,
+        help="Ilk ROI kacirirsa coarse BODY_38 el merkezindeki ikinci crop olcegi",
+    )
+    parser.add_argument(
+        "--embed-hand-in-body",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Ayrik el UDP kanalina ek olarak son el paketini BODY_38 datagramina "
+            "yedek olarak gom; dagitik fusion icin paket kaybi toleransi saglar"
+        ),
+    )
+    parser.add_argument(
+        "--dex3-retargeting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="MediaPipe yerel el seklinden DDS-free Dex3 simulasyon hedefi uret",
+    )
+    parser.add_argument(
+        "--dex3-config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "config" / "g1_23dof_dex3.json",
+    )
     parser.add_argument(
         "--monitor-host",
         default=None,
@@ -1318,6 +1346,15 @@ def main() -> int:
         or not 35 <= args.preview_jpeg_quality <= 90
         or not 1 <= args.hand_stream_port <= 65535
         or args.hand_inference_fps <= 0
+        or not all(
+            0.0 <= value <= 1.0
+            for value in (
+                args.hand_detection_confidence,
+                args.hand_presence_confidence,
+                args.hand_tracking_confidence,
+            )
+        )
+        or not 0.55 <= args.hand_focus_retry_scale <= 0.95
         or args.hand_roi_min_px < 32
         or args.hand_roi_max_px < args.hand_roi_min_px
     ):
@@ -1329,6 +1366,10 @@ def main() -> int:
     if args.hand_tracking and args.hand_model is None:
         print("--hand-tracking icin --hand-model zorunludur; model otomatik indirilmez.", file=sys.stderr)
         return 2
+    if args.dex3_retargeting and not args.hand_tracking:
+        # Retargeting has no input while hand tracking is disabled. Keep the
+        # legacy BODY_38-only command valid without constructing hand state.
+        args.dex3_retargeting = False
     if args.operator_acquire_frames < 1:
         print("--operator-acquire-frames en az 1 olmalı.", file=sys.stderr)
         return 2
@@ -1419,13 +1460,18 @@ def main() -> int:
     hand_target: tuple[str, int] | None = None
     hand_depth = sl.Mat()
     hand_packets_sent = 0
+    single_camera_dex3: SingleCameraDex3Pipeline | None = None
     if args.hand_tracking:
         try:
             intrinsics = CameraIntrinsics.from_mapping(opened_camera["left_intrinsics"])
             hand_pipeline = HandSourcePipeline(
                 source_serial, str(args.source_host_id), intrinsics,
                 lambda _side: MediaPipeHandBackend(
-                    args.hand_model, delegate=args.hand_delegate,
+                    args.hand_model,
+                    delegate=args.hand_delegate,
+                    minimum_detection_confidence=args.hand_detection_confidence,
+                    minimum_presence_confidence=args.hand_presence_confidence,
+                    minimum_tracking_confidence=args.hand_tracking_confidence,
                 ),
                 roi_config=RoiConfig(
                     forearm_scale=args.hand_roi_scale,
@@ -1433,12 +1479,15 @@ def main() -> int:
                     maximum_px=args.hand_roi_max_px,
                 ),
                 inference_fps=args.hand_inference_fps,
+                focus_retry_scale=args.hand_focus_retry_scale,
             )
             destination_host = args.hand_stream_host or args.stream_host
             if not destination_host:
                 raise ValueError("--hand-stream-host veya --stream-host gerekli")
             hand_target = (destination_host, args.hand_stream_port)
             hand_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if args.dex3_retargeting:
+                single_camera_dex3 = SingleCameraDex3Pipeline(args.dex3_config)
             print(
                 f"21-landmark el kanali: {hand_target[0]}:{hand_target[1]} "
                 f"({args.hand_inference_fps:g} Hz, fiziksel robot cikisi KAPALI)"
@@ -1567,6 +1616,7 @@ def main() -> int:
     maximum_stream_hz = max(stream_target_rates.values(), default=0.0)
     stream_every_capture = maximum_stream_hz >= 0.95 * float(args.fps)
     streamed_frames = 0
+    hand_embed_oversize_fallbacks = 0
     target_roles = ("GMR", "analiz", "ROS2")
     for target_index, stream_target in enumerate(stream_targets):
         role = (
@@ -2071,6 +2121,14 @@ def main() -> int:
                         )
                         if hand_packet is not None:
                             record["hand_tracking"] = hand_packet
+                            if single_camera_dex3 is not None:
+                                dex3_targets, dex3_control = (
+                                    single_camera_dex3.update(
+                                        hand_packet, timestamp_ns
+                                    )
+                                )
+                                record["dex3_targets"] = dex3_targets
+                                record["dex3_control"] = dex3_control
                             if hand_socket is not None and hand_target is not None:
                                 hand_socket.sendto(hand_pipeline.encode(hand_packet), hand_target)
                                 hand_packets_sent += 1
@@ -2081,6 +2139,20 @@ def main() -> int:
                             "status": "REJECTED",
                             "reason": str(exc),
                         }
+                # BODY_38 is faster than the asynchronous hand detector. Keep
+                # a valid compact Dex3 contract on every control frame and let
+                # its per-side watchdog hold/fade smoothly between measurements.
+                # Previously the 20+ intervening packets per second carried
+                # null, so the GMR sampler often never delivered a fist target.
+                if (
+                    single_camera_dex3 is not None
+                    and record.get("dex3_control") is None
+                ):
+                    dex3_targets, dex3_control = single_camera_dex3.advance(
+                        timestamp_ns
+                    )
+                    record["dex3_targets"] = dex3_targets
+                    record["dex3_control"] = dex3_control
                 now = time.monotonic()
                 if (
                     stream_socket is not None
@@ -2182,6 +2254,11 @@ def main() -> int:
                                 "g1_reference_features"
                             ],
                             "distance_quality": record["distance_quality"],
+                            "dex3_control": record.get("dex3_control"),
+                            "hand_tracking": (
+                                record.get("hand_tracking")
+                                if args.embed_hand_in_body else None
+                            ),
                             "euclidean_distance_m": record[
                                 "euclidean_distance_m"
                             ],
@@ -2203,42 +2280,80 @@ def main() -> int:
                             },
                         }
                     )
-                    payload = json.dumps(
-                        packet,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    if len(payload) <= 60000:
-                        sent = False
-                        for stream_target in stream_targets:
-                            target_hz = stream_target_rates[stream_target]
-                            if (
-                                now - last_target_stream_time[stream_target]
-                                < 0.98 / target_hz
-                                and not (
-                                    stream_target_roles.get(stream_target) == "GMR"
-                                    and stream_every_capture
-                                )
-                            ):
-                                continue
-                            try:
-                                stream_socket.sendto(payload, stream_target)
-                                sent = True
-                                last_target_stream_time[stream_target] = now
-                            except OSError as exc:
-                                print(
-                                    "UDP yayın uyarısı "
-                                    f"({stream_target[0]}:{stream_target[1]}): "
-                                    f"{exc}",
-                                    file=sys.stderr,
-                                )
-                        if sent:
-                            streamed_frames += 1
-                            last_stream_source_timestamp_ns = timestamp_ns
-                    else:
+                    sent = False
+                    oversized_targets: list[tuple[str, int, int]] = []
+                    for stream_target in stream_targets:
+                        target_packet = packet
+                        if (
+                            stream_target_roles.get(stream_target) == "analysis"
+                            and record.get("hand_tracking") is not None
+                        ):
+                            # Keep control packets compact. The analysis copy
+                            # carries the raw single-camera MediaPipe result so
+                            # Rerun and the session writer can inspect it.
+                            target_packet = dict(packet)
+                            target_packet["hand_tracking"] = record["hand_tracking"]
+                            if record.get("dex3_targets") is not None:
+                                target_packet["dex3_targets"] = record[
+                                    "dex3_targets"
+                                ]
+                        payload = json.dumps(
+                            target_packet,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        if (
+                            len(payload) > 60000
+                            and target_packet.get("hand_tracking") is not None
+                        ):
+                            # BODY continuity is safety-critical. If an
+                            # unusually detailed hand packet would overflow a
+                            # UDP datagram, send BODY without the embedded
+                            # fallback; the separate hand channel remains
+                            # available and the counter makes the loss visible.
+                            target_packet = dict(target_packet)
+                            target_packet.pop("hand_tracking", None)
+                            payload = json.dumps(
+                                target_packet,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                            hand_embed_oversize_fallbacks += 1
+                        if len(payload) > 60000:
+                            oversized_targets.append(
+                                (stream_target[0], stream_target[1], len(payload))
+                            )
+                            continue
+                        target_hz = stream_target_rates[stream_target]
+                        if (
+                            now - last_target_stream_time[stream_target]
+                            < 0.98 / target_hz
+                            and not (
+                                stream_target_roles.get(stream_target) == "GMR"
+                                and stream_every_capture
+                            )
+                        ):
+                            continue
+                        try:
+                            stream_socket.sendto(payload, stream_target)
+                            sent = True
+                            last_target_stream_time[stream_target] = now
+                        except OSError as exc:
+                            print(
+                                "UDP yayın uyarısı "
+                                f"({stream_target[0]}:{stream_target[1]}): "
+                                f"{exc}",
+                                file=sys.stderr,
+                            )
+                    if sent:
+                        streamed_frames += 1
+                        last_stream_source_timestamp_ns = timestamp_ns
+                    for target_host, target_port, payload_size in oversized_targets:
                         print(
-                            f"UDP paket boyutu fazla: {len(payload)} bayt",
+                            "UDP paket boyutu fazla "
+                            f"({target_host}:{target_port}): {payload_size} bayt",
                             file=sys.stderr,
                         )
                 features = record["g1_reference_features"]
@@ -2460,6 +2575,13 @@ def main() -> int:
     print(f"USB frame integrity: corrupt={corrupt_total} total={frame_index}")
     if preview_target is not None:
         print(f"JPEG önizleme kareleri: {preview_streamed_frames}")
+    if hand_pipeline is not None:
+        print(
+            f"El paketleri: ayri_udp={hand_packets_sent} "
+            f"govde_yedegi={'acik' if args.embed_hand_in_body else 'kapali'} "
+            f"yedek_boyut_dusurme={hand_embed_oversize_fallbacks} "
+            f"detektor_job_drop={hand_pipeline.dropped_jobs}"
+        )
     return 7 if camera_failed else 0
 
 

@@ -128,6 +128,7 @@ if (( hand_tracking )); then
     --hand-inference-fps "$hand_inference_fps"
     --hand-stream-host "$target_host"
     --hand-stream-port "$hand_port"
+    --embed-hand-in-body
   )
 fi
 

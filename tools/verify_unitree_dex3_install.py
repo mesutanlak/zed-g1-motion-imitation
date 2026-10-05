@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -24,21 +25,30 @@ def revision(path: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--install-root", type=Path, default=Path(r"C:\g1il"))
+    parser.add_argument(
+        "--install-root",
+        type=Path,
+        default=Path(os.environ.get("G1_NATIVE_ROOT", ROOT.parent)),
+    )
     args = parser.parse_args()
     lock = json.loads((ROOT / "config" / "unitree_official_sources.lock.json").read_text(encoding="utf-8"))
     repos = args.install_root / "repos"
     sim = repos / "unitree_sim_isaaclab"
     xr = repos / "xr_teleoperate"
     errors = []
-    for name, path in (("unitree_sim_isaaclab", sim), ("xr_teleoperate", xr)):
+    for name, source in lock["sources"].items():
+        path = repos / name
         if not (path / ".git").exists():
             errors.append(f"missing repository: {path}")
             continue
         actual = revision(path)
-        expected = lock["sources"][name]["commit"]
+        expected = source["commit"]
         if actual != expected:
             errors.append(f"{name} commit {actual} != {expected}")
+        for field in ("asset", "required_asset", "required_config", "required_example"):
+            relative = source.get(field)
+            if relative and not (path / relative).is_file():
+                errors.append(f"{name} missing {field}: {relative}")
     asset = sim / lock["sources"]["unitree_sim_isaaclab"]["asset"]
     if not asset.is_file() or asset.stat().st_size < 1024:
         errors.append(f"official Dex3 USD missing/incomplete: {asset}")
@@ -51,6 +61,8 @@ def main() -> int:
     else:
         errors.append(f"official retarget config missing: {config_path}")
     dex_python = args.install_root / "envs" / "dex3" / "Scripts" / "python.exe"
+    if not dex_python.is_file():
+        dex_python = args.install_root / "envs" / "dex3" / "bin" / "python"
     retarget_backend = "normalized_21_task_fallback"
     if dex_python.is_file():
         probe = subprocess.run(
@@ -67,7 +79,7 @@ def main() -> int:
             print(f"- {error}")
         return 2
     print(
-        "UNITREE_DEX3_VERIFY_OK pinned_sources=2 asset=official "
+        f"UNITREE_DEX3_VERIFY_OK pinned_sources={len(lock['sources'])} asset=official "
         f"retarget={retarget_backend} dds=disabled"
     )
     return 0

@@ -246,11 +246,26 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import math as math_utils
-from unitree_rl_lab.assets.robots.unitree import (
-    UNITREE_G1_23DOF_CFG,
-    UnitreeUrdfFileCfg,
-    UnitreeUsdFileCfg,
-)
+
+try:
+    from isaaclab.utils.warp import ProxyArray as _IsaacLab3ProxyArray
+except ImportError:
+    _IsaacLab3ProxyArray = None
+
+ISAACLAB3 = _IsaacLab3ProxyArray is not None
+if ISAACLAB3:
+    from isaaclab_bridge.unitree_g1_isaaclab3 import (
+        UNITREE_G1_23DOF_CFG,
+        UnitreeUrdfFileCfg,
+        UnitreeUsdFileCfg,
+        g1_29dof_dex3_cfg,
+    )
+else:
+    from unitree_rl_lab.assets.robots.unitree import (
+        UNITREE_G1_23DOF_CFG,
+        UnitreeUrdfFileCfg,
+        UnitreeUsdFileCfg,
+    )
 
 
 INSTALL_ROOT = Path(os.environ.get("G1IL_ROOT", r"C:\g1il"))
@@ -264,8 +279,13 @@ else:
         Path.home() / "g1_isaaclab_project" / "repos" / "unitree_ros"
         / "robots" / "g1_description" / "g1_23dof_rev_1_0.urdf"
     )
-DEFAULT_USD = INSTALL_ROOT / "cache" / "g1_23dof" / "g1_23dof_rev_1_0.usd"
-DEFAULT_UNITREE_SIM_ROOT = INSTALL_ROOT / "repos" / "unitree_sim_isaaclab"
+if os.name == "nt":
+    DEFAULT_USD = INSTALL_ROOT / "cache" / "g1_23dof" / "g1_23dof_rev_1_0.usd"
+    DEFAULT_UNITREE_SIM_ROOT = INSTALL_ROOT / "repos" / "unitree_sim_isaaclab"
+else:
+    native_root = Path(os.environ.get("G1_NATIVE_ROOT", Path.home() / "g1_isaaclab_project"))
+    DEFAULT_USD = native_root / "cache" / "g1_23dof" / "g1_23dof_rev_1_0.usd"
+    DEFAULT_UNITREE_SIM_ROOT = native_root / "repos" / "unitree_sim_isaaclab"
 LOWER_BODY = {
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -326,6 +346,91 @@ REFERENCE_STATIONARY_DEADBAND_RAD = {
     "right_elbow_joint": 0.012,
     "right_wrist_roll_joint": 0.018,
 }
+
+
+def torch_view(value):
+    """Return an explicit torch view for Isaac Lab 3 ProxyArray values."""
+
+    return value.torch if hasattr(value, "torch") else value
+
+
+def default_root_state(robot: Articulation) -> torch.Tensor:
+    """Return the default pose and velocity without the Lab 3 legacy alias."""
+
+    if ISAACLAB3:
+        return torch.cat(
+            (
+                torch_view(robot.data.default_root_pose),
+                torch_view(robot.data.default_root_vel),
+            ),
+            dim=-1,
+        )
+    return torch_view(robot.data.default_root_state)
+
+
+def quaternion_wxyz(quaternion: np.ndarray) -> tuple[float, float, float, float]:
+    """Normalize the active Isaac Lab quaternion convention to WXYZ."""
+
+    values = [float(item) for item in quaternion]
+    if ISAACLAB3:
+        x, y, z, w = values
+        return w, x, y, z
+    w, x, y, z = values
+    return w, x, y, z
+
+
+def write_root_state(robot: Articulation, root_state: torch.Tensor) -> None:
+    """Write a complete root state through the active Isaac Lab API."""
+
+    if ISAACLAB3:
+        robot.write_root_pose_to_sim_index(root_pose=root_state[:, :7])
+        robot.write_root_velocity_to_sim_index(root_velocity=root_state[:, 7:])
+    else:
+        robot.write_root_pose_to_sim(root_state[:, :7])
+        robot.write_root_velocity_to_sim(root_state[:, 7:])
+
+
+def write_joint_state(
+    robot: Articulation,
+    position: torch.Tensor,
+    velocity: torch.Tensor,
+) -> None:
+    """Write joint position and velocity through the active Isaac Lab API."""
+
+    if ISAACLAB3:
+        robot.write_joint_position_to_sim_index(position=position)
+        robot.write_joint_velocity_to_sim_index(velocity=velocity)
+    else:
+        robot.write_joint_state_to_sim(position, velocity)
+
+
+def set_joint_position_target(robot: Articulation, target: torch.Tensor) -> None:
+    """Set the full articulation position target without a 3.0 legacy shim."""
+
+    if ISAACLAB3:
+        robot.actuators.target_command.set_position_index(value=target)
+    else:
+        robot.set_joint_position_target(target)
+
+
+def write_joint_gains(
+    robot: Articulation,
+    stiffness: torch.Tensor,
+    damping: torch.Tensor,
+    joint_ids: torch.Tensor,
+) -> None:
+    """Write PD gains with the Isaac Lab 3 index API when available."""
+
+    if ISAACLAB3:
+        robot.write_joint_stiffness_to_sim_index(
+            stiffness=stiffness, joint_ids=joint_ids
+        )
+        robot.write_joint_damping_to_sim_index(
+            damping=damping, joint_ids=joint_ids
+        )
+    else:
+        robot.write_joint_stiffness_to_sim(stiffness, joint_ids=joint_ids)
+        robot.write_joint_damping_to_sim(damping, joint_ids=joint_ids)
 
 
 def configure_fabric_gpu_viewport() -> None:
@@ -405,11 +510,11 @@ class BalancePolicy:
         self.target = self.default.clone()
 
     def apply_deployment_gains(self, robot: Articulation) -> None:
-        robot.write_joint_stiffness_to_sim(
-            self.stiffness.unsqueeze(0), joint_ids=self.indices
-        )
-        robot.write_joint_damping_to_sim(
-            self.damping.unsqueeze(0), joint_ids=self.indices
+        write_joint_gains(
+            robot,
+            self.stiffness.unsqueeze(0),
+            self.damping.unsqueeze(0),
+            self.indices,
         )
 
     def apply_fixed_stance_gains(
@@ -419,13 +524,11 @@ class BalancePolicy:
         selected = torch.tensor(
             lower_policy_ids, dtype=torch.long, device=robot.device
         )
-        robot.write_joint_stiffness_to_sim(
+        write_joint_gains(
+            robot,
             (1.25 * self.stiffness[selected]).unsqueeze(0),
-            joint_ids=self.indices[selected],
-        )
-        robot.write_joint_damping_to_sim(
             (2.0 * self.damping[selected]).unsqueeze(0),
-            joint_ids=self.indices[selected],
+            self.indices[selected],
         )
 
     def apply_upper_tracking_gains(
@@ -439,22 +542,20 @@ class BalancePolicy:
         selected = torch.tensor(
             upper_policy_ids, dtype=torch.long, device=robot.device
         )
-        robot.write_joint_stiffness_to_sim(
+        write_joint_gains(
+            robot,
             (stiffness_scale * self.stiffness[selected]).unsqueeze(0),
-            joint_ids=self.indices[selected],
-        )
-        robot.write_joint_damping_to_sim(
             (damping_scale * self.damping[selected]).unsqueeze(0),
-            joint_ids=self.indices[selected],
+            self.indices[selected],
         )
 
     def infer(self, robot: Articulation) -> torch.Tensor:
-        q = robot.data.joint_pos[0, self.indices]
-        qd = robot.data.joint_vel[0, self.indices]
+        q = torch_view(robot.data.joint_pos)[0, self.indices]
+        qd = torch_view(robot.data.joint_vel)[0, self.indices]
         obs = torch.cat(
             (
-                robot.data.root_link_ang_vel_b[0],
-                robot.data.projected_gravity_b[0],
+                torch_view(robot.data.root_link_ang_vel_b)[0],
+                torch_view(robot.data.projected_gravity_b)[0],
                 torch.zeros(3, device=robot.device),
                 torch.zeros(2, device=robot.device),  # zero command => zero gait phase
                 q - self.default,
@@ -592,12 +693,12 @@ class ReferenceUpperBodyPolicy:
         reference_confidence: float,
         safety_guard: dict | None = None,
     ) -> torch.Tensor:
-        q = robot.data.joint_pos[0, self.indices]
-        qd = robot.data.joint_vel[0, self.indices]
-        default = robot.data.default_joint_pos[0, self.indices]
+        q = torch_view(robot.data.joint_pos)[0, self.indices]
+        qd = torch_view(robot.data.joint_vel)[0, self.indices]
+        default = torch_view(robot.data.default_joint_pos)[0, self.indices]
         obs = assemble_reference_policy_observation(
-            projected_gravity=robot.data.projected_gravity_b[0].detach().cpu().numpy(),
-            base_ang_vel=robot.data.root_link_ang_vel_b[0].detach().cpu().numpy(),
+            projected_gravity=torch_view(robot.data.projected_gravity_b)[0].detach().cpu().numpy(),
+            base_ang_vel=torch_view(robot.data.root_link_ang_vel_b)[0].detach().cpu().numpy(),
             q_minus_q_default=(q - default).detach().cpu().numpy(),
             qd=qd.detach().cpu().numpy(),
             q_ref_minus_q=(reference_position - q).detach().cpu().numpy(),
@@ -687,7 +788,7 @@ def live_body_reference_error(
     reference_pelvis = np.asarray(safe["pelvis"], dtype=np.float32)
     if reference_pelvis.shape != (3,) or not np.isfinite(reference_pelvis).all():
         return errors, 0.0
-    actual_pelvis = robot.data.body_pos_w[0, body_ids["pelvis"]]
+    actual_pelvis = torch_view(robot.data.body_pos_w)[0, body_ids["pelvis"]]
     error_vectors = []
     valid_indices = []
     for body_index, body_name in enumerate(REFERENCE_POLICY_TRACKED_BODIES):
@@ -699,13 +800,13 @@ def live_body_reference_error(
         reference_local = torch.as_tensor(
             reference - reference_pelvis, device=robot.device
         )
-        actual_local = robot.data.body_pos_w[0, body_ids[body_name]] - actual_pelvis
+        actual_local = torch_view(robot.data.body_pos_w)[0, body_ids[body_name]] - actual_pelvis
         error_vectors.append(reference_local - actual_local)
         valid_indices.append(body_index)
     if not error_vectors:
         return errors, 0.0
     error_w = torch.stack(error_vectors)
-    pelvis_quat = robot.data.body_quat_w[0, body_ids["pelvis"]]
+    pelvis_quat = torch_view(robot.data.body_quat_w)[0, body_ids["pelvis"]]
     pelvis_inv = math_utils.quat_inv(pelvis_quat.unsqueeze(0)).expand(
         len(error_vectors), -1
     )
@@ -724,7 +825,7 @@ def live_policy_collision_guard(
 
     safe = ((packet or {}).get("g1_skeleton") or {}).get("safe_positions_m") or {}
     actual = {
-        name: robot.data.body_pos_w[0, body_id].detach().cpu().numpy()
+        name: torch_view(robot.data.body_pos_w)[0, body_id].detach().cpu().numpy()
         for name, body_id in body_ids.items()
     }
     return policy_collision_action_scale_numpy(safe, actual)
@@ -732,16 +833,16 @@ def live_policy_collision_guard(
 
 def apply_fall_arrest(robot: Articulation, pelvis_body_id: int) -> None:
     """Apply a compliant safety tether while keeping gravity and foot contacts active."""
-    pos = robot.data.root_link_pos_w[0]
-    vel = robot.data.root_link_lin_vel_w[0]
+    pos = torch_view(robot.data.root_link_pos_w)[0]
+    vel = torch_view(robot.data.root_link_lin_vel_w)[0]
     up_w = math_utils.quat_apply(
-        robot.data.root_link_quat_w[0:1],
+        torch_view(robot.data.root_link_quat_w)[0:1],
         torch.tensor([[0.0, 0.0, 1.0]], device=robot.device),
     )[0]
     world_up = torch.tensor([0.0, 0.0, 1.0], device=robot.device)
     tilt_axis = torch.linalg.cross(up_w, world_up)
-    ang_vel = robot.data.root_link_ang_vel_w[0]
-    total_mass = torch.sum(robot.data.default_mass[0])
+    ang_vel = torch_view(robot.data.root_link_ang_vel_w)[0]
+    total_mass = torch.sum(torch_view(robot.data.default_mass)[0])
 
     force = torch.zeros((1, 1, 3), device=robot.device)
     force[0, 0, 0:2] = -180.0 * pos[0:2] - 35.0 * vel[0:2]
@@ -756,9 +857,14 @@ def apply_fall_arrest(robot: Articulation, pelvis_body_id: int) -> None:
     torque = torch.zeros((1, 1, 3), device=robot.device)
     torque[0, 0] = 110.0 * tilt_axis - 16.0 * ang_vel
     torque = torch.clamp(torque, -90.0, 90.0)
-    robot.set_external_force_and_torque(
-        force, torque, body_ids=[pelvis_body_id], is_global=True
-    )
+    if ISAACLAB3:
+        robot.permanent_wrench_composer.set_forces_and_torques_index(
+            force, torque, body_ids=[pelvis_body_id], is_global=True
+        )
+    else:
+        robot.set_external_force_and_torque(
+            force, torque, body_ids=[pelvis_body_id], is_global=True
+        )
 
 
 def _official_unitree_dex3_config(unitree_sim_root: Path):
@@ -770,8 +876,11 @@ def _official_unitree_dex3_config(unitree_sim_root: Path):
     if not source.is_file() or not asset.is_file() or asset.stat().st_size < 1024:
         raise FileNotFoundError(
             "Official Unitree G1-29 + Dex3 source/asset missing. Run "
-            "install/install_unitree_dex3_sim.ps1 first."
+            "install/fetch_ubuntu24_sources.sh on Ubuntu or "
+            "install/install_unitree_dex3_sim.ps1 on Windows first."
         )
+    if ISAACLAB3:
+        return g1_29dof_dex3_cfg(asset)
     previous_root = os.environ.get("PROJECT_ROOT")
     os.environ["PROJECT_ROOT"] = str(unitree_sim_root)
     try:
@@ -808,19 +917,39 @@ def design_scene(
     else:
         cfg = UNITREE_G1_23DOF_CFG.copy()
     cfg.prim_path = "/World/G1"
+    cached_usd_path = usd_path
+    if (
+        cached_usd_path is not None
+        and not cached_usd_path.is_file()
+        and cached_usd_path.suffix.lower() == ".usd"
+    ):
+        # Isaac Sim 6.1's Asset Transformer writes a composed USDA below a
+        # same-named directory even when the requested output ends in .usd.
+        transformed_path = (
+            cached_usd_path.parent
+            / cached_usd_path.stem
+            / f"{cached_usd_path.stem}.usda"
+        )
+        if transformed_path.is_file():
+            cached_usd_path = transformed_path
+
     if asset_profile == "g1_29dof_dex3":
         print(
             "Using official unitreerobotics G1-29DOF + Dex3 USD (DDS disabled)",
             flush=True,
         )
-    elif usd_path is not None and usd_path.is_file():
-        print(f"Using cached G1 USD: {usd_path}", flush=True)
-        cfg.spawn = UnitreeUsdFileCfg(usd_path=str(usd_path))
+    elif cached_usd_path is not None and cached_usd_path.is_file():
+        print(f"Using cached G1 USD: {cached_usd_path}", flush=True)
+        cfg.spawn = UnitreeUsdFileCfg(usd_path=str(cached_usd_path))
     else:
-        if os.name == "nt":
-            usd_cache = INSTALL_ROOT / "cache" / "g1_23dof"
-        else:
-            usd_cache = Path("/tmp/IsaacLab/g1_23dof")
+        usd_cache = (
+            usd_path.parent
+            if usd_path is not None
+            else INSTALL_ROOT / "cache" / "g1_23dof"
+        )
+        usd_file_name = (
+            usd_path.name if usd_path is not None else "g1_23dof_rev_1_0.usd"
+        )
         usd_cache.mkdir(parents=True, exist_ok=True)
         print(
             "Cached USD not found; converting the official URDF. "
@@ -830,7 +959,7 @@ def design_scene(
         cfg.spawn = UnitreeUrdfFileCfg(
             asset_path=str(urdf_path),
             usd_dir=str(usd_cache),
-            usd_file_name="g1_23dof_rev_1_0.usd",
+            usd_file_name=usd_file_name,
         )
     return Articulation(cfg)
 
@@ -876,7 +1005,7 @@ def main() -> None:
             "Dex3 local articulation controller ready: 14 joints, no DDS",
             flush=True,
         )
-    nominal = robot.data.default_joint_pos.clone()
+    nominal = torch_view(robot.data.default_joint_pos).clone()
     desired = nominal.clone()
     balance = BalancePolicy(
         args_cli.balance_policy.expanduser().resolve(),
@@ -1107,6 +1236,7 @@ def main() -> None:
     last_print_step_count = 0
     physics_wall_hz = 0.0
     packet_count = 0
+    profile_mismatch_warned = False
     resets = 0
     step_count = 0
     upper_indices = torch.tensor(
@@ -1125,11 +1255,11 @@ def main() -> None:
     reference_velocity = torch.zeros_like(desired)
     reference_acceleration = torch.zeros_like(desired)
     reference_lower_np = (
-        robot.data.soft_joint_pos_limits[0, upper_indices, 0]
+        torch_view(robot.data.soft_joint_pos_limits)[0, upper_indices, 0]
         .detach().cpu().numpy().astype(np.float64)
     )
     reference_upper_np = (
-        robot.data.soft_joint_pos_limits[0, upper_indices, 1]
+        torch_view(robot.data.soft_joint_pos_limits)[0, upper_indices, 1]
         .detach().cpu().numpy().astype(np.float64)
     )
     # Unitree's official G1 high-level example limits joint interpolation to
@@ -1175,6 +1305,26 @@ def main() -> None:
                 except BlockingIOError:
                     break
             now = time.monotonic()
+            if newest and newest.get("schema") == "zed_gmr_g1_23dof_live/v1":
+                bridge_profile = (newest.get("safety") or {}).get(
+                    "end_effector_profile"
+                )
+                profile_matches = bridge_profile == args_cli.asset_profile
+                # Dex3's open-hand reach is almost three times the legacy
+                # rubber-hand proxy. Never accept a command whose upstream
+                # collision envelope is missing or describes another asset.
+                if args_cli.asset_profile == "g1_29dof_dex3" and not profile_matches:
+                    if not profile_mismatch_warned:
+                        print(
+                            "REJECTED_END_EFFECTOR_PROFILE "
+                            f"bridge={bridge_profile or 'MISSING'} "
+                            f"isaac={args_cli.asset_profile}",
+                            flush=True,
+                        )
+                        profile_mismatch_warned = True
+                    newest = None
+                elif profile_matches:
+                    profile_mismatch_warned = False
             if newest and newest.get("schema") == "zed_gmr_g1_23dof_live/status/v1":
                 if newest.get("status") == "CONTROL_SESSION_RESET":
                     # R in the ZED UI invalidates the complete causal chain,
@@ -1540,8 +1690,8 @@ def main() -> None:
                 )
             if args_cli.imitation_mode != "kinematic_debug":
                 ref_q = ref_q + ref_qd * physics_dt
-            reference_low = robot.data.soft_joint_pos_limits[0, upper_indices, 0]
-            reference_high = robot.data.soft_joint_pos_limits[0, upper_indices, 1]
+            reference_low = torch_view(robot.data.soft_joint_pos_limits)[0, upper_indices, 0]
+            reference_high = torch_view(robot.data.soft_joint_pos_limits)[0, upper_indices, 1]
             clipped_ref_q = torch.clamp(ref_q, reference_low, reference_high)
             clipped = torch.abs(clipped_ref_q - ref_q) > 1.0e-8
             ref_q = clipped_ref_q
@@ -1559,13 +1709,13 @@ def main() -> None:
             reference_acceleration[0, upper_indices] = ref_qdd
             desired[0, upper_indices] = ref_q
 
-            pelvis_z = float(robot.data.root_pos_w[0, 2])
+            pelvis_z = float(torch_view(robot.data.root_pos_w)[0, 2])
             if pelvis_z < args_cli.reset_height:
-                root = robot.data.default_root_state.clone()
-                robot.write_root_pose_to_sim(root[:, :7])
-                robot.write_root_velocity_to_sim(root[:, 7:])
-                robot.write_joint_state_to_sim(
-                    robot.data.default_joint_pos, robot.data.default_joint_vel
+                root = default_root_state(robot).clone()
+                write_root_state(robot, root)
+                write_joint_state(
+                    robot,
+                    torch_view(robot.data.default_joint_pos), torch_view(robot.data.default_joint_vel)
                 )
                 desired = nominal.clone()
                 desired[0, balance.indices] = balance.default
@@ -1612,8 +1762,8 @@ def main() -> None:
                 # axes remain unchanged/neutral.
                 dex3_state = dex3_controller.write_targets(desired, now)
             desired = torch.max(
-                torch.min(desired, robot.data.soft_joint_pos_limits[:, :, 1]),
-                robot.data.soft_joint_pos_limits[:, :, 0],
+                torch.min(desired, torch_view(robot.data.soft_joint_pos_limits)[:, :, 1]),
+                torch_view(robot.data.soft_joint_pos_limits)[:, :, 0],
             )
             desired_velocity = (desired - previous_desired) / reference_step_dt
             desired_acceleration = (
@@ -1637,16 +1787,18 @@ def main() -> None:
                 # otherwise the drive advances toward its stale/default
                 # target during sim.step(), creating a visible startup twitch
                 # and roughly 0.15 rad of false tracking error with no camera.
-                root = robot.data.default_root_state.clone()
-                robot.write_root_pose_to_sim(root[:, :7])
-                robot.write_root_velocity_to_sim(torch.zeros_like(root[:, 7:]))
-                robot.write_joint_state_to_sim(
-                    desired, torch.zeros_like(robot.data.joint_vel)
+                root = default_root_state(robot).clone()
+                write_root_state(
+                    robot,
+                    torch.cat((root[:, :7], torch.zeros_like(root[:, 7:])), dim=-1),
                 )
-                robot.set_joint_position_target(desired)
+                write_joint_state(
+                    robot, desired, torch.zeros_like(torch_view(robot.data.joint_vel))
+                )
+                set_joint_position_target(robot, desired)
                 robot.write_data_to_sim()
             else:
-                robot.set_joint_position_target(desired)
+                set_joint_position_target(robot, desired)
                 robot.write_data_to_sim()
             command_applied_timestamp_ns = time.time_ns()
             sim.step()
@@ -1654,12 +1806,12 @@ def main() -> None:
             control_observed_timestamp_ns = time.time_ns()
             step_count += 1
             if pending_telemetry is not None:
-                actual = robot.data.joint_pos[0]
+                actual = torch_view(robot.data.joint_pos)[0]
                 joint_rmse = float(
                     torch.sqrt(torch.mean((actual - desired[0]) ** 2))
                 )
-                actual_velocity = robot.data.joint_vel[0]
-                default_position = robot.data.default_joint_pos[0]
+                actual_velocity = torch_view(robot.data.joint_vel)[0]
+                default_position = torch_view(robot.data.default_joint_pos)[0]
                 human_state = pending_telemetry.get("source_human_state") or {}
                 segment_quality = {
                     str(name): float(value)
@@ -1669,22 +1821,22 @@ def main() -> None:
                 reference_confidence = packet_reference_confidence(
                     pending_telemetry
                 )
-                root_quat = robot.data.root_quat_w[0].detach().cpu().numpy()
-                w, x, y, z = [float(item) for item in root_quat]
+                root_quat = torch_view(robot.data.root_quat_w)[0].detach().cpu().numpy()
+                w, x, y, z = quaternion_wxyz(root_quat)
                 roll = float(np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
                 pitch = float(np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0)))
                 applied_torque = getattr(robot.data, "applied_torque", None)
                 torque_rms = None
                 energy = None
                 if applied_torque is not None:
-                    torque = applied_torque[0]
+                    torque = torch_view(applied_torque)[0]
                     torque_rms = float(torch.sqrt(torch.mean(torque ** 2)))
                     energy = float(
-                        torch.sum(torch.abs(torque * robot.data.joint_vel[0]))
+                        torch.sum(torch.abs(torque * torch_view(robot.data.joint_vel)[0]))
                         * sim.get_physics_dt()
                     )
-                left_velocity = robot.data.body_lin_vel_w[0, left_foot_id, :2]
-                right_velocity = robot.data.body_lin_vel_w[0, right_foot_id, :2]
+                left_velocity = torch_view(robot.data.body_lin_vel_w)[0, left_foot_id, :2]
+                right_velocity = torch_view(robot.data.body_lin_vel_w)[0, right_foot_id, :2]
                 foot_slip = float(
                     0.5 * (torch.linalg.norm(left_velocity) + torch.linalg.norm(right_velocity))
                 )
@@ -1698,7 +1850,7 @@ def main() -> None:
                 )
                 if "pelvis" in safe_reference and "pelvis" in tracking_body_ids:
                     reference_pelvis = np.asarray(safe_reference["pelvis"], dtype=float)
-                    actual_pelvis = robot.data.body_pos_w[
+                    actual_pelvis = torch_view(robot.data.body_pos_w)[
                         0, tracking_body_ids["pelvis"]
                     ].detach().cpu().numpy()
                     body_errors = []
@@ -1710,7 +1862,7 @@ def main() -> None:
                             - reference_pelvis
                         )
                         actual_local = (
-                            robot.data.body_pos_w[0, body_id].detach().cpu().numpy()
+                            torch_view(robot.data.body_pos_w)[0, body_id].detach().cpu().numpy()
                             - actual_pelvis
                         )
                         actual_positions_m[body_name] = (
@@ -1730,13 +1882,13 @@ def main() -> None:
                         wrist_id = tracking_body_ids[wrist_name]
                         local_offset = torch.tensor(
                             [G1_RUBBER_HAND_ENDPOINT_OFFSET_LOCAL_M[side]],
-                            dtype=robot.data.body_pos_w.dtype,
-                            device=robot.data.body_pos_w.device,
+                            dtype=torch_view(robot.data.body_pos_w).dtype,
+                            device=torch_view(robot.data.body_pos_w).device,
                         )
                         endpoint_world = (
-                            robot.data.body_pos_w[0, wrist_id]
+                            torch_view(robot.data.body_pos_w)[0, wrist_id]
                             + math_utils.quat_apply(
-                                robot.data.body_quat_w[0, wrist_id].unsqueeze(0),
+                                torch_view(robot.data.body_quat_w)[0, wrist_id].unsqueeze(0),
                                 local_offset,
                             )[0]
                         )
@@ -1787,6 +1939,24 @@ def main() -> None:
                     ),
                     "dex3_watchdog_right": (
                         dex3_state.watchdog_right if dex3_state is not None else "DISABLED"
+                    ),
+                    "dex3_target_q_left": (
+                        dex3_state.q_left.tolist() if dex3_state is not None else None
+                    ),
+                    "dex3_target_q_right": (
+                        dex3_state.q_right.tolist() if dex3_state is not None else None
+                    ),
+                    "dex3_actual_q_left": (
+                        torch_view(robot.data.joint_pos)[
+                            0, dex3_controller.indices["left"].tolist()
+                        ].detach().cpu().numpy().astype(float).tolist()
+                        if dex3_controller is not None else None
+                    ),
+                    "dex3_actual_q_right": (
+                        torch_view(robot.data.joint_pos)[
+                            0, dex3_controller.indices["right"].tolist()
+                        ].detach().cpu().numpy().astype(float).tolist()
+                        if dex3_controller is not None else None
                     ),
                     "joint_tracking_rmse_rad": joint_rmse,
                     "body_tracking_mpjpe_m": body_mpjpe,
@@ -1900,8 +2070,8 @@ def main() -> None:
                     else np.zeros(REFERENCE_POLICY_ACTION_DIM, dtype=np.float32)
                 )
                 deployment_observation = assemble_reference_policy_observation(
-                    projected_gravity=robot.data.projected_gravity_b[0].detach().cpu().numpy(),
-                    base_ang_vel=robot.data.root_link_ang_vel_b[0].detach().cpu().numpy(),
+                    projected_gravity=torch_view(robot.data.projected_gravity_b)[0].detach().cpu().numpy(),
+                    base_ang_vel=torch_view(robot.data.root_link_ang_vel_b)[0].detach().cpu().numpy(),
                     q_minus_q_default=(
                         actual[policy_indices] - default_position[policy_indices]
                     ).detach().cpu().numpy(),
@@ -2012,12 +2182,12 @@ def main() -> None:
                     (step_count - last_print_step_count)
                     / max(now - last_print, 1.0e-6)
                 )
-                left_foot_z = float(robot.data.body_pos_w[0, left_foot_id, 2])
-                right_foot_z = float(robot.data.body_pos_w[0, right_foot_id, 2])
+                left_foot_z = float(torch_view(robot.data.body_pos_w)[0, left_foot_id, 2])
+                right_foot_z = float(torch_view(robot.data.body_pos_w)[0, right_foot_id, 2])
                 actual_delta = float(
                     torch.max(
                         torch.abs(
-                            robot.data.joint_pos[0, upper_indices]
+                            torch_view(robot.data.joint_pos)[0, upper_indices]
                             - nominal[0, upper_indices]
                         )
                     )
@@ -2025,7 +2195,7 @@ def main() -> None:
                 tracking_error = float(
                     torch.max(
                         torch.abs(
-                            robot.data.joint_pos[0, upper_indices]
+                            torch_view(robot.data.joint_pos)[0, upper_indices]
                             - desired[0, upper_indices]
                         )
                     )

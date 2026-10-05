@@ -11,9 +11,9 @@ import numpy as np
 class RoiConfig:
     forearm_scale: float = 1.45
     handward_offset: float = 0.32
-    minimum_px: int = 160
+    minimum_px: int = 128
     maximum_px: int = 420
-    fallback_px: int = 180
+    fallback_px: int = 144
 
 
 def clipped_hand_roi(

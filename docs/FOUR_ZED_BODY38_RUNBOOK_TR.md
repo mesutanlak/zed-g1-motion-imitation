@@ -1,5 +1,10 @@
 # 4 ZED 2i BODY_38 + Isaac + Rerun calistirma kaydi
 
+> Laptop rolü Windows'tan Ubuntu 24.04'e geçirilecekse sıfırdan kurulum,
+> statik Ethernet, yeni kalibrasyon ve Ubuntu başlatıcıları için önce
+> `docs/UBUNTU_LAPTOP_FOUR_CAMERA_KURULUM_TR.md` belgesini izleyin. Aşağıdaki
+> PowerShell akışı Windows laptop rolü için korunmaktadır.
+
 Bu yol iki Windows bilgisayarinda dört ZED 2i kullanir. ZED360'in ag uzerinde
 verdigi `WRONG BODY FORMAT` hatasina bagli degildir. Her ZED kendi hostunda
 BODY_38 ve dusuk hizli JPEG onizleme yayinlar; ana PC extrinsic kalibrasyonu

@@ -14,9 +14,9 @@ class MediaPipeHandBackend:
         self,
         model_path: str | Path,
         *,
-        minimum_detection_confidence: float = 0.30,
-        minimum_presence_confidence: float = 0.30,
-        minimum_tracking_confidence: float = 0.30,
+        minimum_detection_confidence: float = 0.20,
+        minimum_presence_confidence: float = 0.20,
+        minimum_tracking_confidence: float = 0.20,
         delegate: str = "cpu",
     ) -> None:
         path = Path(model_path)

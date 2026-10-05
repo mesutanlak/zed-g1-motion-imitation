@@ -125,6 +125,26 @@ def check_retarget_comparison_logging(output: Path) -> None:
             },
         }
     )
+    app._log_hand_packet(
+        {
+            "timestamp_ns": 1_010_000_000,
+            "hand_tracking": {
+                "schema": "zed_operator_hand/v1",
+                "hands": [
+                    {
+                        "side": "right",
+                        "relative_landmarks_m": [
+                            [0.0, index * 0.004, index * 0.002]
+                            for index in range(21)
+                        ],
+                        "depth_valid_count": 5,
+                        "inference_ms": 8.0,
+                        "rejection_reason": None,
+                    }
+                ],
+            },
+        }
+    )
     rr.disconnect()
     if not (output / "comparison_test.rrd").exists():
         raise AssertionError("comparison RRD was not written")

@@ -2186,6 +2186,37 @@ def main() -> int:
 
     histories: dict[int, deque[Sample]] = {item.serial: deque(maxlen=32) for item in endpoints}
     hand_histories: dict[int, deque[dict[str, Any]]] = {item.serial: deque(maxlen=32) for item in endpoints}
+    hand_rx = {
+        item.serial: {"separate": 0, "embedded": 0, "duplicate": 0, "invalid": 0}
+        for item in endpoints
+    }
+
+    def store_hand_packet(
+        serial: int,
+        document: dict[str, Any],
+        source_clock_offset_ns: int,
+        channel: str,
+    ) -> bool:
+        """Validate, timestamp-align and de-duplicate the dual hand transport."""
+        valid, _reason = validate_hand_packet(document)
+        if not valid or int(document.get("camera_serial", 0)) != int(serial):
+            hand_rx[serial]["invalid"] += 1
+            return False
+        item = dict(document)
+        item["_normalized_capture_timestamp_ns"] = (
+            int(item["capture_timestamp_ns"]) + int(source_clock_offset_ns)
+        )
+        key = (int(item.get("sequence", -1)), int(item["capture_timestamp_ns"]))
+        if any(
+            (int(old.get("sequence", -2)), int(old.get("capture_timestamp_ns", -2)))
+            == key
+            for old in hand_histories[serial]
+        ):
+            hand_rx[serial]["duplicate"] += 1
+            return True
+        hand_histories[serial].append(item)
+        hand_rx[serial][channel] += 1
+        return True
     palm_normalizer = PalmNormalizer()
     dex3_solver = None
     try:
@@ -2231,6 +2262,7 @@ def main() -> int:
     }
     last_preview_at = 0.0
     analysis_fallback_warned = False
+    hand_transport_warned = False
     started = time.monotonic()
     last_status = started
     if args.record:
@@ -2288,14 +2320,12 @@ def main() -> int:
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             invalid_packets += 1
                             continue
-                        valid, _reason = validate_hand_packet(document)
-                        if not valid or int(document.get("camera_serial", 0)) != endpoint.serial:
-                            invalid_packets += 1
-                            continue
                         latest_body = histories[endpoint.serial][-1] if histories[endpoint.serial] else None
                         offset_ns = latest_body.source_clock_offset_ns if latest_body is not None else 0
-                        document["_normalized_capture_timestamp_ns"] = int(document["capture_timestamp_ns"]) + int(offset_ns)
-                        hand_histories[endpoint.serial].append(document)
+                        if not store_hand_packet(
+                            endpoint.serial, document, offset_ns, "separate"
+                        ):
+                            invalid_packets += 1
                     continue
                 while True:
                     try:
@@ -2365,6 +2395,18 @@ def main() -> int:
                     )
                     source_metrics[endpoint.serial]["detected_body_count"] = int(
                         document.get("detected_body_count", 1) or 1
+                    )
+                    embedded_hand = document.get("hand_tracking")
+                    if isinstance(embedded_hand, dict):
+                        if not store_hand_packet(
+                            endpoint.serial,
+                            embedded_hand,
+                            source_clock_offset_ns,
+                            "embedded",
+                        ):
+                            invalid_packets += 1
+                    source_metrics[endpoint.serial]["hand_transport"] = dict(
+                        hand_rx[endpoint.serial]
                     )
                     histories[endpoint.serial].append(Sample(
                         serial=endpoint.serial,
@@ -2588,6 +2630,10 @@ def main() -> int:
                             single_view_depth=args.hand_single_view_depth,
                         )
                         fused_hands["per_camera"] = selected_hand_packets
+                        fused_hands["transport_health"] = {
+                            str(serial): dict(counts)
+                            for serial, counts in hand_rx.items()
+                        }
                         dex3_targets: dict[str, Any] = {"physical_robot_output_enabled": False}
                         for hand in fused_hands["hands"]:
                             side = hand["side"]
@@ -2785,6 +2831,22 @@ def main() -> int:
                 last_preview_at = now
 
             if now - last_status >= 1.0:
+                if (
+                    args.hand_tracking
+                    and not hand_transport_warned
+                    and now - started >= 5.0
+                    and sum(
+                        counts["separate"] + counts["embedded"]
+                        for counts in hand_rx.values()
+                    ) == 0
+                ):
+                    print(
+                        "UYARI: BODY_38 geliyor fakat 5 saniyedir EL21 paketi yok. "
+                        "Kaynaklarda --embed-hand-in-body ve el modeli durumunu kontrol edin.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    hand_transport_warned = True
                 details = ", ".join(
                     f"{item.serial}:{last_source_status.get(item.serial, 'YOK')}"
                     f"/body={source_metrics[item.serial].get('body_fps', 0.0):.1f}fps"
@@ -2810,6 +2872,9 @@ def main() -> int:
                     f"| yayilim_ms={last_arrival_spread_ms:.1f} "
                     f"| dortlu_bekleme_ms={last_full_set_wait_applied_ms:.1f} "
                     f"| rec={recorded}/drop={record_dropped}/q={record_queue.qsize()} "
+                    f"| el_rx="
+                    f"{sum(v['separate'] for v in hand_rx.values())}+"
+                    f"{sum(v['embedded'] for v in hand_rx.values())}yedek "
                     f"| durum={status_packets} | gecersiz={invalid_packets} | {details}",
                     flush=True,
                 )
@@ -2842,7 +2907,11 @@ def main() -> int:
                 pass
             item.close()
         selector.close()
-    print(f"Bitti | input={input_packets} | ham_kayit={raw_records} | fusion_cikis={fused_packets} | kayit={recorded} | drop={record_dropped}")
+    print(
+        f"Bitti | input={input_packets} | ham_kayit={raw_records} "
+        f"| fusion_cikis={fused_packets} | kayit={recorded} | drop={record_dropped} "
+        f"| el_rx={json.dumps(hand_rx, sort_keys=True)}"
+    )
     if fusion_record_file is not None:
         print(f"FUSION JSONL: {record_path}")
     if writer_errors:

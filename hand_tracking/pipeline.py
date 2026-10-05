@@ -37,6 +37,7 @@ class HandSourcePipeline:
         inference_fps: float = 8.0,
         depth_patch_radius_px: int = 4,
         maximum_depth_wrist_delta_m: float = 0.55,
+        focus_retry_scale: float = 0.65,
         asynchronous: bool = True,
     ) -> None:
         self.camera_serial = int(camera_serial)
@@ -49,6 +50,7 @@ class HandSourcePipeline:
         self.interval_ns = int(1e9 / max(inference_fps, 0.1))
         self.depth_patch_radius_px = int(depth_patch_radius_px)
         self.maximum_depth_wrist_delta_m = float(maximum_depth_wrist_delta_m)
+        self.focus_retry_scale = float(np.clip(focus_retry_scale, 0.55, 0.95))
         self.asynchronous = bool(asynchronous)
         self.last_inference_ns: int | None = None
         self._closed = False
@@ -201,10 +203,40 @@ class HandSourcePipeline:
                 inference_ms if inference_ms is not None
                 else (time.perf_counter() - started) * 1000.0
             )
+            detection_roi = roi
+            detector_attempts = 1
+            focus_retry = False
+            # Retry a miss with a tighter crop around the already operator-
+            # locked wrist. Distant and closed hands then occupy more input
+            # pixels, while successful frames still cost one inference.
+            if not candidates:
+                x, y, width, height = roi
+                focus_width = max(64, int(round(width * self.focus_retry_scale)))
+                focus_height = max(64, int(round(height * self.focus_retry_scale)))
+                inset_x = max(0, (width - focus_width) // 2)
+                inset_y = max(0, (height - focus_height) // 2)
+                focus_rgb = source["rgb"][
+                    inset_y:inset_y + focus_height,
+                    inset_x:inset_x + focus_width,
+                ]
+                if focus_rgb.shape[0] >= 64 and focus_rgb.shape[1] >= 64:
+                    retry, retry_ms = self.backends[side].detect(
+                        np.ascontiguousarray(focus_rgb), capture_timestamp_ns
+                    )
+                    inference_ms += float(retry_ms or 0.0)
+                    detector_attempts += 1
+                    if retry:
+                        candidates = retry
+                        detection_roi = (
+                            x + inset_x, y + inset_y, focus_width, focus_height
+                        )
+                        focus_retry = True
             full_candidates: list[dict[str, Any]] = []
             for candidate in candidates:
                 item = dict(candidate)
-                item["landmarks_px"] = crop_to_full(item.pop("landmarks_normalized"), roi).tolist()
+                item["landmarks_px"] = crop_to_full(
+                    item.pop("landmarks_normalized"), detection_roi
+                ).tolist()
                 full_candidates.append(item)
             selected = self.associator.select(side, full_candidates, source["wrist2d"], capture_timestamp_ns)
             if selected is None:
@@ -216,6 +248,12 @@ class HandSourcePipeline:
                         side, full_candidates, source["wrist2d"], capture_timestamp_ns
                     ),
                     "inference_ms": inference_ms,
+                    "detector_attempts": detector_attempts,
+                    "focus_retry": focus_retry,
+                    "focus_roi_xywh": (
+                        [x + inset_x, y + inset_y, focus_width, focus_height]
+                        if detector_attempts > 1 else None
+                    ),
                 })
                 continue
             points_px = np.asarray(selected["landmarks_px"], dtype=float)
@@ -268,6 +306,11 @@ class HandSourcePipeline:
                 "association_score": float(selected.get("association_score", 0.0)),
                 "projected_wrist_distance_px": float(selected.get("projected_wrist_distance_px", 0.0)),
                 "inference_ms": inference_ms,
+                "detector_attempts": detector_attempts,
+                "focus_retry": focus_retry,
+                "focus_roi_xywh": (
+                    list(detection_roi) if detector_attempts > 1 else None
+                ),
                 "rejection_reason": None,
             })
         completed_ns = time.time_ns()
