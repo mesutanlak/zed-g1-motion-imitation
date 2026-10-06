@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import socket
 import sys
 import time
@@ -1815,6 +1816,26 @@ def main() -> int:
         "Hazır. Q/ESC: çıkış | S: kayıt aç/kapat | "
         "P: Normal IK/Policy Powered | R: kişi kilidini sıfırla | D: tanı paneli"
     )
+    # Bash starts asynchronous jobs with SIGINT/SIGQUIT ignored.  Explicitly
+    # install handlers here so the two-camera launcher can still request a
+    # graceful shutdown and let the ZED SDK finalize the SVO2 index.  Use a
+    # flag instead of raising from the handler: a signal may arrive while the
+    # SDK is inside grab(), and cleanup must run exactly once on the main loop.
+    shutdown_requested = False
+
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        nonlocal shutdown_requested
+        if not shutdown_requested:
+            print(
+                f"Kapatma sinyali alindi ({signal.Signals(signum).name}); "
+                "SVO2 guvenli kapatiliyor.",
+                flush=True,
+            )
+        shutdown_requested = True
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
     camera_failed = False
     grab_failure_started: float | None = None
     last_grab_warning = 0.0
@@ -1824,7 +1845,7 @@ def main() -> int:
     corrupt_total = 0
     last_good_frame: np.ndarray | None = None
     try:
-        while True:
+        while not shutdown_requested:
             grab_result = zed.grab()
             if grab_result != sl.ERROR_CODE.SUCCESS:
                 end_of_svo = getattr(sl.ERROR_CODE, "END_OF_SVOFILE_REACHED", None)
@@ -2597,6 +2618,10 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        # Do not allow a repeated Ctrl+C to interrupt disable_recording() and
+        # leave the SVO2 container without its final index.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if record_file is not None:
             record_file.flush()
             record_file.close()
