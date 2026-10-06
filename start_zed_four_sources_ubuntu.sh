@@ -113,7 +113,10 @@ pids=()
 cleanup() {
   trap - INT TERM EXIT
   if ((${#pids[@]})); then
-    kill "${pids[@]}" 2>/dev/null || true
+    # SIGTERM Python'in finally blogunu atlayip SVO2 indeksini yarim
+    # birakabiliyor. SIGINT, KeyboardInterrupt uzerinden disable_recording()
+    # ve camera.close() calistirarak kaydi guvenli kapatir.
+    kill -INT "${pids[@]}" 2>/dev/null || true
     wait "${pids[@]}" 2>/dev/null || true
   fi
 }

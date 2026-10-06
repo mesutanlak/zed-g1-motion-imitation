@@ -65,3 +65,5 @@ ZED_G1_Projesi/
 # Rig-specific four-camera calibration and generated runtime poses stay local.
 four json/*.json
 config/zed_four/
+# Generated rig-specific planar-reference reports and accepted baselines.
+calibration/

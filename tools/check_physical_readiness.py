@@ -25,6 +25,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("quality_summary", type=Path)
     parser.add_argument("--charuco", type=Path)
+    parser.add_argument("--planar-reference", type=Path)
     parser.add_argument("--shadow", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -77,14 +78,21 @@ def main() -> int:
         )
         check(f"{channel}_journal_written_minus_decoded", equality, "==", 0.0)
 
-    if args.charuco is not None:
-        charuco = json.loads(args.charuco.read_text(encoding="utf-8"))
-        check("charuco_camera_count", charuco.get("camera_count"), ">=", 4.0)
-        check("charuco_translation_p95_m", nested(charuco, "translation_error_m", "p95"), "<=", 0.03)
-        check("charuco_rotation_p95_deg", nested(charuco, "rotation_error_deg", "p95"), "<=", 2.0)
-        check("charuco_reprojection_p95_px", nested(charuco, "reprojection_rms_px", "p95"), "<=", 2.0)
+    reference_path = args.planar_reference or args.charuco
+    if reference_path is not None:
+        reference = json.loads(reference_path.read_text(encoding="utf-8"))
+        checks.append({
+            "name": "planar_reference_metric_grade",
+            "status": "PASS" if reference.get("metric_grade") == "FULL_CORNER" else "FAIL",
+            "value": reference.get("metric_grade"),
+            "requirement": "== FULL_CORNER",
+        })
+        check("planar_reference_camera_count", reference.get("camera_count"), ">=", 4.0)
+        check("planar_reference_translation_p95_m", nested(reference, "translation_error_m", "p95"), "<=", 0.03)
+        check("planar_reference_rotation_p95_deg", nested(reference, "rotation_error_deg", "p95"), "<=", 2.0)
+        check("planar_reference_reprojection_p95_px", nested(reference, "reprojection_rms_px", "p95"), "<=", 2.0)
     elif args.phase == "physical-shadow":
-        checks.append({"name": "charuco_reference", "status": "NOT_MEASURED", "value": None, "requirement": "required"})
+        checks.append({"name": "planar_reference", "status": "NOT_MEASURED", "value": None, "requirement": "required"})
 
     if args.shadow is not None:
         ages: list[float] = []

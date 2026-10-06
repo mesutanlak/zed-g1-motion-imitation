@@ -1,0 +1,30 @@
+{
+  "schema": "zed_fixed_planar_reference/v1",
+  "target_type": "checkerboard",
+  "inner_corners": [17, 12],
+  "square_m": 0.02,
+  "outer_pattern_m": [0.36, 0.26],
+  "placement": "fixed_on_floor_in_four_camera_common_view",
+  "detection": {
+    "outer_quad_fallback": true,
+    "expected_area_fraction": 0.006,
+    "roi_normalized_by_serial": {
+      "31571870": [0.58, 0.76, 0.80, 0.98],
+      "33773329": [0.60, 0.78, 0.82, 0.995],
+      "34760587": [0.42, 0.78, 0.62, 0.98],
+      "39504762": [0.54, 0.78, 0.72, 0.98]
+    },
+    "expected_outer_quad_normalized_by_serial": {
+      "31571870": [[0.633594, 0.858333], [0.722656, 0.826389], [0.755469, 0.886111], [0.667188, 0.920139]],
+      "33773329": [[0.666406, 0.873611], [0.762500, 0.905556], [0.752344, 0.970833], [0.649219, 0.927778]],
+      "34760587": [[0.452344, 0.862500], [0.534375, 0.843056], [0.564063, 0.884722], [0.472656, 0.938889]],
+      "39504762": [[0.585156, 0.868056], [0.675781, 0.881944], [0.669531, 0.945833], [0.571875, 0.925000]]
+    }
+  },
+  "notes": [
+    "The target is a Robotiq grid used as a complete checkerboard, not an ArUco/ChArUco dictionary board.",
+    "Do not move the board after a baseline world pose has been accepted.",
+    "OUTER_QUAD_COARSE is a displacement monitor only and cannot pass the physical readiness gate.",
+    "Capture the metric reference with the full target visible at high resolution while the control pipeline is stopped."
+  ]
+}

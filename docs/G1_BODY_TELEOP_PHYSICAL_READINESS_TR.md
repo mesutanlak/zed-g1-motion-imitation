@@ -108,7 +108,53 @@ saklamak yerine `quality_summary.json/transport_integrity` içinde alınan,
 yazılan, düşen, sıra boşluğu ve kuyruk üst-seviye sayaçlarını tutar. Fiziksel
 teste geçiş için `journal_dropped=0` ve `sequence_gaps=0` aranmalıdır.
 
-## 4. Metrik ChArUco doğrulaması
+## 4. Metrik planar hedef doğrulaması
+
+### Sabit Robotiq checkerboard (bu rig)
+
+Bu rigde zemine sabitlenen hedef ChArUco değildir. Tam checkerboard olarak
+algılanır: 17x12 iç köşe, 20.0 mm kare ve 360x260 mm dış desendir. Geometri
+`config/fixed_reference_board.json` içinde sürümlenir; kabul edilmiş dünya pozu
+ise makineye/rig'e özel olduğundan üretilen raporda tutulur.
+
+Normal HD720 BODY kaydında hedefte bir kare yalnız yaklaşık 6--8 piksel kaldığı
+için tam köşe metrik referansı çıkarılmaz. Sabit dış dörtgen yine kamera/levha
+oynaması için `OUTER_QUAD_COARSE` izleyicisidir. Isaac, Rerun, fusion ve normal
+kamera kaynaklarını kapatıp iki hostta ayrı ayrı güvenli referans yakalama
+çalıştırın:
+
+```bash
+# Ana PC
+./tools/capture_fixed_reference_board_ubuntu.sh \
+  --role main-pc --resolution hd720 --fps 30 --seconds 20 --require-ptp
+
+# Laptop
+./tools/capture_fixed_reference_board_ubuntu.sh \
+  --role laptop --resolution hd720 --fps 30 --seconds 20 --require-ptp
+```
+
+Bu yerleşimde HD1080/HD2K dikey görüş alanı levhanın bir kısmını kestiğinden
+fiziksel hazırlık için gerekli `FULL_CORNER` sonucu üretmez. Tam metrik sonuç
+için levhanın yüksek çözünürlükte tüm kameralarda tam görüneceği konuma alınması
+veya daha büyük ChArUco kullanılması gerekir. Otomatik süre sonunu bekleyin;
+betik `disable_recording()` ile SVO2 indeksini güvenli kapatır. Laptopta oluşan
+`recordings/fixed_reference_*_laptop/` klasörünü ana PC'ye kopyalayın.
+
+```bash
+../envs/zed/bin/python tools/validate_fixed_reference_svo.py \
+  recordings/fixed_reference_*_main-pc/*.svo2 \
+  recordings/fixed_reference_*_laptop/*.svo2 \
+  --extrinsics config/zed_four/active_distributed_body38_extrinsics.json \
+  --frame-stride 10 \
+  --output calibration/fixed_reference_metric_report.json
+```
+
+Rapor dört kamerada algılama oranı, reprojection RMS, aynı sabit levhanın dünya
+pozundaki translation/rotation dağılımı ve kabul edilecek referans pozu içerir.
+Hedef veya kameralardan biri fiziksel olarak oynatılırsa baseline yeniden
+alınmalıdır.
+
+### Basılabilir ChArUco alternatifi
 
 Board üretin:
 
@@ -187,7 +233,7 @@ Kanıtları tek, fail-closed raporda değerlendirin:
 ../envs/zed/bin/python tools/check_physical_readiness.py \
   rerun_recordings/OTURUM/quality_summary.json \
   --phase physical-shadow \
-  --charuco calibration/charuco_metric_report.json \
+  --planar-reference calibration/fixed_reference_metric_report.json \
   --shadow hardware_recordings/g1_shadow_OTURUM.jsonl \
   --output reports/g1_physical_readiness.json
 ```
