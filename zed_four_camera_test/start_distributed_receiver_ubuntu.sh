@@ -12,7 +12,7 @@ monitor_host=""
 monitor_port=15052
 ros_host=""
 ros_port=15054
-fps=15
+fps=30
 minimum_sources=3
 preview_hz=10
 headless=0
@@ -38,7 +38,7 @@ Kullanim: start_distributed_receiver_ubuntu.sh [secenekler]
   --output-host IP [--output-port 15050]
   --monitor-host IP [--monitor-port 15052]
   --ros-host IP [--ros-port 15054]
-  --fps 1..15 --minimum-sources 2|3|4 --preview-hz HZ
+  --fps 1..30 --minimum-sources 2|3|4 --preview-hz HZ
   --workspace-x-min M --workspace-x-max M
   --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
   --disable-dex3-retargeting --disable-single-view-hand-depth

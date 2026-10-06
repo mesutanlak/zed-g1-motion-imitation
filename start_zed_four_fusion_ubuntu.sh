@@ -6,8 +6,8 @@ zed_python="${ZED_PYTHON:-$HOME/g1_isaaclab_project/envs/zed/bin/python}"
 extrinsics=""
 reference_serial="33773329"
 minimum_sources=3
-fps=15
-preview_hz=10
+fps=30
+preview_hz=8
 record=0
 headless=0
 skip_gmr_check=0
@@ -26,7 +26,7 @@ Kullanim: ./start_zed_four_fusion_ubuntu.sh [secenekler]
   --extrinsics PATH
   --reference-serial 33773329
   --minimum-sources 2|3|4
-  --fps 1..15 --preview-hz HZ
+  --fps 1..30 --preview-hz HZ
   --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
   --disable-dex3-retargeting --disable-single-view-hand-depth
   --dex3-official-root PATH --dex3-official-python PATH

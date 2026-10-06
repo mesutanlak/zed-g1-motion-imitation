@@ -8,6 +8,8 @@ signal suitable for a reference governor and an event-triggered rescue path.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
@@ -21,6 +23,9 @@ G1_TORSO_CAPSULE_RADIUS_M = 0.110
 G1_UPPER_ARM_CAPSULE_RADIUS_M = 0.038
 G1_FOREARM_CAPSULE_RADIUS_M = 0.038
 G1_HAND_CAPSULE_RADIUS_M = 0.045
+G1_DEX3_HAND_CAPSULE_RADIUS_M = 0.065
+G1_SHOULDER_CAPSULE_RADIUS_M = 0.060
+G1_WRIST_CAPSULE_RADIUS_M = 0.050
 # One circular torso capsule intentionally overbounds the official G1 trunk
 # meshes. Without this calibration the neutral forearms have only 0.014 mm
 # apparent clearance and valid front-corner motion is rejected. Exact MuJoCo
@@ -57,6 +62,64 @@ class ConfigurationBarrierProjection:
     applied: bool
     minimum_margin_m: float
     self_contact_count: int
+    sampled_configurations: int = 0
+
+
+@dataclass(frozen=True)
+class EnvironmentObstacle:
+    """Static keep-out geometry expressed in the G1/world frame."""
+
+    name: str
+    kind: str
+    center: np.ndarray
+    radius: float = 0.0
+    half_extents: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float64)
+    )
+    axis: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float64)
+    )
+
+
+def load_environment_obstacles(
+    path: str | Path | None,
+) -> tuple[EnvironmentObstacle, ...]:
+    """Load measured static keep-out geometry from a versioned JSON file."""
+    if path is None:
+        return ()
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    if document.get("schema") != "g1_collision_safety/v1":
+        raise ValueError("unsupported_collision_safety_schema")
+    result: list[EnvironmentObstacle] = []
+    for index, item in enumerate(document.get("environment_obstacles", [])):
+        kind = str(item.get("type") or "").lower()
+        if kind not in {"sphere", "capsule", "box"}:
+            raise ValueError(f"invalid_obstacle_type:{kind}")
+        center = _point(item.get("center_m", ()))
+        radius = float(item.get("radius_m", 0.0))
+        half_extents = np.asarray(
+            item.get("half_extents_m", (0.0, 0.0, 0.0)), dtype=np.float64
+        )
+        axis = np.asarray(
+            item.get("axis_half_vector_m", (0.0, 0.0, 0.0)), dtype=np.float64
+        )
+        if half_extents.shape != (3,) or axis.shape != (3,):
+            raise ValueError("invalid_obstacle_geometry")
+        if not np.isfinite(half_extents).all() or not np.isfinite(axis).all():
+            raise ValueError("nonfinite_obstacle_geometry")
+        if radius < 0.0 or np.any(half_extents < 0.0):
+            raise ValueError("negative_obstacle_extent")
+        result.append(
+            EnvironmentObstacle(
+                str(item.get("name") or f"obstacle_{index}"),
+                kind,
+                center,
+                radius,
+                half_extents,
+                axis,
+            )
+        )
+    return tuple(result)
 
 
 def _point(value: Sequence[float]) -> np.ndarray:
@@ -116,6 +179,80 @@ def capsule_margin(first: Capsule, second: Capsule) -> float:
     ) - first.radius - second.radius
 
 
+def _point_aabb_signed_distance(
+    point: np.ndarray, center: np.ndarray, half_extents: np.ndarray
+) -> float:
+    delta = np.abs(point - center) - half_extents
+    outside = float(np.linalg.norm(np.maximum(delta, 0.0)))
+    inside = float(min(max(delta), 0.0))
+    return outside + inside
+
+
+def capsule_environment_margin(
+    capsule: Capsule, obstacle: EnvironmentObstacle
+) -> float:
+    """Signed capsule-to-obstacle clearance (negative means penetration)."""
+    kind = obstacle.kind.lower()
+    if kind == "sphere":
+        other = Capsule(obstacle.center, obstacle.center, obstacle.radius)
+        return capsule_margin(capsule, other)
+    if kind == "capsule":
+        other = Capsule(
+            obstacle.center - obstacle.axis,
+            obstacle.center + obstacle.axis,
+            obstacle.radius,
+        )
+        return capsule_margin(capsule, other)
+    if kind != "box":
+        raise ValueError(f"unsupported_environment_obstacle:{obstacle.kind}")
+    # Point-to-AABB signed distance along a segment is convex. Golden-section
+    # minimization provides a stable continuous margin without discretization
+    # holes at box edges.
+    direction = capsule.end - capsule.start
+    low, high = 0.0, 1.0
+    golden = 0.6180339887498949
+    first_t = high - golden * (high - low)
+    second_t = low + golden * (high - low)
+    first_value = _point_aabb_signed_distance(
+        capsule.start + first_t * direction,
+        obstacle.center,
+        obstacle.half_extents,
+    )
+    second_value = _point_aabb_signed_distance(
+        capsule.start + second_t * direction,
+        obstacle.center,
+        obstacle.half_extents,
+    )
+    for _ in range(28):
+        if first_value <= second_value:
+            high = second_t
+            second_t, second_value = first_t, first_value
+            first_t = high - golden * (high - low)
+            first_value = _point_aabb_signed_distance(
+                capsule.start + first_t * direction,
+                obstacle.center,
+                obstacle.half_extents,
+            )
+        else:
+            low = first_t
+            first_t, first_value = second_t, second_value
+            second_t = low + golden * (high - low)
+            second_value = _point_aabb_signed_distance(
+                capsule.start + second_t * direction,
+                obstacle.center,
+                obstacle.half_extents,
+            )
+    endpoint_values = (
+        _point_aabb_signed_distance(
+            capsule.start, obstacle.center, obstacle.half_extents
+        ),
+        _point_aabb_signed_distance(
+            capsule.end, obstacle.center, obstacle.half_extents
+        ),
+    )
+    return min(first_value, second_value, *endpoint_values) - capsule.radius
+
+
 def project_configuration_along_safe_path(
     previous_safe: Sequence[float],
     candidate: Sequence[float],
@@ -138,21 +275,15 @@ def project_configuration_along_safe_path(
     if previous.shape != proposed.shape or previous.ndim != 1:
         raise ValueError("robot body projection expects matching 1-D joint arrays")
 
+    evaluations = 0
+
     def evaluate(alpha: float):
+        nonlocal evaluations
+        evaluations += 1
         q = previous + float(alpha) * (proposed - previous)
         report, contacts = evaluator(q)
         safe = int(contacts) == 0 and float(report.minimum_margin_m) >= float(clearance_m)
         return q, report, int(contacts), safe
-
-    q_candidate, report_candidate, contacts_candidate, candidate_safe = evaluate(1.0)
-    if candidate_safe:
-        return ConfigurationBarrierProjection(
-            q_candidate,
-            1.0,
-            False,
-            float(report_candidate.minimum_margin_m),
-            contacts_candidate,
-        )
 
     q_previous, report_previous, contacts_previous, previous_is_safe = evaluate(0.0)
     if not previous_is_safe:
@@ -164,19 +295,40 @@ def project_configuration_along_safe_path(
             True,
             float(report_previous.minimum_margin_m),
             contacts_previous,
+            evaluations,
         )
 
     low = 0.0
     low_q, low_report, low_contacts = q_previous, report_previous, contacts_previous
     high = 1.0
-    for index in range(1, max(2, int(coarse_steps)) + 1):
-        alpha = index / max(2, int(coarse_steps))
+    first_unsafe_found = False
+    # At least one sample per 0.04 rad of the largest joint change prevents a
+    # fast command from hopping over a narrow collision interval.
+    adaptive_steps = int(
+        np.ceil(float(np.max(np.abs(proposed - previous))) / 0.04)
+    )
+    scan_steps = min(64, max(2, int(coarse_steps), adaptive_steps))
+    for index in range(1, scan_steps + 1):
+        alpha = index / scan_steps
         q, report, contacts, safe = evaluate(alpha)
         if safe:
             low, low_q, low_report, low_contacts = alpha, q, report, contacts
             continue
         high = alpha
+        first_unsafe_found = True
         break
+    if not first_unsafe_found:
+        # The endpoint alone is insufficient evidence: a joint-space segment
+        # can enter and leave collision while both ends remain clear.  Return
+        # the candidate only after the complete adaptive sweep is clear.
+        return ConfigurationBarrierProjection(
+            low_q,
+            1.0,
+            False,
+            float(low_report.minimum_margin_m),
+            int(low_contacts),
+            evaluations,
+        )
     for _ in range(max(0, int(bisection_steps))):
         middle = 0.5 * (low + high)
         q, report, contacts, safe = evaluate(middle)
@@ -190,6 +342,7 @@ def project_configuration_along_safe_path(
         True,
         float(low_report.minimum_margin_m),
         int(low_contacts),
+        evaluations,
     )
 
 
@@ -201,6 +354,7 @@ def upper_body_capsule_report(
     positions: Mapping[str, Sequence[float]],
     *,
     warning_margin_m: float = 0.005,
+    environment_obstacles: Sequence[EnvironmentObstacle] = (),
 ) -> CollisionDistanceReport:
     """Approximate relevant G1 upper-body separation with smooth capsules.
 
@@ -249,6 +403,15 @@ def upper_body_capsule_report(
             if fore_norm > 1.0e-8
             else wrist
         )
+        hand_length = float(np.linalg.norm(hand_end - wrist))
+        hand_radius = (
+            G1_DEX3_HAND_CAPSULE_RADIUS_M
+            if hand_length > 0.12
+            else G1_HAND_CAPSULE_RADIUS_M
+        )
+        capsules[f"{side}_shoulder"] = Capsule(
+            shoulder, shoulder, G1_SHOULDER_CAPSULE_RADIUS_M, side
+        )
         capsules[f"{side}_upper"] = Capsule(
             _trim_start(shoulder, elbow, 0.32),
             elbow,
@@ -258,8 +421,11 @@ def upper_body_capsule_report(
         capsules[f"{side}_fore"] = Capsule(
             elbow, wrist, G1_FOREARM_CAPSULE_RADIUS_M, side
         )
+        capsules[f"{side}_wrist"] = Capsule(
+            wrist, wrist, G1_WRIST_CAPSULE_RADIUS_M, side
+        )
         capsules[f"{side}_hand"] = Capsule(
-            wrist, hand_end, G1_HAND_CAPSULE_RADIUS_M, side
+            wrist, hand_end, hand_radius, side
         )
 
     # Only the proximal upper arm is soft because it is attached beside the
@@ -283,6 +449,9 @@ def upper_body_capsule_report(
         ("left_fore", "right_upper", False, 0.0),
         ("left_fore", "right_fore", False, 0.0),
         ("left_hand", "right_hand", False, 0.0),
+        ("left_wrist", "right_wrist", False, 0.0),
+        ("left_wrist", "head", False, 0.0),
+        ("right_wrist", "head", False, 0.0),
     )
     margins: dict[str, float] = {}
     hard_margins: dict[str, float] = {}
@@ -302,6 +471,19 @@ def upper_body_capsule_report(
         affected = {value.arm for value in (first, second) if value.arm is not None}
         for side in affected:
             arm_margins[side] = min(arm_margins[side], effective_margin)
+    # Environment checks include the trunk/head and every arm section. Static
+    # obstacles are opt-in because their coordinates must come from a measured
+    # room/robot registration, never from a guessed camera frame.
+    for obstacle in environment_obstacles:
+        for capsule_name, capsule in capsules.items():
+            margin = capsule_environment_margin(capsule, obstacle)
+            label = f"environment:{obstacle.name}__{capsule_name}"
+            margins[label] = margin
+            hard_margins[label] = margin
+            if capsule.arm is not None:
+                arm_margins[capsule.arm] = min(
+                    arm_margins[capsule.arm], margin
+                )
     minimum = min(hard_margins.values(), default=float("inf"))
     risks = tuple(
         name for name, margin in hard_margins.items()

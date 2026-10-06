@@ -19,6 +19,12 @@ koordinatlar, G1 `raw_q/safe_q`, Rerun telemetrisi ve safety durumları için
 [güvenli canlı taklit hattı](docs/ZED_G1_SAFE_MIMIC_PIPELINE_TR.md) belgesini
 izleyin.
 
+Dört ZED 2i, 30 FPS BODY öncelikli çalışma, PTP, ayrık/sıra-denetimli Rerun
+telemetrisi, G1-29 + Dex3 collision zarfı, ChArUco metrik doğrulaması ve
+fiziksel robot shadow-mode sırası için
+[G1 BODY teleop fiziksel hazırlık rehberini](docs/G1_BODY_TELEOP_PHYSICAL_READINESS_TR.md)
+kullanın.
+
 İki ZED 2i ile resmî Fusion BODY_38, güvenli tek-görünüm fallback'i ve
 tek/çift kamera deney metrikleri için
 [dual ZED Fusion rehberini](docs/DUAL_ZED_BODY38_FUSION_TR.md) izleyin. Dual

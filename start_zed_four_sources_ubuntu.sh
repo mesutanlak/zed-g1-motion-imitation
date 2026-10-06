@@ -6,7 +6,7 @@ zed_python="${ZED_PYTHON:-$HOME/g1_isaaclab_project/envs/zed/bin/python}"
 launcher="$project/zed_four_camera_test/start_distributed_source_ubuntu.sh"
 role=""
 main_pc_host="192.168.50.10"
-fps=15
+fps=30
 model="medium"
 depth_mode="neural-light"
 frame_integrity_mode="off"
@@ -14,10 +14,11 @@ distance_min="1.0"
 distance_max="5.25"
 calibration_mode=0
 disable_calibration_distance_gate=0
-preview_hz=8
+preview_hz=4
 record_local=0
 record_svo2=0
 hand_tracking=0
+require_ptp=0
 hand_model="$project/models/hand_landmarker.task"
 
 usage() {
@@ -33,6 +34,7 @@ Kullanim: ./start_zed_four_sources_ubuntu.sh --role laptop|main-pc [secenekler]
   --preview-hz HZ
   --record-local | --record-svo2
   --hand-tracking [--hand-model PATH]
+  --require-ptp  (g1-zed-ptp.service aktif degilse baslatma)
 
 Bu betik iki kamerayi ayni terminalden yonetir. Ctrl+C ikisini de kapatir.
 EOF
@@ -54,6 +56,7 @@ while (($#)); do
     --record-local) record_local=1; shift ;;
     --record-svo2) record_svo2=1; shift ;;
     --hand-tracking) hand_tracking=1; shift ;;
+    --require-ptp) require_ptp=1; shift ;;
     --hand-model) hand_model="${2:?}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Bilinmeyen secenek: $1" >&2; usage >&2; exit 2 ;;
@@ -81,6 +84,12 @@ case "$role" in
 esac
 case "$fps" in 15|30) ;; *) echo "Dort kamera icin --fps 15 veya 30 olmali." >&2; exit 2 ;; esac
 [[ -x "$zed_python" ]] || { echo "ZED Python bulunamadi: $zed_python" >&2; exit 1; }
+if (( require_ptp )); then
+  systemctl is-active --quiet g1-zed-ptp.service || {
+    echo "PTP aktif degil. Once install/setup_ptp_sync_ubuntu24.sh calistirin." >&2
+    exit 1
+  }
+fi
 
 device_text="$($zed_python "$project/zed_g1_skeleton.py" --list-devices 2>&1)" || {
   echo "$device_text" >&2

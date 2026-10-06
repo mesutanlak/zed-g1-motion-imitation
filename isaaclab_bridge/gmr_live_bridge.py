@@ -34,19 +34,15 @@ from g1_dof_projection import (
     project_29_to_23,
 )
 from motion_pipeline.safety import (
-    G1_23_ANATOMICAL_LIMITS_RAD,
     G1_23_LIMITS_RAD,
     G1FeasibilityFilter,
     SafetyLevel,
 )
 from motion_pipeline.metrics import PacketMetrics
 from motion_pipeline.collision_geometry import (
+    load_environment_obstacles,
     project_configuration_along_safe_path,
     upper_body_capsule_report,
-)
-from motion_pipeline.mirror_rescue import (
-    KinematicEvaluation,
-    MirrorContinuationRescue,
 )
 from hand_tracking.contracts import validate_dex3_control
 
@@ -494,6 +490,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-port", type=int, default=15051)
     parser.add_argument("--telemetry-host", default=None)
     parser.add_argument("--telemetry-port", type=int, default=15053)
+    parser.add_argument("--shadow-host", default=None)
+    parser.add_argument("--shadow-port", type=int, default=15055)
     parser.add_argument(
         "--gmr-root",
         type=Path,
@@ -546,14 +544,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mirror-rescue",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Enable event-triggered arm-only continuation recovery after the "
-            "nominal deterministic GMR solve. Use --no-mirror-rescue for the "
-            "protected baseline behavior."
+            "Deprecated compatibility flag. Live MIRROR rescue was removed "
+            "after recorded A/B tests produced no accepted corrections."
         ),
     )
-    parser.add_argument("--mirror-workers", type=int, default=4)
+    parser.add_argument("--mirror-workers", type=int, default=1)
     parser.add_argument(
         "--mode", choices=("upper_body", "whole_body"), default="upper_body"
     )
@@ -573,6 +570,12 @@ def parse_args() -> argparse.Namespace:
         choices=("g1_23dof", "g1_29dof_dex3"),
         default="g1_23dof",
         help="Collision envelope matching the official Isaac articulation asset",
+    )
+    parser.add_argument(
+        "--collision-config",
+        type=Path,
+        default=PROJECT_ROOT / "config" / "g1_collision_safety.json",
+        help="Olculmus statik ortam engelleri ve G1 collision profili",
     )
     return parser.parse_args()
 
@@ -654,6 +657,81 @@ def forward_g1_skeleton(
         ):
             self_contacts += 1
     return positions, self_contacts
+
+
+def arm_singularity_metrics(
+    model: mujoco.MjModel,
+    base_qpos: np.ndarray,
+    joint_values: np.ndarray,
+    *,
+    stop_ratio: float = 0.015,
+    slowdown_ratio: float = 0.08,
+) -> dict[str, dict[str, float]]:
+    """Return positional Jacobian conditioning and a conservative speed scale.
+
+    This is the same safety principle used by realtime servo controllers: the
+    requested arm is progressively slowed when its wrist Jacobian loses rank.
+    It is measured on the official MuJoCo chain, not inferred from human elbow
+    angles.
+    """
+    data = mujoco.MjData(model)
+    data.qpos[:] = np.asarray(base_qpos, dtype=np.float64)
+    for name, value in zip(G1_23DOF_ORDER, joint_values):
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if joint_id >= 0:
+            data.qpos[int(model.jnt_qposadr[joint_id])] = float(value)
+    mujoco.mj_forward(model, data)
+    result: dict[str, dict[str, float]] = {}
+    for side in ("left", "right"):
+        wrist_id = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            f"{side}_wrist_roll_rubber_hand",
+        )
+        dofs: list[int] = []
+        for suffix in (
+            "shoulder_pitch_joint", "shoulder_roll_joint",
+            "shoulder_yaw_joint", "elbow_joint",
+        ):
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}_{suffix}"
+            )
+            if joint_id >= 0:
+                dofs.append(int(model.jnt_dofadr[joint_id]))
+        if wrist_id < 0 or len(dofs) != 4:
+            result[side] = {
+                "jacobian_ratio": 1.0,
+                "condition_number": 1.0,
+                "speed_scale": 1.0,
+            }
+            continue
+        jacobian_position = np.zeros((3, model.nv), dtype=np.float64)
+        jacobian_rotation = np.zeros((3, model.nv), dtype=np.float64)
+        mujoco.mj_jacBodyCom(
+            model, data, jacobian_position, jacobian_rotation, wrist_id
+        )
+        singular_values = np.linalg.svd(
+            jacobian_position[:, dofs], compute_uv=False
+        )
+        largest = float(max(singular_values[0], 1.0e-12))
+        smallest = float(singular_values[-1])
+        ratio = smallest / largest
+        condition = largest / max(smallest, 1.0e-12)
+        blend = float(np.clip(
+            (ratio - stop_ratio) / max(slowdown_ratio - stop_ratio, 1.0e-6),
+            0.0,
+            1.0,
+        ))
+        # Do not deadlock an exactly straight arm. A small crawl speed lets it
+        # move away from the singularity while preventing a full-speed branch
+        # flip through it.
+        speed_scale = 0.20 + 0.80 * blend
+        result[side] = {
+            "jacobian_ratio": ratio,
+            "condition_number": condition,
+            "speed_scale": speed_scale,
+        }
+    return result
 
 
 def retarget_human_visualization_positions(
@@ -758,6 +836,17 @@ def limb_direction_metrics(
 
 def main() -> int:
     args = parse_args()
+    environment_obstacles = load_environment_obstacles(args.collision_config)
+    collision_document = json.loads(
+        args.collision_config.read_text(encoding="utf-8")
+    )
+    collision_thresholds = collision_document.get("thresholds") or {}
+    singularity_stop_ratio = float(
+        collision_thresholds.get("singularity_ratio_stop", 0.015)
+    )
+    singularity_slowdown_ratio = float(
+        collision_thresholds.get("singularity_ratio_slowdown_start", 0.08)
+    )
     hand_endpoint_offsets = (
         G1_DEX3_OPEN_HAND_ENDPOINT_OFFSET_LOCAL_M
         if args.end_effector_profile == "g1_29dof_dex3"
@@ -838,6 +927,9 @@ def main() -> int:
         if args.telemetry_host
         else None
     )
+    shadow_destination = (
+        (args.shadow_host, args.shadow_port) if args.shadow_host else None
+    )
 
     nyquist_safe_hz = 0.45 * float(args.input_fps)
     max_cutoff_hz = np.minimum(
@@ -872,23 +964,18 @@ def main() -> int:
         # behavior disabled for whole-body and physical-robot paths.
         orange_return_after_s=0.35 if args.mode == "upper_body" else None,
         orange_return_tau_s=0.80,
-    )
-    mirror_rescue = MirrorContinuationRescue(
-        # The event-driven mirrored branch competed with the deterministic
-        # arm solve on 97% of this recording and made forearm tracking worse.
-        # Keep it available for whole-body experiments, never in the clean
-        # upper-body command path.
-        enabled=args.mirror_rescue and args.mode != "upper_body",
-        workers=max(1, args.mirror_workers),
-        # The measured project baseline has useful upper-body solutions below
-        # roughly 12 cm. Rescue is therefore reserved for the tail, not every
-        # nominal GMR frame.
-        residual_trigger_m=0.12,
-        collision_trigger_m=0.005,
+        collision_stop_margin_m=float(
+            collision_thresholds.get("collision_stop_margin_m", 0.0)
+        ),
+        collision_slowdown_start_m=float(
+            collision_thresholds.get("collision_slowdown_start_m", 0.03)
+        ),
     )
     packet_metrics = PacketMetrics()
     stale_watchdog_active = False
     last_update = time.monotonic()
+    last_source_timestamp_ns = 0
+    last_filter_dt_s = 1.0 / max(float(args.input_fps), 1.0)
     last_status = last_update
     accepted = 0
     rejected = 0
@@ -908,17 +995,19 @@ def main() -> int:
     def reset_control_session(reason: str) -> None:
         """Reset every causal state after operator/calibration invalidation."""
         nonlocal control_session_active, control_session_id, last_update
+        nonlocal last_source_timestamp_ns, last_filter_dt_s
         control_session_id += 1
         control_session_active = False
         adapter.reset()
         joint_filter.reset()
         feasibility.reset()
-        mirror_rescue.reset()
         hand_roll.reset()
         gmr.configuration.update(neutral_gmr_qpos.copy())
         elbow_regularizer.reset(neutral_gmr_qpos)
         arm_ik_refiner.reset(neutral_gmr_qpos)
         last_update = time.monotonic()
+        last_source_timestamp_ns = 0
+        last_filter_dt_s = 1.0 / max(float(args.input_fps), 1.0)
         status_packet = {
             "schema": "zed_gmr_g1_23dof_live/status/v1",
             "status": "CONTROL_SESSION_RESET",
@@ -1095,36 +1184,36 @@ def main() -> int:
                 rejected += 1
                 continue
 
-            human_targets = {
-                name: np.asarray(value[0], dtype=np.float64)
-                for name, value in adapted.human_data.items()
-            }
-
-            def evaluate_arm_candidate(candidate_q: np.ndarray) -> KinematicEvaluation:
-                candidate_skeleton, _ = forward_g1_skeleton(
-                    gmr.model, qpos, candidate_q, hand_endpoint_offsets
-                )
-                return KinematicEvaluation(
-                    candidate_skeleton,
-                    upper_body_capsule_report(candidate_skeleton),
-                )
-
-            mirror_result = mirror_rescue.update(
-                nominal_q=raw,
-                previous_safe_q=feasibility.safe_q,
-                targets=human_targets,
-                evaluate=evaluate_arm_candidate,
-                joint_limits=np.column_stack((
-                    G1_23_ANATOMICAL_LIMITS_RAD[:, 0] + feasibility.margin,
-                    G1_23_ANATOMICAL_LIMITS_RAD[:, 1] - feasibility.margin,
-                )),
-                residual_m=last_ik_upper_position_max_m,
-                branch_change_pending=adapter.branch_change_pending,
+            singularity_metrics = arm_singularity_metrics(
+                gmr.model,
+                qpos,
+                raw,
+                stop_ratio=singularity_stop_ratio,
+                slowdown_ratio=singularity_slowdown_ratio,
             )
-            raw = mirror_result.q
 
             now = time.monotonic()
-            dt = min(max(now - last_update, 1.0 / 120.0), 0.10)
+            source_timestamp_ns = int(frame.get("timestamp_ns", 0) or 0)
+            if (
+                last_source_timestamp_ns > 0
+                and source_timestamp_ns > last_source_timestamp_ns
+            ):
+                source_dt_s = (
+                    source_timestamp_ns - last_source_timestamp_ns
+                ) / 1.0e9
+                # A large capture gap is a watchdog event, not a request to
+                # integrate one huge filter step. Keep the causal 30 Hz target
+                # clock bounded while honoring normal timestamp variation.
+                dt = float(np.clip(
+                    source_dt_s,
+                    0.50 / max(float(args.input_fps), 1.0),
+                    2.00 / max(float(args.input_fps), 1.0),
+                ))
+            else:
+                dt = 1.0 / max(float(args.input_fps), 1.0)
+            if source_timestamp_ns > 0:
+                last_source_timestamp_ns = source_timestamp_ns
+            last_filter_dt_s = dt
             filtered = joint_filter.update(raw, dt, MAX_VELOCITY_RAD_S)
             if not np.isfinite(filtered).all():
                 # A non-finite target must never cross the simulation/robot
@@ -1210,6 +1299,16 @@ def main() -> int:
                 arm_quality_blend[side] = min(
                     arm_quality_blend.get(side, 1.0), confidence_blend
                 )
+                singularity_scale = float(
+                    singularity_metrics[side]["speed_scale"]
+                )
+                arm_quality_blend[side] = min(
+                    arm_quality_blend[side], singularity_scale
+                )
+                if singularity_scale < 0.999:
+                    arm_perception_reasons[side].append(
+                        f"{side}_arm_singularity_slowdown"
+                    )
                 if value < minimum_segment_quality:
                     arm_perception_reasons[side].append(
                         f"low_{side}_arm_fusion_confidence"
@@ -1254,7 +1353,10 @@ def main() -> int:
                 collision_skeleton, raw_self_collisions_for_safety = forward_g1_skeleton(
                     gmr.model, qpos, filtered, hand_endpoint_offsets
                 )
-            raw_collision_report = upper_body_capsule_report(collision_skeleton)
+            raw_collision_report = upper_body_capsule_report(
+                collision_skeleton,
+                environment_obstacles=environment_obstacles,
+            )
             limb_direction_error, end_effector_error = limb_direction_metrics(
                 adapted.human_data, raw_skeleton
             )
@@ -1299,7 +1401,10 @@ def main() -> int:
                 skeleton, contacts = forward_g1_skeleton(
                     gmr.model, qpos, joint_position, hand_endpoint_offsets
                 )
-                return upper_body_capsule_report(skeleton), contacts
+                return upper_body_capsule_report(
+                    skeleton,
+                    environment_obstacles=environment_obstacles,
+                ), contacts
 
             barrier_projection = project_configuration_along_safe_path(
                 previous_safe_command,
@@ -1309,7 +1414,9 @@ def main() -> int:
                 # the conservative capsule shell.  Require non-penetration at
                 # the final projection; the upstream governor already starts
                 # fading commands inside the 5 mm warning band.
-                clearance_m=0.0,
+                clearance_m=float(
+                    collision_thresholds.get("collision_stop_margin_m", 0.0)
+                ),
             )
             safe = barrier_projection.joint_position
             safety_reasons = list(feasibility_result.reasons)
@@ -1339,7 +1446,6 @@ def main() -> int:
             accepted += 1
             control_session_active = True
             last_solve_ms = (time.perf_counter() - solve_started) * 1000.0
-            source_timestamp_ns = int(frame.get("timestamp_ns", 0))
             trace_in = frame.get("latency_trace_ns") or {}
             try:
                 capture_to_windows_send_ms = max(
@@ -1437,6 +1543,11 @@ def main() -> int:
                     "hand_collision_reach_m": float(
                         np.linalg.norm(hand_endpoint_offsets["left"])
                     ),
+                    "environment_obstacle_count": len(environment_obstacles),
+                    "swept_collision_samples": int(
+                        barrier_projection.sampled_configurations
+                    ),
+                    "arm_singularity": singularity_metrics,
                 },
                 "g1_skeleton": {
                     "body_names": list(G1_SKELETON_BODIES),
@@ -1468,6 +1579,8 @@ def main() -> int:
                     ),
                     "velocity_beta": joint_filter.velocity_beta,
                     "input_fps": args.input_fps,
+                    "timestamp_filter_dt_s": last_filter_dt_s,
+                    "target_timeline_hz": float(args.input_fps),
                     "wrist_roll_calibrated": wrist_calibrated,
                     "left_elbow_regularizer_target_rad": (
                         elbow_regularizer.last_target_rad.get("left")
@@ -1523,16 +1636,13 @@ def main() -> int:
                     "right_elbow_branch_sign": adapter.last_arm_branch_sign["right"],
                     "left_wrist_orientation_quality": hand_roll.quality["left"],
                     "right_wrist_orientation_quality": hand_roll.quality["right"],
-                    "mirror_rescue_enabled": mirror_rescue.enabled,
-                    "mirror_rescue_triggered": mirror_result.triggered,
-                    "mirror_rescue_applied": mirror_result.applied,
-                    "mirror_rescue_reasons": list(mirror_result.trigger_reasons),
-                    "mirror_rescue_candidates": mirror_result.candidate_count,
-                    "mirror_rescue_solve_ms": mirror_result.solve_ms,
-                    "mirror_nominal_task_error_m": mirror_result.nominal_task_error_m,
-                    "mirror_selected_task_error_m": mirror_result.selected_task_error_m,
-                    "mirror_nominal_collision_margin_m": mirror_result.nominal_collision_margin_m,
-                    "mirror_selected_collision_margin_m": mirror_result.selected_collision_margin_m,
+                    "mirror_rescue_enabled": False,
+                    "mirror_rescue_triggered": False,
+                    "mirror_rescue_applied": False,
+                    "mirror_rescue_reasons": ["removed_after_zero_acceptance_ab_test"],
+                    "mirror_rescue_candidates": 0,
+                    "mirror_rescue_solve_ms": 0.0,
+                    "mirror_rescue_removed": True,
                     "left_wrist_roll_rad": wrist_roll["left"],
                     "right_wrist_roll_rad": wrist_roll["right"],
                     "ik_error_norm": last_ik_error,
@@ -1549,14 +1659,17 @@ def main() -> int:
                     "system_transport": packet_metrics.snapshot(),
                 },
             }
-            sender.sendto(
-                json.dumps(packet, separators=(",", ":")).encode(), destination
-            )
+            encoded_packet = json.dumps(
+                packet, separators=(",", ":")
+            ).encode()
+            # The control target is always published first. Reuse the exact
+            # encoded bytes for telemetry so JSON work cannot be doubled on
+            # the latency-critical bridge thread.
+            sender.sendto(encoded_packet, destination)
             if telemetry_destination is not None:
-                sender.sendto(
-                    json.dumps(packet, separators=(",", ":")).encode(),
-                    telemetry_destination,
-                )
+                sender.sendto(encoded_packet, telemetry_destination)
+            if shadow_destination is not None:
+                sender.sendto(encoded_packet, shadow_destination)
             if now - last_status >= 1.0:
                 print(
                     f"accepted={accepted} rejected={rejected} "

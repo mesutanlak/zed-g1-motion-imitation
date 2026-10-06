@@ -99,6 +99,7 @@ args=(
   --stream-host "$target_host"
   --stream-port "$target_port"
   --stream-max-hz "$fps"
+  --compact-stream
   --output-dir "$output_dir"
 )
 (( enforce_distance_gate )) && args+=(--enforce-distance-gate)

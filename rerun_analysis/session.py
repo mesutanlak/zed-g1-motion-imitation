@@ -84,6 +84,7 @@ IMITATION_FIELDS = (
     "pelvis_disagreement_m", "left_wrist_disagreement_m",
     "right_wrist_disagreement_m", "camera_timestamp_delta_ms",
     "joint_tracking_rmse_rad", "body_tracking_mpjpe_m", "total_control_ms",
+    "gmr_solve_ms",
     "target_jerk_rms_rad_s3", "target_jerk_max_rad_s3",
     "reference_target_error_rms_rad", "reference_target_error_max_rad",
     "reference_confidence", "reference_velocity_max_rad_s",
@@ -161,6 +162,7 @@ class AnalysisSessionWriter:
         self._fusion_mode_counts: dict[str, int] = {}
         self._safety_level_counts: dict[str, int] = {}
         self._snapshot_warning_at: dict[str, float] = {}
+        self._transport_integrity: dict[str, Any] = {}
 
         self._json = self.jsonl_path.open("w", encoding="utf-8", newline="\n")
         self._frames = self.frames_csv_path.open(
@@ -212,6 +214,8 @@ class AnalysisSessionWriter:
                 "imitation_lossless": self.imitation_jsonl_path.name,
                 "imitation_summary": self.imitation_csv_path.name,
                 "quality_summary": self.quality_summary_path.name,
+                "body_telemetry_raw": "body_telemetry_raw.jsonl",
+                "control_telemetry_raw": "control_telemetry_raw.jsonl",
             },
             "safety": "Perception analysis only; no Unitree motor commands.",
         }
@@ -299,7 +303,9 @@ class AnalysisSessionWriter:
                 "mean": sum(values) / len(values),
                 "p50": self._percentile(values, 0.50),
                 "p90": self._percentile(values, 0.90),
+                "p95": self._percentile(values, 0.95),
                 "p99": self._percentile(values, 0.99),
+                "min": min(values),
                 "max": max(values),
             }
         payload = {
@@ -310,8 +316,14 @@ class AnalysisSessionWriter:
             "fusion_mode_counts": fusion_modes,
             "safety_level_counts": safety_levels,
             "metrics": metrics,
+            "transport_integrity": self._transport_integrity,
         }
         self._write_json_snapshot(self.quality_summary_path, payload)
+
+    def set_transport_integrity(self, value: dict[str, Any]) -> None:
+        """Attach final raw-ingest counters to the manifest and summary."""
+        self._transport_integrity = _json_safe(value)
+        self.metadata["transport_integrity"] = self._transport_integrity
 
     def write_imitation(self, packet: dict[str, Any]) -> None:
         """Persist synchronized human, GMR-safe and measured Isaac geometry."""
@@ -361,6 +373,7 @@ class AnalysisSessionWriter:
             "joint_tracking_rmse_rad": isaac.get("joint_tracking_rmse_rad"),
             "body_tracking_mpjpe_m": isaac.get("body_tracking_mpjpe_m"),
             "total_control_ms": latency.get("total_control_ms"),
+            "gmr_solve_ms": bridge.get("solve_ms"),
             "target_jerk_rms_rad_s3": isaac.get("target_jerk_rms_rad_s3"),
             "target_jerk_max_rad_s3": isaac.get("target_jerk_max_rad_s3"),
             "reference_target_error_rms_rad": isaac.get(
@@ -553,7 +566,7 @@ class AnalysisSessionWriter:
             "left_wrist_disagreement_m", "right_wrist_disagreement_m",
             "camera_timestamp_delta_ms",
             "joint_tracking_rmse_rad", "body_tracking_mpjpe_m",
-            "total_control_ms", "target_jerk_rms_rad_s3",
+            "total_control_ms", "gmr_solve_ms", "target_jerk_rms_rad_s3",
             "target_jerk_max_rad_s3", "left_hand_position_error_m",
             "reference_target_error_rms_rad",
             "reference_target_error_max_rad",

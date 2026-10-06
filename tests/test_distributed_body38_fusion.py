@@ -5,7 +5,12 @@ import json
 
 import numpy as np
 
-from zed_g1_skeleton import body_in_distance_gate, detect_torn_frame
+from zed_g1_skeleton import (
+    body_in_distance_gate,
+    compact_source_network_packet,
+    detect_torn_frame,
+)
+from motion_pipeline.udp_codec import decode_json_datagram, encode_json_datagram
 
 from zed_four_camera_test.calibrate_distributed_body38 import (
     pelvis_trajectory_metrics,
@@ -149,6 +154,27 @@ def test_body38_payload_validation_checks_raw_shape_and_joint_names() -> None:
     document = packet(1, 1)
     document["keypoint_names"] = list(BODY38_NAMES[:-1])
     assert not valid_body38_payload(document)
+
+
+def test_compact_compressed_source_packet_roundtrips_and_stays_small() -> None:
+    document = packet(1, 1)
+    document["keypoints_3d_raw_m"] = document["keypoints_3d_m"]
+    document["keypoints_3d_filtered_m"] = document["keypoints_3d_m"]
+    document["root_relative_keypoints_m"] = document["keypoints_3d_m"]
+    document["shoulder_width_normalized_keypoints"] = document["keypoints_3d_m"]
+    compact = compact_source_network_packet(document)
+    encoded = encode_json_datagram(compact, compress=True)
+    decoded = decode_json_datagram(encoded)
+    assert valid_body38_payload(decoded)
+    assert decoded["sequence"] == 1
+    assert "keypoints_3d_filtered_m" not in decoded
+    assert len(encoded) < 4_000
+
+
+def test_udp_codec_keeps_plain_json_backwards_compatible() -> None:
+    document = packet(1, 7)
+    encoded = encode_json_datagram(document, compress=False)
+    assert decode_json_datagram(encoded)["sequence"] == 7
 
 
 def test_clock_offset_estimator_turns_negative_cross_host_latency_positive() -> None:

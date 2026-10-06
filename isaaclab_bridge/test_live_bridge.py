@@ -113,6 +113,7 @@ def main() -> int:
     safety_levels: Counter[str] = Counter()
     safety_reasons: Counter[str] = Counter()
     mirror_solve_ms: list[float] = []
+    bridge_solve_ms: list[float] = []
     mirror_triggered = 0
     mirror_applied = 0
     mirror_reasons: Counter[str] = Counter()
@@ -185,6 +186,9 @@ def main() -> int:
                         ), skeleton["safe_positions_m"].keys()
                     received_packets += 1
                     metrics = packet.get("bridge_metrics") or {}
+                    solve_ms = metrics.get("solve_ms")
+                    if solve_ms is not None and math.isfinite(float(solve_ms)):
+                        bridge_solve_ms.append(float(solve_ms))
                     relative = metrics.get("ik_upper_relative_residual_m")
                     absolute = metrics.get("ik_upper_position_max_m")
                     if relative is not None and math.isfinite(float(relative)):
@@ -253,6 +257,8 @@ def main() -> int:
                             f"relative_p50={np.percentile(relative_residuals, 50):.4f} "
                             f"relative_p95={np.percentile(relative_residuals, 95):.4f} "
                             f"absolute_p95={np.percentile(absolute_residuals, 95):.4f} "
+                            f"solve_p50_ms={np.percentile(bridge_solve_ms, 50):.2f} "
+                            f"solve_p95_ms={np.percentile(bridge_solve_ms, 95):.2f} "
                             f"levels={dict(safety_levels)} "
                             f"reason_counts={dict(safety_reasons)} "
                             f"raw_contact_frames={raw_contact_frames} "

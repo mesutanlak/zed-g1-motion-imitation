@@ -44,6 +44,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from motion_pipeline.calibration import to_pelvis_local
+from motion_pipeline.telemetry import AsyncJsonUdpPublisher
+from motion_pipeline.udp_codec import decode_json_datagram
 from hand_tracking.contracts import validate_hand_packet
 from hand_tracking.fusion import CameraPose, fuse_hand_packets, interpolate_landmarks
 from hand_tracking.normalization import PalmNormalizer
@@ -2061,6 +2063,12 @@ def main() -> int:
         for endpoint in endpoints:
             receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Four independent BODY_38 streams can arrive in a short burst
+            # after the same camera tick.  Keep enough kernel space for that
+            # burst while the event loop fuses the preceding bundle.
+            receiver.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024
+            )
             receiver.bind((args.bind, endpoint.port))
             receiver.setblocking(False)
             selector.register(receiver, selectors.EVENT_READ, data=("body", endpoint))
@@ -2069,6 +2077,9 @@ def main() -> int:
         for endpoint in preview_endpoints:
             receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            receiver.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024
+            )
             receiver.bind((args.bind, endpoint.port))
             receiver.setblocking(False)
             selector.register(receiver, selectors.EVENT_READ, data=("preview", endpoint))
@@ -2077,6 +2088,9 @@ def main() -> int:
         for endpoint in hand_endpoints:
             receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            receiver.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024
+            )
             receiver.bind((args.bind, endpoint.port))
             receiver.setblocking(False)
             selector.register(receiver, selectors.EVENT_READ, data=("hand", endpoint))
@@ -2095,7 +2109,41 @@ def main() -> int:
         output_targets["monitor"] = ((args.monitor_host, args.monitor_port), args.monitor_max_hz)
     if args.ros_host:
         output_targets["ros"] = ((args.ros_host, args.ros_port), args.ros_max_hz)
-    output_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if output_targets else None
+    synchronous_targets = {
+        name: value for name, value in output_targets.items()
+        if name != "monitor"
+    }
+    output_socket = (
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if synchronous_targets else None
+    )
+    if output_socket is not None:
+        output_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+
+    def encode_monitor_packet(value: dict[str, Any]) -> bytes:
+        detailed = json.dumps(
+            analysis_live_packet(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(detailed) <= UDP_SAFE_DATAGRAM_BYTES:
+            return detailed
+        return json.dumps(
+            compact_live_packet(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    monitor_publisher = (
+        AsyncJsonUdpPublisher(
+            output_targets["monitor"][0],
+            transform=encode_monitor_packet,
+            maximum_datagram_bytes=UDP_SAFE_DATAGRAM_BYTES,
+        )
+        if "monitor" in output_targets else None
+    )
     last_target_send = {name: 0.0 for name in output_targets}
     record_file = None
     if args.calibration_record:
@@ -2261,7 +2309,6 @@ def main() -> int:
         item.serial: False for item in endpoints
     }
     last_preview_at = 0.0
-    analysis_fallback_warned = False
     hand_transport_warned = False
     started = time.monotonic()
     last_status = started
@@ -2316,8 +2363,8 @@ def main() -> int:
                         except OSError:
                             break
                         try:
-                            document = json.loads(payload.decode("utf-8"))
-                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            document = decode_json_datagram(payload)
+                        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                             invalid_packets += 1
                             continue
                         latest_body = histories[endpoint.serial][-1] if histories[endpoint.serial] else None
@@ -2335,8 +2382,8 @@ def main() -> int:
                     except OSError:
                         break
                     try:
-                        document = json.loads(payload.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        document = decode_json_datagram(payload)
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                         invalid_packets += 1
                         continue
                     if not isinstance(document, dict):
@@ -2713,14 +2760,13 @@ def main() -> int:
                             )
                             / 1.0e6,
                         )
+                        if monitor_publisher is not None:
+                            packet["transport_metrics"][
+                                "monitor_publisher"
+                            ] = monitor_publisher.snapshot()
                         compact = compact_live_packet(packet)
                         compact_encoded = json.dumps(
                             compact, ensure_ascii=False, allow_nan=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                        analysis_encoded = json.dumps(
-                            analysis_live_packet(packet),
-                            ensure_ascii=False, allow_nan=False,
                             separators=(",", ":"),
                         ).encode("utf-8")
                         if len(compact_encoded) > UDP_SAFE_DATAGRAM_BYTES:
@@ -2730,40 +2776,34 @@ def main() -> int:
                                 file=sys.stderr,
                             )
                         else:
-                            if (
-                                len(analysis_encoded) > UDP_SAFE_DATAGRAM_BYTES
-                                and not analysis_fallback_warned
-                            ):
-                                print(
-                                    "UYARI: ayrintili Rerun UDP paketi siniri asti; "
-                                    "kontrol-guvenli pakete dusuldu. Lossless JSONL "
-                                    "kaydi tam kalir.",
-                                    file=sys.stderr,
-                                )
-                                analysis_fallback_warned = True
-                            # Control is deliberately sent before analysis and disk work.
+                            # Control is serialized and sent before analysis.
+                            # The detailed monitor packet is encoded on its own
+                            # worker so Rerun/disk pressure cannot stall fusion.
                             if output_socket is not None:
-                                for target_name in ("gmr", "monitor", "ros"):
-                                    target_config = output_targets.get(target_name)
+                                for target_name in ("gmr", "ros"):
+                                    target_config = synchronous_targets.get(target_name)
                                     if target_config is None:
                                         continue
                                     target, target_hz = target_config
                                     if now - last_target_send[target_name] < 0.80 / target_hz:
                                         continue
-                                    outgoing = (
-                                        analysis_encoded
-                                        if target_name == "monitor"
-                                        and len(analysis_encoded) <= UDP_SAFE_DATAGRAM_BYTES
-                                        else compact_encoded
-                                    )
                                     try:
-                                        output_socket.sendto(outgoing, target)
+                                        output_socket.sendto(compact_encoded, target)
                                         last_target_send[target_name] = now
                                     except OSError as exc:
                                         print(
                                             f"UYARI: {target_name} UDP gonderilemedi: {exc}",
                                             file=sys.stderr,
                                         )
+                            monitor_config = output_targets.get("monitor")
+                            if (
+                                monitor_publisher is not None
+                                and monitor_config is not None
+                                and now - last_target_send["monitor"]
+                                >= 0.80 / monitor_config[1]
+                                and monitor_publisher.submit(packet)
+                            ):
+                                last_target_send["monitor"] = now
                             output_sequence += 1
                             fused_packets += 1
                             output_events.append(now)
@@ -2890,6 +2930,8 @@ def main() -> int:
             record_file.close()
         if output_socket is not None:
             output_socket.close()
+        if monitor_publisher is not None:
+            monitor_publisher.close()
         if fusion_record_file is not None:
             recording = False
             record_queue.join()

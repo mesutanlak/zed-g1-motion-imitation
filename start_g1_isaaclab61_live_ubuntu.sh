@@ -10,7 +10,7 @@ mode="upper_body"
 imitation_mode="kinematic_debug"
 runtime_profile="shared_gpu_safe"
 stance_mode="fixed_double_support"
-input_fps="15"
+input_fps="30"
 upper_cutoff_hz="10"
 upper_min_cutoff_hz="2"
 upper_velocity_beta="1.2"
@@ -28,15 +28,14 @@ reference_stationary_deadband_scale="1"
 stale_return_delay="0.25"
 stale_return_tau="0.60"
 render_interval="8"
-mirror_workers="4"
 max_steps="0"
 headless=0
 accept_eula=0
 no_fall_arrest=0
-no_mirror_rescue=0
 no_anatomical_branch_continuity=0
 restrict_backward_arms=0
-asset_profile="g1_23dof"
+hardware_shadow=0
+asset_profile="g1_29dof_dex3"
 
 usage() {
   cat <<'EOF'
@@ -51,9 +50,9 @@ Kullanim: ./start_g1_isaaclab61_live_ubuntu.sh --accept-nvidia-eula [secenekler]
   --asset-profile g1_23dof|g1_29dof_dex3
   --max-steps N
   --no-fall-arrest
-  --no-mirror-rescue
   --no-anatomical-branch-continuity
   --restrict-backward-arms
+  --hardware-shadow   (127.0.0.1:15055 hedef kopyasi; motor komutu yok)
 EOF
 }
 
@@ -83,13 +82,12 @@ while [[ $# -gt 0 ]]; do
     --stale-return-delay) stale_return_delay="${2:?}"; shift 2 ;;
     --stale-return-tau) stale_return_tau="${2:?}"; shift 2 ;;
     --render-interval) render_interval="${2:?}"; shift 2 ;;
-    --mirror-workers) mirror_workers="${2:?}"; shift 2 ;;
     --max-steps) max_steps="${2:?}"; shift 2 ;;
     --headless) headless=1; shift ;;
     --no-fall-arrest) no_fall_arrest=1; shift ;;
-    --no-mirror-rescue) no_mirror_rescue=1; shift ;;
     --no-anatomical-branch-continuity) no_anatomical_branch_continuity=1; shift ;;
     --restrict-backward-arms) restrict_backward_arms=1; shift ;;
+    --hardware-shadow) hardware_shadow=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Bilinmeyen secenek: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -118,6 +116,10 @@ balance_config="$project/policies/g1_23dof_velocity/deploy.yaml"
 reference_policy="$project/policies/g1_reference_upper_body/policy.onnx"
 reference_metadata="$project/policies/g1_reference_upper_body/policy_metadata.json"
 
+if [[ "$asset_profile" == "g1_29dof_dex3" ]]; then
+  urdf="$root/repos/xr_teleoperate/assets/g1/g1_body29_hand14.urdf"
+fi
+
 for required in "$urdf" "$balance_policy" "$balance_config"; do
   [[ -f "$required" ]] || { echo "Gerekli dosya bulunamadi: $required" >&2; exit 1; }
 done
@@ -144,7 +146,8 @@ bridge_args=(
   --stationary-deadband-scale "$stationary_deadband_scale"
   --human-height "$human_height" --no-gmr-velocity-limit
 )
-(( no_mirror_rescue )) && bridge_args+=(--no-mirror-rescue) || bridge_args+=(--mirror-rescue --mirror-workers "$mirror_workers")
+(( hardware_shadow )) && bridge_args+=(--shadow-host 127.0.0.1 --shadow-port 15055)
+bridge_args+=(--no-mirror-rescue)
 (( no_anatomical_branch_continuity )) && bridge_args+=(--no-anatomical-branch-continuity) || bridge_args+=(--anatomical-branch-continuity)
 (( restrict_backward_arms )) && bridge_args+=(--restrict-backward-arms) || bridge_args+=(--no-restrict-backward-arms)
 

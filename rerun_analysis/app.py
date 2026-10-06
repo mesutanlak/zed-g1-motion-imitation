@@ -6,7 +6,6 @@ import argparse
 import json
 import queue
 import shutil
-import socket
 import sys
 import sysconfig
 import threading
@@ -35,6 +34,7 @@ from rerun_analysis.model import (  # noqa: E402
     joint_angle_names,
 )
 from rerun_analysis.session import AnalysisSessionWriter  # noqa: E402
+from rerun_analysis.transport import LatestUdpReceiver  # noqa: E402
 from hand_tracking.rerun_output import HAND_EDGES  # noqa: E402
 
 
@@ -75,6 +75,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "rerun_recordings"
+    )
+    parser.add_argument(
+        "--rrd-path", type=Path, default=None,
+        help="Harici Rerun sunucusunun yazdigi RRD yolu",
+    )
+    parser.add_argument(
+        "--rerun-grpc-url", default=None,
+        help="Ayrik Rerun kayit sunucusu (or. rerun+http://127.0.0.1:9876/proxy)",
     )
     parser.add_argument("--svo2", type=Path, default=None, help="İlişkili özgün ZED SVO2")
     parser.add_argument("--no-viewer", action="store_true")
@@ -274,9 +282,18 @@ class RerunSkeletonApp:
         )
         stamp = time.strftime("%Y%m%d_%H%M%S")
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        self.rrd_path = args.output_dir / f"rerun_body38_{stamp}.rrd"
+        self.rrd_path = (
+            args.rrd_path.expanduser().resolve()
+            if args.rrd_path is not None
+            else args.output_dir / f"rerun_body38_{stamp}.rrd"
+        )
         rr.init("zed_g1_body38_rerun_analysis")
-        if not args.no_viewer:
+        if args.rerun_grpc_url:
+            # The standalone Rerun server owns RRD persistence.  A viewer can
+            # connect to that server independently and may be killed/restarted
+            # without touching this analysis/telemetry process.
+            rr.set_sinks(rr.GrpcSink(args.rerun_grpc_url))
+        elif not args.no_viewer:
             rr.spawn(executable_path=str(find_rerun_viewer()))
             rr.set_sinks(rr.GrpcSink(), rr.FileSink(self.rrd_path))
         else:
@@ -299,6 +316,27 @@ class RerunSkeletonApp:
             svo2_path=args.svo2,
             config=self.config.snapshot(),
         )
+        self.body_receiver: LatestUdpReceiver | None = None
+        self.control_receiver: LatestUdpReceiver | None = None
+        if not args.input and not args.demo:
+            self.body_receiver = LatestUdpReceiver(
+                args.listen_host,
+                args.listen_port,
+                channel="body",
+                journal_path=self.writer.session_dir / "body_telemetry_raw.jsonl",
+                allowed_schemas=("zed_body38_live/v1",),
+                require_keypoints=True,
+            )
+            self.control_receiver = LatestUdpReceiver(
+                args.gmr_listen_host,
+                args.gmr_listen_port,
+                channel="control",
+                journal_path=self.writer.session_dir / "control_telemetry_raw.jsonl",
+                allowed_schemas=(
+                    "zed_gmr_g1_23dof_live/v1",
+                    "zed_gmr_g1_23dof_isaac_telemetry/v1",
+                ),
+            )
         self.worker = threading.Thread(target=self._run_source, daemon=True)
         self.gmr_worker = threading.Thread(target=self._run_gmr_telemetry, daemon=True)
 
@@ -576,28 +614,20 @@ class RerunSkeletonApp:
             writer.write_imitation(packet)
 
     def _run_gmr_telemetry(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        sock.bind((self.args.gmr_listen_host, self.args.gmr_listen_port))
-        sock.settimeout(0.2)
+        receiver = self.control_receiver
+        if receiver is None:
+            return
         drain_deadline = None
-        try:
-            while True:
-                if self.stop_event.is_set() and drain_deadline is None:
-                    # Isaac telemetry trails the source stream slightly. Drain
-                    # the socket before quality_summary is finalized.
-                    drain_deadline = time.monotonic() + 0.60
-                if drain_deadline is not None and time.monotonic() >= drain_deadline:
-                    break
-                try:
-                    payload, _ = sock.recvfrom(2_000_000)
-                except socket.timeout:
-                    continue
-                try:
-                    packet = json.loads(payload.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
+        while True:
+            if self.stop_event.is_set() and drain_deadline is None:
+                # Isaac telemetry trails the source stream slightly. The raw
+                # ingest thread keeps draining while this worker finishes its
+                # last sampled Rerun/CSV rows.
+                drain_deadline = time.monotonic() + 0.60
+            if drain_deadline is not None and time.monotonic() >= drain_deadline:
+                break
+            packets = receiver.take_all_latest(timeout_s=0.2)
+            for packet in packets:
                 if packet.get("schema") in {
                     "zed_gmr_g1_23dof_live/v1",
                     "zed_gmr_g1_23dof_isaac_telemetry/v1",
@@ -632,8 +662,6 @@ class RerunSkeletonApp:
                             time.monotonic() + 0.20,
                             drain_deadline + 0.10,
                         )
-        finally:
-            sock.close()
 
     def _log_hand_packet(self, source: dict[str, Any]) -> None:
         """Log fused 21-landmark hands and safe Dex3 analysis targets."""
@@ -1109,39 +1137,13 @@ class RerunSkeletonApp:
         )
 
     def _receive_udp(self) -> Iterable[dict[str, Any]]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        sock.bind((self.args.listen_host, self.args.listen_port))
-        sock.settimeout(0.2)
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    payload, _address = sock.recvfrom(2_000_000)
-                except socket.timeout:
-                    continue
-                # Rendering and RRD writes are intentionally slower than the
-                # lossless 15 Hz JSONL recorder.  Never replay an accumulated
-                # UDP backlog: drain it and visualize the newest complete
-                # sample so the live window remains current instead of several
-                # seconds behind the robot.
-                sock.setblocking(False)
-                try:
-                    while True:
-                        newest, _address = sock.recvfrom(2_000_000)
-                        payload = newest
-                except BlockingIOError:
-                    pass
-                finally:
-                    sock.settimeout(0.2)
-                try:
-                    packet = json.loads(payload.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if "keypoint_names" in packet:
-                    yield packet
-        finally:
-            sock.close()
+        receiver = self.body_receiver
+        if receiver is None:
+            return
+        while not self.stop_event.is_set():
+            packet = receiver.take_latest(timeout_s=0.2)
+            if packet is not None:
+                yield packet
 
     def _run_source(self) -> None:
         packets = (
@@ -1220,6 +1222,10 @@ class RerunSkeletonApp:
             self.stop_event.set()
 
     def start(self) -> int:
+        if self.body_receiver is not None:
+            self.body_receiver.start()
+        if self.control_receiver is not None:
+            self.control_receiver.start()
         self.worker.start()
         if not self.args.input and not self.args.demo:
             self.gmr_worker.start()
@@ -1231,6 +1237,12 @@ class RerunSkeletonApp:
         self.worker.join(timeout=3.0)
         if self.gmr_worker.is_alive():
             self.gmr_worker.join(timeout=2.0)
+        ingest_statistics = {}
+        for receiver in (self.body_receiver, self.control_receiver):
+            if receiver is not None:
+                receiver.close()
+                ingest_statistics[receiver.channel] = receiver.snapshot()
+        self.writer.set_transport_integrity(ingest_statistics)
         self.writer.close()
         rr.disconnect()
         print(f"Rerun RRD: {self.rrd_path}")

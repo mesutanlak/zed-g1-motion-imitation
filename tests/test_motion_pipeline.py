@@ -14,7 +14,10 @@ from motion_pipeline.metrics import PerceptionMetrics, latency_breakdown_ms
 from motion_pipeline.operator_selector import OperatorSelector, OperatorState
 from motion_pipeline.safety import G1FeasibilityFilter, G1_23_LIMITS_RAD
 from motion_pipeline.collision_geometry import (
+    Capsule,
     CollisionDistanceReport,
+    EnvironmentObstacle,
+    capsule_environment_margin,
     project_configuration_along_safe_path,
     segment_segment_distance,
     upper_body_capsule_report,
@@ -379,6 +382,17 @@ def test_feasibility_projects_limits_and_slew() -> None:
     assert np.all(result.safe_q >= G1_23_LIMITS_RAD[:, 0])
 
 
+def test_collision_distance_scales_arm_motion_to_zero_at_stop_margin() -> None:
+    filter_ = G1FeasibilityFilter(
+        collision_stop_margin_m=0.0,
+        collision_slowdown_start_m=0.03,
+    )
+    assert filter_._collision_blend(0.03) == 1.0
+    assert np.isclose(filter_._collision_blend(0.015), 0.5)
+    assert filter_._collision_blend(0.0) == 0.0
+    assert filter_._collision_blend(-0.001) == 0.0
+
+
 def test_straight_g1_elbows_do_not_degrade_the_whole_reference() -> None:
     filter_ = G1FeasibilityFilter()
     command = np.zeros(23, dtype=np.float64)
@@ -456,6 +470,27 @@ def test_capsule_segment_distance_is_continuous() -> None:
     assert abs(separated - 0.2) < 1.0e-9
 
 
+def test_environment_box_reports_capsule_clearance_and_penetration() -> None:
+    box = EnvironmentObstacle(
+        "table",
+        "box",
+        np.asarray([0.0, 0.0, 0.0]),
+        half_extents=np.asarray([0.2, 0.2, 0.2]),
+    )
+    clear = Capsule(
+        np.asarray([0.5, -0.1, 0.0]),
+        np.asarray([0.5, 0.1, 0.0]),
+        0.05,
+    )
+    crossing = Capsule(
+        np.asarray([-0.5, 0.0, 0.0]),
+        np.asarray([0.5, 0.0, 0.0]),
+        0.05,
+    )
+    assert np.isclose(capsule_environment_margin(clear, box), 0.25, atol=1e-4)
+    assert capsule_environment_margin(crossing, box) < 0.0
+
+
 def test_robot_body_barrier_keeps_largest_safe_command_prefix() -> None:
     def evaluator(q):
         # Synthetic contact starts at q=0.6; the 5 mm shell starts at 0.55.
@@ -475,6 +510,28 @@ def test_robot_body_barrier_keeps_largest_safe_command_prefix() -> None:
     assert 0.54 <= projected.joint_position[0] <= 0.551
     assert projected.minimum_margin_m >= 0.005 - 1.0e-5
     assert projected.self_contact_count == 0
+
+
+def test_robot_body_barrier_detects_collision_between_two_safe_endpoints() -> None:
+    def evaluator(q):
+        # Both q=0 and q=1 are clear, but the swept motion crosses a narrow
+        # forbidden interval centered on q=0.5.
+        margin = abs(float(q[0]) - 0.5) - 0.08
+        report = CollisionDistanceReport(
+            margin,
+            {"swept_obstacle": margin},
+            {"left": margin, "right": float("inf")},
+            ("swept_obstacle",) if margin < 0.005 else (),
+        )
+        return report, int(margin < 0.0)
+
+    projected = project_configuration_along_safe_path(
+        [0.0], [1.0], evaluator, clearance_m=0.0
+    )
+    assert projected.applied is True
+    assert 0.41 <= projected.joint_position[0] <= 0.421
+    assert projected.alpha < 1.0
+    assert projected.sampled_configurations >= 3
 
 
 def test_forearm_across_torso_is_a_hard_robot_body_barrier() -> None:

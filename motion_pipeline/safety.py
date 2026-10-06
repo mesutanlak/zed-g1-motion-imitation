@@ -69,6 +69,8 @@ class G1FeasibilityFilter:
         orange_return_after_s: float | None = None,
         orange_return_tau_s: float = 0.80,
         arm_blend_recovery_tau_s: float = 0.18,
+        collision_stop_margin_m: float = 0.0,
+        collision_slowdown_start_m: float = 0.030,
     ) -> None:
         self.nominal = np.zeros(23) if nominal_q is None else np.asarray(list(nominal_q), dtype=np.float64)
         if self.nominal.shape != (23,):
@@ -86,6 +88,10 @@ class G1FeasibilityFilter:
         self.arm_blend_recovery_tau_s = float(
             max(0.02, arm_blend_recovery_tau_s)
         )
+        self.collision_stop_margin_m = float(collision_stop_margin_m)
+        self.collision_slowdown_start_m = float(
+            max(collision_slowdown_start_m, collision_stop_margin_m + 1.0e-6)
+        )
         self.safe_q: np.ndarray | None = None
         self.velocity = np.zeros(23, dtype=np.float64)
         self.last_reliable: np.ndarray | None = None
@@ -101,16 +107,18 @@ class G1FeasibilityFilter:
         self.arm_collision_elapsed_s = {"left": 0.0, "right": 0.0}
         self.arm_blend_state = {"left": 1.0, "right": 1.0}
 
-    @staticmethod
-    def _collision_blend(margin_m: float) -> float:
+    def _collision_blend(self, margin_m: float) -> float:
         """Continuous reference-governor blend from signed capsule margin."""
-        if not np.isfinite(margin_m) or margin_m >= 0.030:
+        if not np.isfinite(margin_m) or margin_m >= self.collision_slowdown_start_m:
             return 1.0
-        if margin_m >= 0.0:
-            return float(0.35 + 0.65 * margin_m / 0.030)
-        if margin_m >= -0.020:
-            return float(0.05 + 0.30 * (margin_m + 0.020) / 0.020)
-        return 0.0
+        if margin_m <= self.collision_stop_margin_m:
+            return 0.0
+        return float(np.clip(
+            (margin_m - self.collision_stop_margin_m)
+            / (self.collision_slowdown_start_m - self.collision_stop_margin_m),
+            0.0,
+            1.0,
+        ))
 
     def update(
         self,

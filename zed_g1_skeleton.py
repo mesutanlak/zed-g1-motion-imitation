@@ -30,6 +30,7 @@ except ImportError:  # Windows console hotkeys are optional on other platforms.
 from motion_pipeline.arm_chain import ArmChainOptimizer
 from motion_pipeline.calibration import CalibrationManager, to_pelvis_local
 from motion_pipeline.metrics import PerceptionMetrics
+from motion_pipeline.udp_codec import encode_json_datagram
 from motion_pipeline.operator_selector import OperatorSelector, OperatorState
 
 # Hand modules do not import MediaPipe until the feature is explicitly enabled.
@@ -468,6 +469,41 @@ def sanitize_for_json(value: Any) -> Any:
             "height": int(value.height),
         }
     return value
+
+
+SOURCE_NETWORK_FIELDS = (
+    "schema", "source_serial", "source_host_id", "sequence", "timestamp_ns",
+    "coordinate_system", "units", "body_id", "unique_object_id",
+    "tracking_state", "action_state", "body_confidence", "root_position_m",
+    "global_root_orientation_xyzw", "keypoint_names", "keypoints_3d_m",
+    "keypoint_confidence", "keypoints_covariance",
+    "local_orientation_per_joint_xyzw", "pelvis_frame", "operator_selection",
+    "calibration", "occlusion_analysis", "perception_metrics",
+    "control_mode_request", "distance_quality", "euclidean_distance_m",
+    "latency_trace_ns", "transport_metrics", "hand_tracking", "dex3_targets",
+    "dex3_control",
+)
+
+
+def _quantize_network_floats(value: Any) -> Any:
+    """Bound payload size at precision far below ZED depth uncertainty."""
+    if isinstance(value, dict):
+        return {key: _quantize_network_floats(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_quantize_network_floats(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return round(number, 6) if math.isfinite(number) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
+def compact_source_network_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Minimal four-camera source contract; local JSONL remains lossless."""
+    return _quantize_network_floats({
+        key: packet[key] for key in SOURCE_NETWORK_FIELDS if key in packet
+    })
 
 
 def zed_value(value: Any) -> Any:
@@ -1092,6 +1128,15 @@ def parse_args() -> argparse.Namespace:
         help="BODY_38 UDP hedef portu (varsayılan: 15050)",
     )
     parser.add_argument(
+        "--compact-stream",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Dort-kamera Ethernet yolu icin gerekli BODY alanlarini 6 ondaliga "
+            "indir ve G1Z1/zlib olarak gonder; yerel JSONL/SVO2 degismez"
+        ),
+    )
+    parser.add_argument(
         "--hand-tracking", action=argparse.BooleanOptionalAction, default=False,
         help="Kilitli operator bilek ROI'lerinde 21-landmark el takibini ac",
     )
@@ -1486,6 +1531,9 @@ def main() -> int:
                 raise ValueError("--hand-stream-host veya --stream-host gerekli")
             hand_target = (destination_host, args.hand_stream_port)
             hand_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            hand_socket.setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024
+            )
             if args.dex3_retargeting:
                 single_camera_dex3 = SingleCameraDex3Pipeline(args.dex3_config)
             print(
@@ -1594,6 +1642,10 @@ def main() -> int:
         if stream_targets
         else None
     )
+    if stream_socket is not None:
+        stream_socket.setsockopt(
+            socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024
+        )
     preview_target = (
         (args.preview_stream_host, args.preview_stream_port)
         if args.preview_stream_host
@@ -1604,6 +1656,10 @@ def main() -> int:
         if preview_target is not None
         else None
     )
+    if preview_socket is not None:
+        preview_socket.setsockopt(
+            socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024
+        )
     last_preview_stream_time = 0.0
     preview_streamed_frames = 0
     last_target_stream_time = {target: 0.0 for target in stream_targets}
@@ -2100,13 +2156,18 @@ def main() -> int:
                 # Run 21-landmark inference only for the already locked BODY_38
                 # operator.  Full RGB never leaves this camera process; only the
                 # compact, separately versioned hand datagram is transmitted.
-                if hand_pipeline is not None and hand_pipeline.due(timestamp_ns):
+                if hand_pipeline is not None:
                     depth_image = None
-                    depth_result = zed.retrieve_measure(hand_depth, sl.MEASURE.DEPTH)
-                    if depth_result == sl.ERROR_CODE.SUCCESS:
-                        # HandSourcePipeline copies only the two ROI slices
-                        # before queueing; avoid a full 720p depth copy here.
-                        depth_image = np.asarray(hand_depth.get_data())
+                    if hand_pipeline.due(timestamp_ns):
+                        depth_result = zed.retrieve_measure(
+                            hand_depth, sl.MEASURE.DEPTH
+                        )
+                        if depth_result == sl.ERROR_CODE.SUCCESS:
+                            # Depth is needed only when a new inference job is
+                            # submitted. Completed async results are polled on
+                            # every BODY frame below, avoiding one complete
+                            # 8 Hz period of artificial result age.
+                            depth_image = np.asarray(hand_depth.get_data())
                     try:
                         hand_packet = hand_pipeline.process(
                             frame, depth_image,
@@ -2297,12 +2358,11 @@ def main() -> int:
                                 target_packet["dex3_targets"] = record[
                                     "dex3_targets"
                                 ]
-                        payload = json.dumps(
-                            target_packet,
-                            ensure_ascii=False,
-                            allow_nan=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
+                        payload = encode_json_datagram(
+                            compact_source_network_packet(target_packet)
+                            if args.compact_stream else target_packet,
+                            compress=args.compact_stream,
+                        )
                         if (
                             len(payload) > 60000
                             and target_packet.get("hand_tracking") is not None
@@ -2314,12 +2374,11 @@ def main() -> int:
                             # available and the counter makes the loss visible.
                             target_packet = dict(target_packet)
                             target_packet.pop("hand_tracking", None)
-                            payload = json.dumps(
-                                target_packet,
-                                ensure_ascii=False,
-                                allow_nan=False,
-                                separators=(",", ":"),
-                            ).encode("utf-8")
+                            payload = encode_json_datagram(
+                                compact_source_network_packet(target_packet)
+                                if args.compact_stream else target_packet,
+                                compress=args.compact_stream,
+                            )
                             hand_embed_oversize_fallbacks += 1
                         if len(payload) > 60000:
                             oversized_targets.append(

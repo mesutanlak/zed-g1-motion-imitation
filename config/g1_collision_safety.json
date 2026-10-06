@@ -1,0 +1,17 @@
+{
+  "schema": "g1_collision_safety/v1",
+  "coordinate_system": "G1_WORLD_RIGHT_HANDED_Z_UP_X_FORWARD",
+  "robot": {
+    "model": "Unitree G1 29-DOF + Dex3-1",
+    "official_urdf": "repos/xr_teleoperate/assets/g1/g1_body29_hand14.urdf",
+    "official_isaac_asset": "repos/unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd"
+  },
+  "thresholds": {
+    "collision_stop_margin_m": 0.0,
+    "collision_slowdown_start_m": 0.03,
+    "singularity_ratio_stop": 0.015,
+    "singularity_ratio_slowdown_start": 0.08
+  },
+  "environment_obstacles": [],
+  "instructions": "Ortam engellerini ancak kamera-world ile G1-world kaydi olculdukten sonra sphere, capsule veya box olarak ekleyin. Bos liste ortam carpisma kontrolunu devre disi birakir; self-collision her zaman aktiftir."
+}
