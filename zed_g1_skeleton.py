@@ -482,7 +482,8 @@ SOURCE_NETWORK_FIELDS = (
     "calibration", "occlusion_analysis", "perception_metrics",
     "control_mode_request", "distance_quality", "euclidean_distance_m",
     "latency_trace_ns", "transport_metrics", "hand_tracking", "dex3_targets",
-    "dex3_control",
+    "dex3_control", "imu",
+    "source_configuration",
 )
 
 
@@ -2280,6 +2281,12 @@ def main() -> int:
                             "schema": "zed_body38_live/v1",
                             "source_serial": source_serial,
                             "source_host_id": str(args.source_host_id),
+                            "source_configuration": {
+                                "fps": int(args.fps),
+                                "body_model": str(args.model),
+                                "depth_mode": str(args.depth_mode),
+                                "frame_integrity_mode": str(args.frame_integrity_mode),
+                            },
                             "sequence": frame_index,
                             "timestamp_ns": timestamp_ns,
                             "coordinate_system": record["coordinate_system"],

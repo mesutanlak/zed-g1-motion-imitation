@@ -223,6 +223,22 @@ def parse_endpoint(value: str) -> InputEndpoint:
     return InputEndpoint(serial, port)
 
 
+def parse_source_priority(value: str) -> tuple[int, float]:
+    """Parse ``SERIAL:WEIGHT`` without coupling calibration to host names."""
+    try:
+        serial_text, weight_text = value.strip().split(":", 1)
+        serial, weight = int(serial_text), float(weight_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Kaynak onceligi SERIAL:AGIRLIK biciminde olmali."
+        ) from exc
+    if serial <= 0 or not math.isfinite(weight) or not 0.0 < weight <= 4.0:
+        raise argparse.ArgumentTypeError(
+            "Kaynak onceliginde SERIAL pozitif, AGIRLIK 0-4 araliginda olmali."
+        )
+    return serial, weight
+
+
 def vector(value: Any, length: int) -> np.ndarray:
     try:
         result = np.asarray(value, dtype=np.float64)
@@ -850,11 +866,52 @@ def weighted_quaternion_average_xyzw(
     return averaged / norm if norm >= 1.0e-8 else reference.copy()
 
 
+def source_priority_for_joint(
+    serial: int,
+    *,
+    side: str | None,
+    state: dict[str, Any] | None,
+    arm_states: dict[int, dict[str, Any]] | None,
+    source_priorities: dict[int, float] | None,
+    recover_clear_secondary_views: bool,
+) -> tuple[float, bool]:
+    """Return the source prior, restoring a clear secondary arm view.
+
+    Static host preference must never suppress the only camera that can see an
+    occluded arm.  Recovery is deliberately limited to a complete, direct arm
+    chain; recovered or torso-overlapped estimates retain their configured
+    lower prior.
+    """
+    priorities = source_priorities or {}
+    base = float(priorities.get(int(serial), 1.0))
+    if (
+        not recover_clear_secondary_views
+        or side is None
+        or state is None
+        or not bool(state.get("clear"))
+        or not arm_states
+        or not priorities
+    ):
+        return base, False
+    maximum = max(float(value) for value in priorities.values())
+    preferred_clear_available = any(
+        bool(candidate.get("clear"))
+        and float(priorities.get(int(candidate_serial), 1.0))
+        >= maximum - 1.0e-9
+        for candidate_serial, candidate in arm_states.items()
+    )
+    if not preferred_clear_available and base < maximum:
+        return maximum, True
+    return base, False
+
+
 def fuse_body_orientations(
     accepted: list[PreparedView],
     contribution_serials: list[list[int]],
     *,
     minimum_confidence: float,
+    source_priorities: dict[int, float] | None = None,
+    recover_clear_secondary_views: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[int | None], dict[str, int | None]]:
     """Fuse BODY_38 rotations from the same views selected for each joint.
 
@@ -872,6 +929,13 @@ def fuse_body_orientations(
     root_values: list[np.ndarray] = []
     root_weights: list[float] = []
     root_serials: list[int] = []
+    arm_states = {
+        side: {
+            item.sample.serial: arm_view_state(item, side, minimum_confidence)
+            for item in accepted
+        }
+        for side in ARM_CHAIN_NAMES
+    }
 
     for joint in range(38):
         side = ARM_SIDE_BY_INDEX.get(joint)
@@ -891,16 +955,25 @@ def fuse_body_orientations(
             if value is None:
                 continue
             visibility_weight = 1.0
+            state = None
             if side:
-                state = arm_view_state(item, side, minimum_confidence)
+                state = arm_states[side][item.sample.serial]
                 if not state["clear"]:
                     visibility_weight = 0.12 if state["overlap"] else 0.25
                     if state["recovered"]:
                         visibility_weight *= 0.60
+            source_priority, _priority_recovered = source_priority_for_joint(
+                serial,
+                side=side,
+                state=state,
+                arm_states=arm_states.get(side) if side else None,
+                source_priorities=source_priorities,
+                recover_clear_secondary_views=recover_clear_secondary_views,
+            )
             weight = (
                 max(float(item.confidence[joint]), 0.0) / 100.0
-            ) ** 2 * max(item.quality, 0.05) * visibility_weight * covariance_weight(
-                item.sample.packet, joint
+            ) ** 2 * max(item.quality, 0.05) * visibility_weight * source_priority * (
+                covariance_weight(item.sample.packet, joint)
             )
             values.append(value)
             weights.append(max(weight, 1.0e-6))
@@ -971,11 +1044,23 @@ def _fuse_prepared_keypoints(
     *,
     minimum_confidence: float,
     maximum_spread_m: float,
-) -> tuple[np.ndarray, np.ndarray, list[int], list[list[int]], dict[str, Any]]:
+    source_priorities: dict[int, float] | None = None,
+    recover_clear_secondary_views: bool = True,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    list[int],
+    list[list[int]],
+    dict[str, Any],
+    dict[str, Any],
+]:
     result = np.full((38, 3), np.nan, dtype=np.float64)
     result_confidence = np.zeros(38, dtype=np.float64)
     contribution_count: list[int] = []
     contribution_serials: list[list[int]] = []
+    normalized_camera_weights: dict[str, dict[str, float]] = {}
+    effective_source_priorities: dict[str, dict[str, float]] = {}
+    recovered_priority_serials: dict[str, list[int]] = {}
     accepted = [item for item in prepared if item.accepted]
     arm_states = {
         side: {
@@ -998,6 +1083,14 @@ def _fuse_prepared_keypoints(
                     visibility_weight = 0.12 if state["overlap"] else 0.25
                     if state["recovered"]:
                         visibility_weight *= 0.60
+                source_priority, priority_recovered = source_priority_for_joint(
+                    item.sample.serial,
+                    side=side,
+                    state=state,
+                    arm_states=arm_states.get(side) if side else None,
+                    source_priorities=source_priorities,
+                    recover_clear_secondary_views=recover_clear_secondary_views,
+                )
                 candidates.append({
                     "point": item.aligned_points[joint],
                     "confidence": float(item.confidence[joint]),
@@ -1006,10 +1099,15 @@ def _fuse_prepared_keypoints(
                     "clear": bool(state["clear"]) if state is not None else True,
                     "visibility_weight": visibility_weight,
                     "covariance_weight": covariance_weight(item.sample.packet, joint),
+                    "source_priority": source_priority,
+                    "priority_recovered": priority_recovered,
                 })
         if not candidates:
             contribution_count.append(0)
             contribution_serials.append([])
+            normalized_camera_weights[BODY38_NAMES[joint]] = {}
+            effective_source_priorities[BODY38_NAMES[joint]] = {}
+            recovered_priority_serials[BODY38_NAMES[joint]] = []
             continue
         clear = [item for item in candidates if item["clear"]] if side else []
         if len(clear) >= 2:
@@ -1053,10 +1151,12 @@ def _fuse_prepared_keypoints(
                 (item["confidence"] / 100.0) ** 2
                 * max(item["quality"], 0.05)
                 * item["visibility_weight"]
-                * item["covariance_weight"],
+                * item["covariance_weight"]
+                * item["source_priority"],
             )
             for item in inliers
         ])
+        normalized = weights / max(float(np.sum(weights)), 1.0e-12)
         joint_values = np.asarray([item["point"] for item in inliers])
         result[joint] = np.average(joint_values, axis=0, weights=weights)
         result_confidence[joint] = float(np.average(
@@ -1064,6 +1164,19 @@ def _fuse_prepared_keypoints(
         ))
         contribution_count.append(len(inliers))
         contribution_serials.append(sorted(int(item["serial"]) for item in inliers))
+        normalized_camera_weights[BODY38_NAMES[joint]] = {
+            str(item["serial"]): float(value)
+            for item, value in zip(inliers, normalized)
+        }
+        effective_source_priorities[BODY38_NAMES[joint]] = {
+            str(item["serial"]): float(item["source_priority"])
+            for item in inliers
+        }
+        recovered_priority_serials[BODY38_NAMES[joint]] = sorted(
+            int(item["serial"])
+            for item in inliers
+            if item["priority_recovered"]
+        )
 
     evidence: dict[str, Any] = {}
     for side, states in arm_states.items():
@@ -1092,7 +1205,19 @@ def _fuse_prepared_keypoints(
                 if state["complete"] and serial not in selected_motion
             ),
         }
-    return result, result_confidence, contribution_count, contribution_serials, evidence
+    priority_telemetry = {
+        "per_joint_normalized_camera_weights": normalized_camera_weights,
+        "per_joint_effective_source_priorities": effective_source_priorities,
+        "per_joint_recovered_priority_serials": recovered_priority_serials,
+    }
+    return (
+        result,
+        result_confidence,
+        contribution_count,
+        contribution_serials,
+        evidence,
+        priority_telemetry,
+    )
 
 
 def fuse_prepared_keypoints(
@@ -1101,7 +1226,7 @@ def fuse_prepared_keypoints(
     minimum_confidence: float,
     maximum_spread_m: float,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    fused, fused_confidence, counts, _serials, _evidence = _fuse_prepared_keypoints(
+    fused, fused_confidence, counts, _serials, _evidence, _priority = _fuse_prepared_keypoints(
         prepared,
         minimum_confidence=minimum_confidence,
         maximum_spread_m=maximum_spread_m,
@@ -1140,6 +1265,7 @@ def compact_sample(sample: Sample) -> dict[str, Any]:
         "normalized_capture_timestamp_ns": sample_timeline_ns(sample),
         "source_clock_offset_ns": sample.source_clock_offset_ns,
         "source_host_id": sample.source_host_id,
+        "source_configuration": packet.get("source_configuration"),
         "receiver_timestamp_ns": sample.received_ns,
         "sequence": sample.sequence,
         "body_id": packet.get("body_id"),
@@ -1149,6 +1275,11 @@ def compact_sample(sample: Sample) -> dict[str, Any]:
         "keypoints_3d_m": packet.get("keypoints_3d_m"),
         "keypoint_confidence": packet.get("keypoint_confidence"),
         "keypoints_covariance": packet.get("keypoints_covariance"),
+        # Camera tilt is a useful independent constraint for the offline
+        # extrinsic solve.  It is deliberately retained only in the lossless
+        # calibration record; the fused real-time control packet does not
+        # need the four raw IMU payloads.
+        "imu": packet.get("imu"),
         "operator_selection": packet.get("operator_selection"),
         "distance_quality": packet.get("distance_quality"),
         "euclidean_distance_m": packet.get("euclidean_distance_m"),
@@ -1394,6 +1525,17 @@ def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
     preserving everything drawn or exported by ``rerun_analysis``.
     """
     result = compact_live_packet(packet)
+    source_fusion = dict(packet.get("fusion") or {})
+    analysis_fusion = dict(result.get("fusion") or {})
+    for key in (
+        "source_priority_policy",
+        "per_joint_normalized_camera_weights",
+        "per_joint_effective_source_priorities",
+        "per_joint_recovered_priority_serials",
+    ):
+        if key in source_fusion:
+            analysis_fusion[key] = source_fusion[key]
+    result["fusion"] = analysis_fusion
     multi = dict(packet.get("multi_camera") or {})
     compact_multi = dict(result.get("multi_camera") or {})
     for key in ("camera_pose_fusion_from_local", "source_operator_selections"):
@@ -1438,6 +1580,17 @@ def analysis_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
 def research_record_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Persist fused signals and measured metrics, not display-only geometry."""
     result = compact_live_packet(packet)
+    source_fusion = dict(packet.get("fusion") or {})
+    research_fusion = dict(result.get("fusion") or {})
+    for key in (
+        "source_priority_policy",
+        "per_joint_normalized_camera_weights",
+        "per_joint_effective_source_priorities",
+        "per_joint_recovered_priority_serials",
+    ):
+        if key in source_fusion:
+            research_fusion[key] = source_fusion[key]
+    result["fusion"] = research_fusion
     if "hand_tracking" in packet:
         result["hand_tracking"] = compact_hand_analysis(packet["hand_tracking"])
     if "dex3_targets" in packet:
@@ -1547,7 +1700,13 @@ def make_output_packet(
     workspace_x_min_m: float = 2.0,
     workspace_x_max_m: float = 4.0,
     full_set_wait_applied_ms: float = 0.0,
+    source_priorities: dict[int, float] | None = None,
+    recover_clear_secondary_views: bool = True,
 ) -> dict[str, Any]:
+    source_priorities = {
+        int(serial): float(weight)
+        for serial, weight in (source_priorities or {}).items()
+    }
     prepared = prepare_aligned_views(
         views,
         minimum_confidence=minimum_confidence,
@@ -1557,7 +1716,13 @@ def make_output_packet(
     accepted = [item for item in prepared if item.accepted]
     if not accepted:
         accepted = prepared
-    best_view = max(accepted, key=lambda item: item.quality)
+    best_view = max(
+        accepted,
+        key=lambda item: (
+            item.quality
+            * source_priorities.get(item.sample.serial, 1.0)
+        ),
+    )
     best_sample = best_view.sample
     packet = dict(best_sample.packet)
     # A source covariance describes that camera's estimate, not the fused
@@ -1566,10 +1731,19 @@ def make_output_packet(
     packet.pop("_fusion_temporal_prediction_ms", None)
     packet.pop("_fusion_temporal_prediction_joints", None)
     packet.pop("_fusion_target_capture_ns", None)
-    fused, fused_confidence, contributions, contribution_serials, arm_evidence = _fuse_prepared_keypoints(
+    (
+        fused,
+        fused_confidence,
+        contributions,
+        contribution_serials,
+        arm_evidence,
+        priority_telemetry,
+    ) = _fuse_prepared_keypoints(
         prepared,
         minimum_confidence=minimum_confidence,
         maximum_spread_m=maximum_spread_m,
+        source_priorities=source_priorities,
+        recover_clear_secondary_views=recover_clear_secondary_views,
     )
     pelvis = fused[IDX["PELVIS"]]
     try:
@@ -1767,6 +1941,8 @@ def make_output_packet(
             accepted,
             contribution_serials,
             minimum_confidence=minimum_confidence,
+            source_priorities=source_priorities,
+            recover_clear_secondary_views=recover_clear_secondary_views,
         )
     )
     # temporal_compensate_samples writes the common target into every view.
@@ -1802,7 +1978,11 @@ def make_output_packet(
             for item in accepted
         ]),
         weights=np.maximum(
-            np.asarray([item.quality for item in accepted], dtype=np.float64),
+            np.asarray([
+                item.quality
+                * source_priorities.get(item.sample.serial, 1.0)
+                for item in accepted
+            ], dtype=np.float64),
             0.05,
         ),
     ))
@@ -1880,6 +2060,21 @@ def make_output_packet(
             },
             "per_joint_contributions": contributions,
             "per_joint_contributing_serials": contribution_serials,
+            "source_priority_policy": {
+                "configured": {
+                    str(item.sample.serial): source_priorities.get(
+                        item.sample.serial, 1.0
+                    )
+                    for item in prepared
+                },
+                "recover_clear_secondary_views": bool(
+                    recover_clear_secondary_views
+                ),
+                "semantics": (
+                    "confidence2_quality_visibility_covariance_source_prior"
+                ),
+            },
+            **priority_telemetry,
             "arm_evidence": arm_evidence,
             "maximum_joint_spread_m": maximum_spread_m,
             "capture_spread_ms": contributor_spread_ms,
@@ -1977,6 +2172,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-timeout-ms", type=float, default=250.0, help="Bu sureden eski BODY_38 kaynagini taze sayma.")
     parser.add_argument("--minimum-sources", type=int, choices=(2, 3, 4), default=2, help="Calisma aninda cikis icin gereken en az taze kamera.")
     parser.add_argument("--max-joint-spread-m", type=float, default=0.30)
+    parser.add_argument(
+        "--source-priority",
+        type=parse_source_priority,
+        action="append",
+        default=[],
+        metavar="SERIAL:WEIGHT",
+        help=(
+            "Eklem-bazli kalite agirligina carpilacak kamera onceligi; "
+            "belirtilmeyen kaynak 1.0 kullanir."
+        ),
+    )
+    parser.add_argument(
+        "--source-priority-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Oncelikli kameralarda kol net degilse net ikincil gorusu 1.0 "
+            "agirligina geri getir."
+        ),
+    )
     parser.add_argument("--max-pose-disagreement-m", type=float, default=0.22, help="Farkli kisi/poz gorunumunu dislamak icin pelvis-yerel govde MPJPE esigi.")
     parser.add_argument("--max-alignment-translation-m", type=float, default=0.25, help="Iyi kalibrasyonda izin verilen azami dinamik pelvis cevirisi; asilirsa gorus dislanir.")
     parser.add_argument("--max-temporal-prediction-ms", type=float, default=70.0, help="Eski kamera gorusunu son capture anina tasimak icin azami tahmin (ms).")
@@ -2004,6 +2219,22 @@ def main() -> int:
     endpoints: list[InputEndpoint] = args.source
     preview_endpoints: list[InputEndpoint] = args.preview_source
     hand_endpoints: list[InputEndpoint] = args.hand_source
+    configured_serials = {item.serial for item in endpoints}
+    source_priorities = {serial: weight for serial, weight in args.source_priority}
+    if len(source_priorities) != len(args.source_priority):
+        print("HATA: ayni --source-priority SERIAL degeri birden cok verildi.", file=sys.stderr)
+        return 2
+    unknown_priority_serials = sorted(set(source_priorities) - configured_serials)
+    if unknown_priority_serials:
+        print(
+            f"HATA: kaynak onceligi bilinmeyen ZED serileri: {unknown_priority_serials}",
+            file=sys.stderr,
+        )
+        return 2
+    source_priorities = {
+        serial: float(source_priorities.get(serial, 1.0))
+        for serial in configured_serials
+    }
     if len(endpoints) != 4 or len({item.serial for item in endpoints}) != 4 or len({item.port for item in endpoints}) != 4:
         print("HATA: tam dort farkli SERIAL:PORT kaynagi gerekli.", file=sys.stderr)
         return 2
@@ -2056,6 +2287,19 @@ def main() -> int:
         print("UYARI: extrinsic yok. Kayit yapilabilir ancak guvenli olarak sadece en iyi tek kamera paketlenecek.")
     elif args.calibration_record is not None:
         print("BILGI: Kalibrasyon kaydinda tum 4 kamera zorunludur; --minimum-sources yalniz canli cikisi etkiler.")
+    if any(abs(weight - 1.0) > 1.0e-9 for weight in source_priorities.values()):
+        print(
+            "HIBRIT KAYNAK ONCELIGI | "
+            + " ".join(
+                f"{serial}={weight:.2f}"
+                for serial, weight in sorted(source_priorities.items())
+            )
+            + (
+                " | net ikincil kol gorusu kurtarma=ACIK"
+                if args.source_priority_recovery
+                else " | net ikincil kol gorusu kurtarma=KAPALI"
+            )
+        )
 
     selector = selectors.DefaultSelector()
     sockets: list[socket.socket] = []
@@ -2117,8 +2361,23 @@ def main() -> int:
         socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if synchronous_targets else None
     )
+    control_publish_statistics = {
+        name: {
+            "submitted": 0,
+            "sent": 0,
+            "would_block": 0,
+            "errors": 0,
+            "last_error": None,
+        }
+        for name in synchronous_targets
+    }
     if output_socket is not None:
         output_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        # A local control consumer must never be able to stop fusion, SVO2 or
+        # the lossless monitor stream. If the kernel queue is momentarily full,
+        # discard that historical target and retry the newest target next
+        # frame. GMR/Isaac already implement HOLD -> bounded RETURN.
+        output_socket.setblocking(False)
 
     def encode_monitor_packet(value: dict[str, Any]) -> bytes:
         detailed = json.dumps(
@@ -2157,10 +2416,13 @@ def main() -> int:
             "units": "meter",
             "sources": [{"serial": item.serial, "port": item.port} for item in endpoints],
             "maximum_capture_spread_ms": args.max_sync_ms,
+            "preferred_full_set_spread_ms": args.preferred_full_set_spread_ms,
+            "camera_fps": args.output_max_hz,
             "timestamp_basis": "clock_offset_corrected_capture_time",
             "instruction": (
                 "Ortamda tek kisi olsun. Tum ortak calisma hacmini yavasca dolasin; "
-                "grid noktalarinda T/A ve bukulu-dirsek pozlarinda 1-2 saniye durun."
+                "ayak bilekleri ve govde dort kamerada gorunsun. Ani kol hareketi "
+                "ve hizli donus yapmayin; grid noktalarinda 1-2 saniye durun."
             ),
         }), ensure_ascii=False, allow_nan=False) + "\n")
         print(f"HAM KALIBRASYON KAYDI: {path}")
@@ -2223,6 +2485,15 @@ def main() -> int:
                     "x_min_m": args.workspace_x_min_m,
                     "x_max_m": args.workspace_x_max_m,
                     "hysteresis_m": args.workspace_hysteresis_m,
+                },
+                "fusion_source_priority": {
+                    "configured": {
+                        str(serial): weight
+                        for serial, weight in sorted(source_priorities.items())
+                    },
+                    "recover_clear_secondary_views": bool(
+                        args.source_priority_recovery
+                    ),
                 },
                 "safety": "Perception only; contains no physical robot motor commands.",
             })
@@ -2626,6 +2897,10 @@ def main() -> int:
                         workspace_x_min_m=args.workspace_x_min_m,
                         workspace_x_max_m=args.workspace_x_max_m,
                         full_set_wait_applied_ms=last_full_set_wait_applied_ms,
+                        source_priorities=source_priorities,
+                        recover_clear_secondary_views=(
+                            args.source_priority_recovery
+                        ),
                     )
                     if args.hand_tracking and extrinsics is not None:
                         target_capture_ns = int(packet["timestamp_ns"])
@@ -2764,6 +3039,12 @@ def main() -> int:
                             packet["transport_metrics"][
                                 "monitor_publisher"
                             ] = monitor_publisher.snapshot()
+                        packet["transport_metrics"][
+                            "control_publishers"
+                        ] = {
+                            name: dict(statistics)
+                            for name, statistics in control_publish_statistics.items()
+                        }
                         compact = compact_live_packet(packet)
                         compact_encoded = json.dumps(
                             compact, ensure_ascii=False, allow_nan=False,
@@ -2787,14 +3068,33 @@ def main() -> int:
                                     target, target_hz = target_config
                                     if now - last_target_send[target_name] < 0.80 / target_hz:
                                         continue
+                                    statistics = control_publish_statistics[target_name]
+                                    statistics["submitted"] += 1
                                     try:
                                         output_socket.sendto(compact_encoded, target)
+                                        statistics["sent"] += 1
+                                        statistics["last_error"] = None
                                         last_target_send[target_name] = now
+                                    except BlockingIOError as exc:
+                                        statistics["would_block"] += 1
+                                        statistics["last_error"] = (
+                                            f"{type(exc).__name__}: {exc}"
+                                        )[:160]
                                     except OSError as exc:
+                                        statistics["errors"] += 1
+                                        statistics["last_error"] = (
+                                            f"{type(exc).__name__}: {exc}"
+                                        )[:160]
                                         print(
                                             f"UYARI: {target_name} UDP gonderilemedi: {exc}",
                                             file=sys.stderr,
                                         )
+                            packet["transport_metrics"][
+                                "control_publishers"
+                            ] = {
+                                name: dict(statistics)
+                                for name, statistics in control_publish_statistics.items()
+                            }
                             monitor_config = output_targets.get("monitor")
                             if (
                                 monitor_publisher is not None

@@ -15,6 +15,7 @@ import numpy as np
 
 ZED360_METHOD = "zed_sdk_read_fusion_configuration_file_from_zed360"
 BODY38_METHOD = "trimmed_kabsch_from_synchronized_body38_core_joints"
+BODY38_PHYSICAL_METHOD = "weighted_torso_kabsch_imu_temporal_holdout_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,7 +73,7 @@ def validate_document(
         )
 
     method = str(document.get("method", ""))
-    if method not in {ZED360_METHOD, BODY38_METHOD}:
+    if method not in {ZED360_METHOD, BODY38_METHOD, BODY38_PHYSICAL_METHOD}:
         raise ValueError(f"Desteklenmeyen kalibrasyon methodu: {method or 'MISSING'}")
 
     for serial in sorted(expected_serials):
@@ -163,6 +164,38 @@ def validate_document(
             fit.get("pelvis_trajectory_correlation"),
             f"ZED {serial} pelvis_trajectory_correlation",
         )
+        if method == BODY38_PHYSICAL_METHOD:
+            holdout_samples = finite_number(
+                fit.get("holdout_capture_samples"),
+                f"ZED {serial} holdout_capture_samples",
+            )
+            holdout_full = fit.get("holdout_full_body_all_valid")
+            holdout_torso = fit.get("holdout_torso_all_valid")
+            imu_tilt = fit.get("imu_tilt_constraint")
+            if not isinstance(holdout_full, dict) or not isinstance(holdout_torso, dict):
+                raise ValueError(f"ZED {serial} zaman-ayrik holdout metrikleri eksik.")
+            holdout_p95 = finite_number(
+                holdout_full.get("p95_m"), f"ZED {serial} holdout full-body p95"
+            )
+            holdout_torso_p95 = finite_number(
+                holdout_torso.get("p95_m"), f"ZED {serial} holdout torso p95"
+            )
+            systematic_bias = finite_number(
+                holdout_torso.get("mean_bias_m"),
+                f"ZED {serial} holdout torso systematic bias",
+            )
+            if holdout_samples < 20:
+                raise ValueError(f"ZED {serial} holdout ornegi yetersiz: {holdout_samples:g}.")
+            if holdout_torso_p95 > 0.12:
+                raise ValueError(f"ZED {serial} holdout torso p95={holdout_torso_p95:.3f}m > 0.12m.")
+            if systematic_bias > 0.05:
+                raise ValueError(f"ZED {serial} sistematik bias={systematic_bias:.3f}m > 0.05m.")
+            policy = document.get("calibration_policy")
+            if not isinstance(policy, dict) or float(policy.get("maximum_pair_delta_ms", math.inf)) > 33.0:
+                raise ValueError(f"ZED {serial} kalibrasyon zaman penceresi 33ms sinirini geciyor.")
+            if bool(policy.get("imu_tilt_required")):
+                if not isinstance(imu_tilt, dict) or imu_tilt.get("available") is not True:
+                    raise ValueError(f"ZED {serial} IMU tilt kisiti olculemedi.")
         if candidates <= 0.0 or abs(inlier_ratio - paired / candidates) > 0.01:
             raise ValueError(f"ZED {serial} inlier orani tutarsiz.")
         if capture_samples < 60 or paired < 300 or inlier_ratio < 0.25:

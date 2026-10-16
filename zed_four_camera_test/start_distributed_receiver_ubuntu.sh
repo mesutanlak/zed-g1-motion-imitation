@@ -29,6 +29,11 @@ disable_dex3_retargeting=0
 disable_single_view_hand_depth=0
 dex3_official_root=""
 dex3_official_python=""
+source_priorities=()
+source_priority_recovery=1
+max_sync_ms=""
+preferred_full_set_spread_ms=""
+full_set_wait_ms=""
 
 usage() {
   cat <<'EOF'
@@ -39,6 +44,10 @@ Kullanim: start_distributed_receiver_ubuntu.sh [secenekler]
   --monitor-host IP [--monitor-port 15052]
   --ros-host IP [--ros-port 15054]
   --fps 1..30 --minimum-sources 2|3|4 --preview-hz HZ
+  --max-sync-ms MS --preferred-full-set-spread-ms MS
+  --full-set-wait-ms MS
+  --source-priority SERIAL:WEIGHT (tekrarlanabilir)
+  --no-source-priority-recovery
   --workspace-x-min M --workspace-x-max M
   --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
   --disable-dex3-retargeting --disable-single-view-hand-depth
@@ -60,7 +69,12 @@ while (($#)); do
     --ros-port) ros_port="${2:?}"; shift 2 ;;
     --fps) fps="${2:?}"; shift 2 ;;
     --minimum-sources) minimum_sources="${2:?}"; shift 2 ;;
+    --max-sync-ms) max_sync_ms="${2:?}"; shift 2 ;;
+    --preferred-full-set-spread-ms) preferred_full_set_spread_ms="${2:?}"; shift 2 ;;
+    --full-set-wait-ms) full_set_wait_ms="${2:?}"; shift 2 ;;
     --preview-hz) preview_hz="${2:?}"; shift 2 ;;
+    --source-priority) source_priorities+=("${2:?}"); shift 2 ;;
+    --no-source-priority-recovery) source_priority_recovery=0; shift ;;
     --workspace-x-min) workspace_x_min="${2:?}"; shift 2 ;;
     --workspace-x-max) workspace_x_max="${2:?}"; shift 2 ;;
     --hand-tracking) hand_tracking=1; shift ;;
@@ -88,6 +102,27 @@ if [[ -n "$calibration_record" && -n "$extrinsics" ]]; then
   exit 2
 fi
 
+# Calibration must never pair observations farther apart than one 30 Hz
+# capture interval.  Runtime keeps its existing wider dropout-tolerant window;
+# callers may override either profile explicitly.
+if [[ -n "$calibration_record" ]]; then
+  max_sync_ms="${max_sync_ms:-33}"
+  preferred_full_set_spread_ms="${preferred_full_set_spread_ms:-20}"
+  full_set_wait_ms="${full_set_wait_ms:-35}"
+else
+  max_sync_ms="${max_sync_ms:-80}"
+  preferred_full_set_spread_ms="${preferred_full_set_spread_ms:-40}"
+  full_set_wait_ms="${full_set_wait_ms:-20}"
+fi
+"$zed_python" - "$max_sync_ms" "$preferred_full_set_spread_ms" "$full_set_wait_ms" <<'PY'
+import math, sys
+values = [float(value) for value in sys.argv[1:]]
+if any(not math.isfinite(value) or value < 0.0 for value in values):
+    raise SystemExit("Senkronizasyon pencereleri sonlu ve >= 0 olmali.")
+if values[1] > values[0]:
+    raise SystemExit("--preferred-full-set-spread-ms, --max-sync-ms degerini asamaz.")
+PY
+
 sources=(39504762:16000 31571870:16002 33773329:16004 34760587:16006)
 previews=(39504762:16100 31571870:16102 33773329:16104 34760587:16106)
 hands=(39504762:16200 31571870:16202 33773329:16204 34760587:16206)
@@ -110,9 +145,9 @@ if (( hand_tracking )); then
 fi
 args+=(
   --minimum-sources "$minimum_sources"
-  --max-sync-ms 80
-  --preferred-full-set-spread-ms 40
-  --full-set-wait-ms 20
+  --max-sync-ms "$max_sync_ms"
+  --preferred-full-set-spread-ms "$preferred_full_set_spread_ms"
+  --full-set-wait-ms "$full_set_wait_ms"
   --source-timeout-ms 250
   --max-joint-spread-m 0.18
   --max-pose-disagreement-m 0.22
@@ -126,6 +161,10 @@ args+=(
   --record-stem "$record_stem"
   --record-detail "$record_detail"
 )
+for item in "${source_priorities[@]}"; do
+  args+=(--source-priority "$item")
+done
+(( source_priority_recovery )) || args+=(--no-source-priority-recovery)
 [[ -n "$extrinsics" ]] && args+=(--extrinsics "$extrinsics")
 [[ -n "$calibration_record" ]] && args+=(--calibration-record "$calibration_record")
 if [[ -n "$output_host" ]]; then

@@ -34,7 +34,7 @@ Kullanim: ./start_zed_four_sources_ubuntu.sh --role laptop|main-pc [secenekler]
   --preview-hz HZ
   --record-local | --record-svo2
   --hand-tracking [--hand-model PATH]
-  --require-ptp  (g1-zed-ptp.service aktif degilse baslatma)
+  --require-ptp  (PTP MASTER/SLAVE kilitli degilse baslatma; kayit boyunca izle)
 
 Bu betik iki kamerayi ayni terminalden yonetir. Ctrl+C ikisini de kapatir.
 EOF
@@ -84,11 +84,18 @@ case "$role" in
 esac
 case "$fps" in 15|30) ;; *) echo "Dort kamera icin --fps 15 veya 30 olmali." >&2; exit 2 ;; esac
 [[ -x "$zed_python" ]] || { echo "ZED Python bulunamadi: $zed_python" >&2; exit 1; }
+ptp_interface=""
 if (( require_ptp )); then
-  systemctl is-active --quiet g1-zed-ptp.service || {
-    echo "PTP aktif degil. Once install/setup_ptp_sync_ubuntu24.sh calistirin." >&2
+  ptp_interface="$(ip -o -4 addr show | awk '$4 ~ /^192\.168\.50\./ {print $2; exit}')"
+  [[ -n "$ptp_interface" ]] || {
+    echo "192.168.50.x PTP arayuzu bulunamadi." >&2
     exit 1
   }
+  "$zed_python" "$project/tools/monitor_ptp_sync_ubuntu.py" \
+    --role "$role" --interface "$ptp_interface" --once --require-locked || {
+      echo "PTP kilitli degil. Once ./tools/check_ptp_sync_ubuntu.sh ile servisi duzeltin." >&2
+      exit 1
+    }
 fi
 
 device_text="$($zed_python "$project/zed_g1_skeleton.py" --list-devices 2>&1)" || {
@@ -123,6 +130,14 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 session="$(date +%Y%m%d_%H%M%S)"
+if (( require_ptp )); then
+  ptp_record="$project/recordings/ptp_lock_${role}_${session}.jsonl"
+  "$zed_python" "$project/tools/monitor_ptp_sync_ubuntu.py" \
+    --role "$role" --interface "$ptp_interface" \
+    --output "$ptp_record" --require-locked --fail-on-unlock-samples 3 &
+  pids+=("$!")
+  echo "PTP OTURUM KAYDI: $ptp_record"
+fi
 for index in 0 1; do
   serial="${serials[$index]}"
   args=(

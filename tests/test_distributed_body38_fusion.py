@@ -4,6 +4,7 @@ from collections import deque
 import json
 
 import numpy as np
+import pytest
 
 from zed_g1_skeleton import (
     body_in_distance_gate,
@@ -13,7 +14,10 @@ from zed_g1_skeleton import (
 from motion_pipeline.udp_codec import decode_json_datagram, encode_json_datagram
 
 from zed_four_camera_test.calibrate_distributed_body38 import (
+    apply_imu_tilt_constraint,
+    pair_camera_packets,
     pelvis_trajectory_metrics,
+    weighted_rigid_alignment,
     write_world_poses_jsonl,
 )
 from zed_four_camera_test.extrinsic_geometry import rebase_camera_transforms
@@ -537,6 +541,45 @@ def test_runtime_validator_recomputes_body38_quality_thresholds() -> None:
         raise AssertionError("Relaxed producer thresholds must not bypass runtime policy")
 
 
+def test_runtime_validator_accepts_time_separated_physical_calibration() -> None:
+    serials = {1, 2, 3, 4}
+    document = {
+        "schema": "zed_body38_distributed_extrinsics/v1",
+        "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+        "units": "meter",
+        "reference_world_serial": 1,
+        "method": "weighted_torso_kabsch_imu_temporal_holdout_v2",
+        "calibration_policy": {
+            "maximum_pair_delta_ms": 20.0,
+            "imu_tilt_required": True,
+        },
+        "cameras": {},
+    }
+    for serial in serials:
+        fit = {"reference": True} if serial == 1 else {
+            "capture_samples": 500,
+            "holdout_capture_samples": 150,
+            "candidate_keypoints": 5000,
+            "paired_keypoints": 4700,
+            "inlier_ratio": 0.94,
+            "rms_m": 0.04,
+            "pelvis_p95_m": 0.08,
+            "pelvis_reference_motion_m": 0.6,
+            "pelvis_motion_scale_ratio": 0.98,
+            "pelvis_trajectory_correlation": 0.98,
+            "holdout_full_body_all_valid": {"p95_m": 0.25},
+            "holdout_torso_all_valid": {"p95_m": 0.09, "mean_bias_m": 0.02},
+            "imu_tilt_constraint": {"available": True, "correction_deg": 2.0},
+            "quality_gate_passed": True,
+        }
+        document["cameras"][str(serial)] = {
+            "rotation_camera_to_world": np.eye(3).tolist(),
+            "translation_camera_to_world_m": [0.0, 0.0, 0.0] if serial == 1 else [float(serial), 0.0, 0.0],
+            "fit": fit,
+        }
+    validate_document(document, expected_serials=serials, reference_serial=1)
+
+
 def test_pelvis_trajectory_gate_rejects_stationary_wrong_person() -> None:
     reference = np.column_stack((
         np.linspace(0.0, 1.0, 120),
@@ -554,6 +597,71 @@ def test_pelvis_trajectory_gate_rejects_stationary_wrong_person() -> None:
     assert metrics["pelvis_reference_motion_m"] >= 0.10
     assert metrics["pelvis_motion_scale_ratio"] < 0.60
     assert metrics["pelvis_trajectory_correlation"] < 0.75
+
+
+def test_calibration_pairing_applies_bounded_temporal_offset() -> None:
+    samples = []
+    for sequence in range(12):
+        reference_time = 1_000_000_000 + sequence * 33_333_333
+        source_time = reference_time + 12_000_000
+        samples.append({
+            "sources": {
+                "1": {"sequence": sequence, "normalized_capture_timestamp_ns": reference_time},
+                "2": {"sequence": sequence, "normalized_capture_timestamp_ns": source_time},
+            }
+        })
+    paired = pair_camera_packets(
+        samples,
+        reference_serial=1,
+        target_serial=2,
+        maximum_samples=100,
+        temporal_offset_ms=-12.0,
+        maximum_pair_delta_ms=20.0,
+    )
+    assert len(paired) == 12
+    assert max(value[2] for value in paired) < 1.0e-6
+
+
+def test_weighted_torso_alignment_reports_all_valid_residuals() -> None:
+    rng = np.random.default_rng(7)
+    source = rng.normal(size=(200, 3))
+    angle = np.deg2rad(18.0)
+    rotation = np.asarray([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    translation = np.asarray([0.8, -0.2, 0.4])
+    target = source @ rotation.T + translation
+    target[-5:] += 0.5
+    result = weighted_rigid_alignment(
+        source, target, np.ones(len(source)), maximum_residual_m=0.12
+    )
+    assert result is not None
+    fitted_rotation, fitted_translation, metrics = result
+    assert np.allclose(fitted_rotation, rotation, atol=0.01)
+    assert np.allclose(fitted_translation, translation, atol=0.02)
+    assert metrics["paired_keypoints"] == 195
+    assert metrics["all_valid_p95_m"] > metrics["p95_m"]
+
+
+def test_imu_tilt_constraint_aligns_camera_up_vectors() -> None:
+    angle = np.deg2rad(5.0)
+    reference_quaternion = [0.0, np.sin(angle / 2.0), 0.0, np.cos(angle / 2.0)]
+    source = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    constrained, _translation, report = apply_imu_tilt_constraint(
+        np.eye(3),
+        np.zeros(3),
+        source,
+        source.copy(),
+        np.ones(3),
+        [{"imu": {"orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}}],
+        [{"imu": {"orientation_xyzw": reference_quaternion}}],
+    )
+    expected_reference_up = np.asarray([-np.sin(angle), 0.0, np.cos(angle)])
+    assert report["available"] is True
+    assert report["correction_deg"] == pytest.approx(5.0, abs=0.05)
+    assert constrained @ np.asarray([0.0, 0.0, 1.0]) == pytest.approx(expected_reference_up)
 
 
 def test_fused_packet_rebuilds_world_and_g1_reference_features() -> None:
@@ -862,6 +970,99 @@ def test_one_clear_arm_view_rejects_disagreeing_occluded_views() -> None:
         np.asarray(fused["keypoints_3d_m"])[IDX["LEFT_WRIST"]],
         base[IDX["LEFT_WRIST"]],
     )
+
+
+def test_main_pc_priority_biases_clear_joint_and_records_normalized_weights() -> None:
+    base = body38_points()
+    laptop = base.copy()
+    laptop[IDX["LEFT_ELBOW"], 1] += 0.10
+    laptop[IDX["LEFT_WRIST"], 1] += 0.10
+    views = [
+        (
+            Sample(serial, packet(serial, index, xyz), 1_000_000_000 + index, index),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        )
+        for index, (serial, xyz) in enumerate((
+            (31571870, base),
+            (33773329, base),
+            (34760587, laptop),
+            (39504762, laptop),
+        ), start=1)
+    ]
+    priorities = {
+        31571870: 1.0,
+        33773329: 1.0,
+        34760587: 0.60,
+        39504762: 0.60,
+    }
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=33773329,
+        arrival_spread_ms=1.0,
+        source_priorities=priorities,
+    )
+
+    wrist = np.asarray(fused["keypoints_3d_m"])[IDX["LEFT_WRIST"]]
+    assert np.isclose(wrist[1], base[IDX["LEFT_WRIST"], 1] + 0.0375)
+    weights = fused["fusion"]["per_joint_normalized_camera_weights"][
+        "LEFT_WRIST"
+    ]
+    assert np.isclose(sum(weights.values()), 1.0)
+    assert np.isclose(weights["31571870"], 0.3125)
+    assert np.isclose(weights["33773329"], 0.3125)
+    assert np.isclose(weights["34760587"], 0.1875)
+    assert np.isclose(weights["39504762"], 0.1875)
+    compact = compact_live_packet(fused)
+    assert "per_joint_normalized_camera_weights" not in compact["fusion"]
+    analysis = analysis_live_packet(fused)
+    assert analysis["fusion"]["per_joint_normalized_camera_weights"][
+        "LEFT_WRIST"
+    ] == weights
+
+
+def test_clear_laptop_arm_views_recover_full_priority_when_main_is_occluded() -> None:
+    base = body38_points()
+    views = []
+    for index, serial in enumerate(
+        (31571870, 33773329, 34760587, 39504762), start=1
+    ):
+        document = packet(serial, index, base)
+        is_main = serial in {31571870, 33773329}
+        document["occlusion_analysis"] = {
+            "arm_torso_overlap": {"left": is_main, "right": False},
+            "arm_chain_recovered": {"left": False, "right": False},
+        }
+        views.append((
+            Sample(serial, document, 1_000_000_000 + index, index),
+            Extrinsic(np.eye(3), np.zeros(3)),
+        ))
+    fused = make_output_packet(
+        views,
+        minimum_confidence=45.0,
+        maximum_spread_m=0.30,
+        output_sequence=1,
+        reference_serial=33773329,
+        arrival_spread_ms=1.0,
+        source_priorities={
+            31571870: 1.0,
+            33773329: 1.0,
+            34760587: 0.60,
+            39504762: 0.60,
+        },
+        recover_clear_secondary_views=True,
+    )
+
+    effective = fused["fusion"]["per_joint_effective_source_priorities"][
+        "LEFT_WRIST"
+    ]
+    recovered = fused["fusion"]["per_joint_recovered_priority_serials"][
+        "LEFT_WRIST"
+    ]
+    assert effective == {"34760587": 1.0, "39504762": 1.0}
+    assert recovered == [34760587, 39504762]
 
 
 def test_dynamic_pelvis_alignment_repairs_translation_biased_extrinsic() -> None:
