@@ -9,29 +9,57 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
 
 STATE_RE = re.compile(r"(?:to|portState\s+)\s*(MASTER|SLAVE|FAULTY|LISTENING|UNCALIBRATED)", re.I)
 OFFSET_RE = re.compile(r"master offset\s+(-?\d+)\s+(s[012])\b.*?path delay\s+(-?\d+)", re.I)
+PMC_STATE_RE = re.compile(r"^\s*portState\s+(MASTER|SLAVE|FAULTY|LISTENING|UNCALIBRATED)\s*$", re.I | re.M)
+PMC_OFFSET_RE = re.compile(r"^\s*master_offset\s+(-?\d+)\s*$", re.M)
+PMC_GM_RE = re.compile(r"^\s*gmPresent\s+(true|false)\s*$", re.I | re.M)
 
 
 def command(*args: str) -> tuple[int, str]:
-    result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    try:
+        result = subprocess.run(
+            args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=3.0,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "command timed out"
     return result.returncode, result.stdout
+
+
+def pmc_status(role: str) -> tuple[int, str]:
+    # ptp4l's read-only management socket accepts GET requests from an
+    # unprivileged client. Give pmc a writable client socket outside /var/run.
+    with tempfile.TemporaryDirectory(prefix="g1-ptp-monitor-") as directory:
+        return command(
+            "pmc", "-u", "-b", "0", "-f", f"/etc/linuxptp/g1-zed-{role}.cfg",
+            "-i", f"{directory}/client", "-s", "/var/run/ptp4lro",
+            "GET PORT_DATA_SET", "GET TIME_STATUS_NP",
+        )
 
 
 def snapshot(role: str, interface: str, maximum_offset_ns: int) -> dict[str, Any]:
     service_code, service_text = command("systemctl", "is-active", "g1-zed-ptp.service")
     link_code, link_text = command("ip", "-o", "link", "show", "dev", interface)
+    pmc_code, pmc_text = pmc_status(role)
     _journal_code, journal = command(
         "journalctl", "-u", "g1-zed-ptp.service", "-n", "240", "--no-pager", "-o", "cat"
     )
     states = STATE_RE.findall(journal)
     offsets = OFFSET_RE.findall(journal)
-    state = states[-1].upper() if states else None
-    offset_ns = int(offsets[-1][0]) if offsets else None
+    pmc_states = PMC_STATE_RE.findall(pmc_text)
+    pmc_offsets = PMC_OFFSET_RE.findall(pmc_text)
+    pmc_gm = PMC_GM_RE.findall(pmc_text)
+    # The journal is diagnostic only: summary_interval=0 commonly prints RMS
+    # lines without the "master offset ... s2" text used by older versions.
+    state = pmc_states[-1].upper() if pmc_states else None
+    offset_ns = int(pmc_offsets[-1]) if pmc_offsets else None
+    gm_present = pmc_gm[-1].lower() == "true" if pmc_gm else None
     servo_state = offsets[-1][1].lower() if offsets else None
     path_delay_ns = int(offsets[-1][2]) if offsets else None
     service_active = service_code == 0 and service_text.strip() == "active"
@@ -40,11 +68,12 @@ def snapshot(role: str, interface: str, maximum_offset_ns: int) -> dict[str, Any
     locked = bool(
         service_active
         and link_up
+        and pmc_code == 0
         and state == expected_state
         and (
             role == "main-pc"
             or (
-                servo_state == "s2"
+                gm_present is True
                 and offset_ns is not None
                 and abs(offset_ns) <= maximum_offset_ns
             )
@@ -58,8 +87,12 @@ def snapshot(role: str, interface: str, maximum_offset_ns: int) -> dict[str, Any
         "service_active": service_active,
         "link_up": link_up,
         "port_state": state,
+        "journal_port_state": states[-1].upper() if states else None,
         "expected_port_state": expected_state,
         "servo_state": servo_state,
+        "gm_present": gm_present,
+        "measurement_source": "linuxptp_pmc_readonly",
+        "pmc_available": pmc_code == 0,
         "master_offset_ns": offset_ns,
         "path_delay_ns": path_delay_ns,
         "maximum_offset_ns": maximum_offset_ns,
