@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -101,6 +102,10 @@ def snapshot(role: str, interface: str, maximum_offset_ns: int) -> dict[str, Any
 
 
 def main() -> int:
+    # Bash may launch this monitor as an asynchronous job with SIGINT ignored.
+    # Restore Python's handler so the camera launcher's Ctrl+C can write a
+    # clean journal footer before calibration validates the PTP evidence.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     parser = argparse.ArgumentParser(description="PTP kilidini JSONL olarak izler")
     parser.add_argument("--role", choices=("main-pc", "laptop"), required=True)
     parser.add_argument("--interface", required=True)
