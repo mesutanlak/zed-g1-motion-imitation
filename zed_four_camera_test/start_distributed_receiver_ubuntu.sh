@@ -30,6 +30,7 @@ disable_single_view_hand_depth=0
 dex3_official_root=""
 dex3_official_python=""
 source_priorities=()
+excluded_sources=()
 source_priority_recovery=1
 max_sync_ms=""
 preferred_full_set_spread_ms=""
@@ -47,6 +48,7 @@ Kullanim: start_distributed_receiver_ubuntu.sh [secenekler]
   --max-sync-ms MS --preferred-full-set-spread-ms MS
   --full-set-wait-ms MS
   --source-priority SERIAL:WEIGHT (tekrarlanabilir)
+  --exclude-source SERIAL          (yalniz runtime; tekrarlanabilir)
   --no-source-priority-recovery
   --workspace-x-min M --workspace-x-max M
   --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
@@ -74,6 +76,7 @@ while (($#)); do
     --full-set-wait-ms) full_set_wait_ms="${2:?}"; shift 2 ;;
     --preview-hz) preview_hz="${2:?}"; shift 2 ;;
     --source-priority) source_priorities+=("${2:?}"); shift 2 ;;
+    --exclude-source) excluded_sources+=("${2:?}"); shift 2 ;;
     --no-source-priority-recovery) source_priority_recovery=0; shift ;;
     --workspace-x-min) workspace_x_min="${2:?}"; shift 2 ;;
     --workspace-x-max) workspace_x_max="${2:?}"; shift 2 ;;
@@ -101,6 +104,10 @@ if [[ -n "$calibration_record" && -n "$extrinsics" ]]; then
   echo "Ham kalibrasyon kaydi ile runtime extrinsic ayni anda verilmez." >&2
   exit 2
 fi
+if [[ -n "$calibration_record" && ${#excluded_sources[@]} -gt 0 ]]; then
+  echo "Kalibrasyon kaydinda kamera dislanamaz; dort kamera zorunludur." >&2
+  exit 2
+fi
 
 # Calibration must never pair observations farther apart than one 30 Hz
 # capture interval.  Runtime keeps its existing wider dropout-tolerant window;
@@ -126,6 +133,41 @@ PY
 sources=(39504762:16000 31571870:16002 33773329:16004 34760587:16006)
 previews=(39504762:16100 31571870:16102 33773329:16104 34760587:16106)
 hands=(39504762:16200 31571870:16202 33773329:16204 34760587:16206)
+declare -A excluded_source_set=()
+for serial in "${excluded_sources[@]}"; do
+  case "$serial" in
+    39504762|31571870|33773329|34760587) ;;
+    *) echo "Bilinmeyen --exclude-source seri numarasi: $serial" >&2; exit 2 ;;
+  esac
+  if [[ -n "${excluded_source_set[$serial]:-}" ]]; then
+    echo "Ayni --exclude-source seri numarasi birden cok verildi: $serial" >&2
+    exit 2
+  fi
+  excluded_source_set[$serial]=1
+done
+if ((${#excluded_source_set[@]})); then
+  filtered_sources=()
+  filtered_previews=()
+  filtered_hands=()
+  for index in "${!sources[@]}"; do
+    serial="${sources[$index]%%:*}"
+    [[ -n "${excluded_source_set[$serial]:-}" ]] && continue
+    filtered_sources+=("${sources[$index]}")
+    filtered_previews+=("${previews[$index]}")
+    filtered_hands+=("${hands[$index]}")
+  done
+  sources=("${filtered_sources[@]}")
+  previews=("${filtered_previews[@]}")
+  hands=("${filtered_hands[@]}")
+fi
+if ((${#sources[@]} < 3)); then
+  echo "Runtime fusion icin en az uc kamera kalmali; kalan=${#sources[@]}." >&2
+  exit 2
+fi
+if ((minimum_sources > ${#sources[@]})); then
+  echo "--minimum-sources=$minimum_sources kalan kamera sayisini (${#sources[@]}) asamaz." >&2
+  exit 2
+fi
 args=("$receiver")
 for item in "${sources[@]}"; do args+=(--source "$item"); done
 if (( ! headless )); then

@@ -20,6 +20,7 @@ record_svo2=0
 hand_tracking=0
 require_ptp=0
 hand_model="$project/models/hand_landmarker.task"
+excluded_serials=()
 
 usage() {
   cat <<'EOF'
@@ -34,9 +35,10 @@ Kullanim: ./start_zed_four_sources_ubuntu.sh --role laptop|main-pc [secenekler]
   --preview-hz HZ
   --record-local | --record-svo2
   --hand-tracking [--hand-model PATH]
+  --exclude-serial SERIAL (runtime'da yerel kamerayi baslatma; tekrarlanabilir)
   --require-ptp  (PTP MASTER/SLAVE kilitli degilse baslatma; kayit boyunca izle)
 
-Bu betik iki kamerayi ayni terminalden yonetir. Ctrl+C ikisini de kapatir.
+Bu betik roldeki kameralari ayni terminalden yonetir. Ctrl+C hepsini kapatir.
 EOF
 }
 
@@ -56,6 +58,7 @@ while (($#)); do
     --record-local) record_local=1; shift ;;
     --record-svo2) record_svo2=1; shift ;;
     --hand-tracking) hand_tracking=1; shift ;;
+    --exclude-serial) excluded_serials+=("${2:?}"); shift 2 ;;
     --require-ptp) require_ptp=1; shift ;;
     --hand-model) hand_model="${2:?}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
@@ -83,6 +86,42 @@ case "$role" in
   *) echo "--role laptop veya main-pc olmali." >&2; usage >&2; exit 2 ;;
 esac
 case "$fps" in 15|30) ;; *) echo "Dort kamera icin --fps 15 veya 30 olmali." >&2; exit 2 ;; esac
+if (( calibration_mode && ${#excluded_serials[@]} > 0 )); then
+  echo "Kalibrasyon modunda kamera dislanamaz; roldeki iki kamera da zorunludur." >&2
+  exit 2
+fi
+declare -A excluded_serial_set=()
+for excluded in "${excluded_serials[@]}"; do
+  found=0
+  for serial in "${serials[@]}"; do
+    [[ "$serial" == "$excluded" ]] && found=1
+  done
+  (( found )) || { echo "ZED $excluded, $role rolunde degil." >&2; exit 2; }
+  [[ -z "${excluded_serial_set[$excluded]:-}" ]] || {
+    echo "Ayni --exclude-serial birden cok verildi: $excluded" >&2
+    exit 2
+  }
+  excluded_serial_set[$excluded]=1
+done
+if ((${#excluded_serial_set[@]})); then
+  kept_serials=()
+  kept_body_ports=()
+  kept_preview_ports=()
+  kept_hand_ports=()
+  for index in "${!serials[@]}"; do
+    serial="${serials[$index]}"
+    [[ -n "${excluded_serial_set[$serial]:-}" ]] && continue
+    kept_serials+=("$serial")
+    kept_body_ports+=("${body_ports[$index]}")
+    kept_preview_ports+=("${preview_ports[$index]}")
+    kept_hand_ports+=("${hand_ports[$index]}")
+  done
+  serials=("${kept_serials[@]}")
+  body_ports=("${kept_body_ports[@]}")
+  preview_ports=("${kept_preview_ports[@]}")
+  hand_ports=("${kept_hand_ports[@]}")
+fi
+((${#serials[@]} > 0)) || { echo "$role rolunde baslatilacak kamera kalmadi." >&2; exit 2; }
 [[ -x "$zed_python" ]] || { echo "ZED Python bulunamadi: $zed_python" >&2; exit 1; }
 ptp_interface=""
 if (( require_ptp )); then
@@ -138,7 +177,7 @@ if (( require_ptp )); then
   pids+=("$!")
   echo "PTP OTURUM KAYDI: $ptp_record"
 fi
-for index in 0 1; do
+for index in "${!serials[@]}"; do
   serial="${serials[$index]}"
   args=(
     --serial "$serial"
@@ -169,8 +208,8 @@ for index in 0 1; do
   sleep 1
 done
 
-echo "4-ZED kaynak rolu=$role | host=$source_host_id | BODY/JPEG hedefi=$target_host"
-echo "Seriler: ${serials[*]} | Ctrl+C iki kaynagi da guvenli kapatir."
+echo "ZED kaynak rolu=$role | host=$source_host_id | BODY/JPEG hedefi=$target_host"
+echo "Seriler: ${serials[*]} | Ctrl+C tum kaynaklari guvenli kapatir."
 if (( calibration_mode )); then
   echo "KALIBRASYON MODU: odada tek kisi olsun; iki preview'da da ayni operator LOCKED olmali."
 fi

@@ -1675,7 +1675,8 @@ def draw_four_preview(
     grid = np.vstack((np.hstack((tiles[0], tiles[1])), np.hstack((tiles[2], tiles[3]))))
     footer = np.zeros((58, grid.shape[1], 3), dtype=np.uint8)
     spread = f"{arrival_spread_ms:.1f} ms" if math.isfinite(arrival_spread_ms) else "n/a"
-    cv2.putText(footer, f"4-ZED | bagli={len(connected)}/4 taze={len(body_fresh)}/4 katki={len(contributing)}/4 fusion={output_hz:.1f}fps yayilim={spread}", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80, 235, 235), 1, cv2.LINE_AA)
+    source_count = len(endpoints)
+    cv2.putText(footer, f"{source_count}-ZED | bagli={len(connected)}/{source_count} taze={len(body_fresh)}/{source_count} katki={len(contributing)}/{source_count} fusion={output_hz:.1f}fps yayilim={spread}", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (80, 235, 235), 1, cv2.LINE_AA)
     cv2.putText(footer, f"REC={'ON' if recording else 'OFF'} kare={recorded} drop={record_dropped} | S kayit | Q/ESC cikis", (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (60, 220, 80) if recording else (200, 200, 200), 1, cv2.LINE_AA)
     return np.vstack((grid, footer))
 
@@ -2142,9 +2143,9 @@ def make_output_packet(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Iki-host, dort-ZED application BODY_38 fusion alicisi")
-    parser.add_argument("--source", type=parse_endpoint, action="append", required=True, help="Her kamera icin SERIAL:UDP_PORT; dort kez verin.")
-    parser.add_argument("--hand-source", type=parse_endpoint, action="append", default=[], help="21-landmark kanali icin SERIAL:UDP_PORT; el takibinde dort kez verin.")
+    parser = argparse.ArgumentParser(description="Iki-host, uc/dort-ZED application BODY_38 fusion alicisi")
+    parser.add_argument("--source", type=parse_endpoint, action="append", required=True, help="Her kamera icin SERIAL:UDP_PORT; runtime'da uc veya dort kez verin.")
+    parser.add_argument("--hand-source", type=parse_endpoint, action="append", default=[], help="21-landmark kanali icin SERIAL:UDP_PORT; el takibinde kaynak sayisi kadar verin.")
     parser.add_argument("--hand-tracking", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dex3-retargeting", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hand-max-age-ms", type=float, default=120.0)
@@ -2153,7 +2154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dex3-config", type=Path, default=REPOSITORY_ROOT / "config" / "g1_23dof_dex3.json")
     parser.add_argument("--dex3-official-root", type=Path, default=None, help="Opsiyonel resmi unitreerobotics/xr_teleoperate checkout yolu")
     parser.add_argument("--dex3-official-python", type=Path, default=None, help="Resmi DexPilot icin izole Python ortami")
-    parser.add_argument("--preview-source", type=parse_endpoint, action="append", default=[], help="Canli JPEG icin SERIAL:UDP_PORT; arayuz icin dort kez verin.")
+    parser.add_argument("--preview-source", type=parse_endpoint, action="append", default=[], help="Canli JPEG icin SERIAL:UDP_PORT; arayuz icin kaynak sayisi kadar verin.")
     parser.add_argument("--bind", default="0.0.0.0", help="Dinlenecek PC IPv4 adresi (varsayilan tum arayuzler).")
     parser.add_argument("--extrinsics", type=Path, default=None, help="Kalibre edilmis zed_body38_distributed_extrinsics/v1 JSON dosyasi.")
     parser.add_argument("--output-host", default="", help="Birlesik BODY_38 UDP hedefi; bos ise cikis yayini kapali.")
@@ -2214,6 +2215,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_endpoint_configuration(
+    endpoints: list[InputEndpoint],
+    preview_endpoints: list[InputEndpoint],
+    hand_endpoints: list[InputEndpoint],
+    *,
+    hand_tracking: bool,
+    calibration_record: Path | None,
+    minimum_sources: int,
+) -> str | None:
+    """Keep four-camera calibration strict while permitting a 3-camera runtime."""
+    source_count = len(endpoints)
+    serials = {item.serial for item in endpoints}
+    ports = {item.port for item in endpoints}
+    if source_count not in (3, 4) or len(serials) != source_count or len(ports) != source_count:
+        return "runtime icin uc veya dort farkli SERIAL:PORT kaynagi gerekli."
+    if calibration_record is not None and source_count != 4:
+        return "kalibrasyon kaydi tam dort farkli kamera gerektirir."
+    if minimum_sources > source_count:
+        return f"--minimum-sources ({minimum_sources}) kaynak sayisini ({source_count}) asamaz."
+    if preview_endpoints and (
+        len(preview_endpoints) != source_count
+        or {item.serial for item in preview_endpoints} != serials
+        or len({item.port for item in preview_endpoints}) != source_count
+    ):
+        return "onizleme kaynaklari runtime BODY kaynaklariyla bire bir eslesmeli."
+    if hand_tracking and (
+        len(hand_endpoints) != source_count
+        or {item.serial for item in hand_endpoints} != serials
+        or len({item.port for item in hand_endpoints}) != source_count
+    ):
+        return "el kaynaklari runtime BODY kaynaklariyla bire bir eslesmeli."
+    return None
+
+
 def main() -> int:
     args = parse_args()
     endpoints: list[InputEndpoint] = args.source
@@ -2235,22 +2270,16 @@ def main() -> int:
         serial: float(source_priorities.get(serial, 1.0))
         for serial in configured_serials
     }
-    if len(endpoints) != 4 or len({item.serial for item in endpoints}) != 4 or len({item.port for item in endpoints}) != 4:
-        print("HATA: tam dort farkli SERIAL:PORT kaynagi gerekli.", file=sys.stderr)
-        return 2
-    if preview_endpoints and (
-        len(preview_endpoints) != 4
-        or {item.serial for item in preview_endpoints} != {item.serial for item in endpoints}
-        or len({item.port for item in preview_endpoints}) != 4
-    ):
-        print("HATA: onizleme icin ayni dort seriye ait dort farkli SERIAL:PORT gerekli.", file=sys.stderr)
-        return 2
-    if args.hand_tracking and (
-        len(hand_endpoints) != 4
-        or {item.serial for item in hand_endpoints} != {item.serial for item in endpoints}
-        or len({item.port for item in hand_endpoints}) != 4
-    ):
-        print("HATA: el takibi icin ayni dort seriye ait dort farkli --hand-source gerekli.", file=sys.stderr)
+    endpoint_error = validate_endpoint_configuration(
+        endpoints,
+        preview_endpoints,
+        hand_endpoints,
+        hand_tracking=args.hand_tracking,
+        calibration_record=args.calibration_record,
+        minimum_sources=args.minimum_sources,
+    )
+    if endpoint_error is not None:
+        print(f"HATA: {endpoint_error}", file=sys.stderr)
         return 2
     if preview_endpoints and not args.headless and cv2 is None:
         print("HATA: dortlu arayuz icin opencv-python kurulu olmali.", file=sys.stderr)
@@ -3203,14 +3232,14 @@ def main() -> int:
                     for item in endpoints
                 )
                 print(
-                    f"DURUM | bagli={len(online_serials)}/4 [{', '.join(map(str, online_serials)) or 'yok'}] "
-                    f"| body_taze={len(body_serials)}/4 [{', '.join(map(str, body_serials)) or 'yok'}] | input={input_packets} "
+                    f"DURUM | bagli={len(online_serials)}/{len(endpoints)} [{', '.join(map(str, online_serials)) or 'yok'}] "
+                    f"| body_taze={len(body_serials)}/{len(endpoints)} [{', '.join(map(str, body_serials)) or 'yok'}] | input={input_packets} "
                     f"| ham_kayit={raw_records} | fusion_cikis={fused_packets} "
                     f"| son_katki=[{', '.join(map(str, last_fused_serials)) or 'yok'}] "
                     f"| fusion_fps={event_rate(output_events, now):.1f} "
                     f"| gmr_kapi={last_gmr_gate} "
                     f"| yayilim_ms={last_arrival_spread_ms:.1f} "
-                    f"| dortlu_bekleme_ms={last_full_set_wait_applied_ms:.1f} "
+                    f"| tam_set_bekleme_ms={last_full_set_wait_applied_ms:.1f} "
                     f"| rec={recorded}/drop={record_dropped}/q={record_queue.qsize()} "
                     f"| el_rx="
                     f"{sum(v['separate'] for v in hand_rx.values())}+"

@@ -38,6 +38,7 @@ from zed_four_camera_test.distributed_body38_fusion import (
     prepare_aligned_views,
     synchronized_samples,
     temporal_compensate_samples,
+    validate_endpoint_configuration,
     valid_body38_payload,
     world_forward_in_workspace,
     workspace_membership_with_hysteresis,
@@ -450,6 +451,69 @@ def test_load_extrinsics_preserves_explicit_reference_serial(tmp_path) -> None:
     assert set(loaded.cameras) == {39504762, 31571870, 33773329, 34760587}
 
 
+def test_three_camera_runtime_endpoint_configuration_is_allowed(tmp_path) -> None:
+    endpoints = [
+        InputEndpoint(39504762, 16000),
+        InputEndpoint(31571870, 16002),
+        InputEndpoint(33773329, 16004),
+    ]
+    previews = [
+        InputEndpoint(39504762, 16100),
+        InputEndpoint(31571870, 16102),
+        InputEndpoint(33773329, 16104),
+    ]
+    assert validate_endpoint_configuration(
+        endpoints,
+        previews,
+        [],
+        hand_tracking=False,
+        calibration_record=None,
+        minimum_sources=2,
+    ) is None
+    assert "tam dort" in (validate_endpoint_configuration(
+        endpoints,
+        previews,
+        [],
+        hand_tracking=False,
+        calibration_record=tmp_path / "capture.jsonl",
+        minimum_sources=2,
+    ) or "")
+    assert "kaynak sayisini" in (validate_endpoint_configuration(
+        endpoints,
+        previews,
+        [],
+        hand_tracking=False,
+        calibration_record=None,
+        minimum_sources=4,
+    ) or "")
+
+
+def test_load_extrinsics_accepts_three_camera_runtime_subset(tmp_path) -> None:
+    path = tmp_path / "extrinsics.json"
+    path.write_text(json.dumps({
+        "schema": "zed_body38_distributed_extrinsics/v1",
+        "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+        "units": "meter",
+        "reference_world_serial": 33773329,
+        "cameras": {
+            str(serial): {
+                "rotation_camera_to_world": np.eye(3).tolist(),
+                "translation_camera_to_world_m": [0.0, 0.0, 0.0],
+            }
+            for serial in (31571870, 33773329, 34760587, 39504762)
+        },
+    }), encoding="utf-8")
+    endpoints = [
+        InputEndpoint(39504762, 16000),
+        InputEndpoint(31571870, 16002),
+        InputEndpoint(33773329, 16004),
+    ]
+    loaded = load_extrinsics(path, endpoints)
+    assert loaded is not None
+    assert loaded.reference_serial == 33773329
+    assert set(loaded.cameras) == {39504762, 31571870, 33773329}
+
+
 def test_zed360_transforms_are_rebased_to_selected_reference_camera() -> None:
     world_from_reference = np.eye(4)
     world_from_reference[:3, 3] = [4.0, -2.0, 0.5]
@@ -578,6 +642,69 @@ def test_runtime_validator_accepts_time_separated_physical_calibration() -> None
             "fit": fit,
         }
     validate_document(document, expected_serials=serials, reference_serial=1)
+
+
+def test_rejected_fit_requires_explicit_simulation_scope_and_stays_physical_fail_closed() -> None:
+    serials = {1, 2, 3, 4}
+    document = {
+        "schema": "zed_body38_distributed_extrinsics/v1",
+        "coordinate_system": "RIGHT_HANDED_Z_UP_X_FWD",
+        "units": "meter",
+        "reference_world_serial": 1,
+        "method": "weighted_torso_kabsch_imu_temporal_holdout_v2",
+        "activation_scope": "simulation_only",
+        "quality_gate_passed": False,
+        "simulation_override": {
+            "approved_for": "simulation_only",
+            "strict_quality_gate_passed": False,
+        },
+        "calibration_policy": {"maximum_pair_delta_ms": 20.0, "imu_tilt_required": True},
+        "cameras": {},
+    }
+    for serial in serials:
+        fit = {"reference": True} if serial == 1 else {
+            "capture_samples": 500,
+            "holdout_capture_samples": 150,
+            "candidate_keypoints": 5000,
+            "paired_keypoints": 4000,
+            "inlier_ratio": 0.8,
+            "rms_m": 0.08,
+            "pelvis_p95_m": 0.20,
+            "pelvis_reference_motion_m": 0.6,
+            "pelvis_motion_scale_ratio": 0.98,
+            "pelvis_trajectory_correlation": 0.98,
+            "holdout_full_body_all_valid": {"p95_m": 0.22},
+            "holdout_torso_all_valid": {"p95_m": 0.16, "mean_bias_m": 0.02},
+            "imu_tilt_constraint": {"available": True, "correction_deg": 13.0},
+            "quality_gate_passed": False,
+        }
+        document["cameras"][str(serial)] = {
+            "rotation_camera_to_world": np.eye(3).tolist(),
+            "translation_camera_to_world_m": [0.0, 0.0, 0.0] if serial == 1 else [float(serial), 0.0, 0.0],
+            "fit": fit,
+        }
+    validate_document(document, expected_serials=serials, reference_serial=1,
+                      simulation_only=True)
+    with pytest.raises(ValueError):
+        validate_document(document, expected_serials=serials, reference_serial=1)
+    document["simulation_override"]["approved_for"] = "physical"
+    with pytest.raises(ValueError):
+        validate_document(document, expected_serials=serials, reference_serial=1,
+                          simulation_only=True)
+    document["simulation_override"]["approved_for"] = "simulation_only"
+    document["cameras"]["2"]["fit"]["imu_tilt_constraint"]["correction_deg"] = 22.0
+    with pytest.raises(ValueError):
+        validate_document(document, expected_serials=serials, reference_serial=1,
+                          simulation_only=True)
+    document["simulation_override"]["shadow_evaluation"] = True
+    validate_document(document, expected_serials=serials, reference_serial=1,
+                      simulation_only=True)
+    with pytest.raises(ValueError):
+        validate_document(document, expected_serials=serials, reference_serial=1)
+    document["cameras"]["2"]["fit"]["imu_tilt_constraint"]["correction_deg"] = 26.0
+    with pytest.raises(ValueError):
+        validate_document(document, expected_serials=serials, reference_serial=1,
+                          simulation_only=True)
 
 
 def test_pelvis_trajectory_gate_rejects_stationary_wrong_person() -> None:
