@@ -1,5 +1,6 @@
 """The calibration lock gate must accept current PMC data, not stale log text."""
 
+import signal
 from unittest.mock import patch
 
 from tools import monitor_ptp_sync_ubuntu as monitor
@@ -31,3 +32,16 @@ def test_summary_only_journal_uses_readonly_pmc_offset():
 def test_missing_grandmaster_or_large_offset_stays_unlocked():
     assert _snapshot("portState SLAVE\nmaster_offset 250\ngmPresent false\n")["locked"] is False
     assert _snapshot("portState SLAVE\nmaster_offset 1000001\ngmPresent true\n")["locked"] is False
+
+
+def test_footer_finalization_masks_repeated_shutdown_signals():
+    with patch.object(monitor.signal, "signal") as register:
+        monitor.mask_shutdown_signals()
+
+    expected = [
+        ((signal.SIGINT, signal.SIG_IGN),),
+        ((signal.SIGTERM, signal.SIG_IGN),),
+    ]
+    if hasattr(signal, "SIGHUP"):
+        expected.append(((signal.SIGHUP, signal.SIG_IGN),))
+    assert [call.args for call in register.call_args_list] == [item[0] for item in expected]

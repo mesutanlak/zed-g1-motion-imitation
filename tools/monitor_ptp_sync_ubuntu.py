@@ -101,6 +101,20 @@ def snapshot(role: str, interface: str, maximum_offset_ns: int) -> dict[str, Any
     }
 
 
+def mask_shutdown_signals() -> None:
+    """Keep a second launcher signal from interrupting the footer write.
+
+    The camera launcher and the terminal's foreground process group can both
+    deliver SIGINT during Ctrl+C shutdown.  Once the monitor is finalizing,
+    another shutdown signal must not leave an otherwise valid PTP journal
+    without its clean-shutdown footer.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
 def main() -> int:
     # Bash may launch this monitor as an asynchronous job with SIGINT ignored.
     # Restore Python's handler so the camera launcher's Ctrl+C can write a
@@ -150,6 +164,7 @@ def main() -> int:
         return 3 if args.require_locked and ever_unlocked else 0
     finally:
         if output is not None:
+            mask_shutdown_signals()
             output.write(json.dumps({
                 "schema": "g1_zed_ptp_lock_footer/v1",
                 "timestamp_unix_ns": time.time_ns(),
