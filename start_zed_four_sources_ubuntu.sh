@@ -68,18 +68,18 @@ done
 
 case "$role" in
   laptop)
-    serials=(39504762 34760587)
-    body_ports=(16000 16006)
-    preview_ports=(16100 16106)
-    hand_ports=(16200 16206)
-    target_host="$main_pc_host"
-    source_host_id="Laptop"
-    ;;
-  main-pc)
     serials=(31571870 33773329)
     body_ports=(16002 16004)
     preview_ports=(16102 16104)
     hand_ports=(16202 16204)
+    target_host="$main_pc_host"
+    source_host_id="Laptop"
+    ;;
+  main-pc)
+    serials=(39504762 34760587)
+    body_ports=(16000 16006)
+    preview_ports=(16100 16106)
+    hand_ports=(16200 16206)
     target_host="127.0.0.1"
     source_host_id="MainPc"
     ;;
