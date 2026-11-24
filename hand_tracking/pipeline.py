@@ -257,6 +257,13 @@ class HandSourcePipeline:
                 })
                 continue
             points_px = np.asarray(selected["landmarks_px"], dtype=float)
+            pixel_min = np.min(points_px, axis=0)
+            pixel_max = np.max(points_px, axis=0)
+            hand_bbox_px = [
+                float(pixel_min[0]), float(pixel_min[1]),
+                float(pixel_max[0] - pixel_min[0]),
+                float(pixel_max[1] - pixel_min[1]),
+            ]
             wrist3d = source["wrist3d"]
             wrist_depth = (
                 float(wrist3d[0])
@@ -291,6 +298,7 @@ class HandSourcePipeline:
                 "roi_xywh": list(roi),
                 "candidate_count": len(full_candidates),
                 "landmarks_px": points_px.tolist(),
+                "hand_bbox_px": hand_bbox_px,
                 "relative_landmarks_m": selected.get("relative_landmarks_m"),
                 "landmark_confidence": [float(value) for value in confidence],
                 "camera_points_m": camera_points,

@@ -18,8 +18,10 @@ from dataclasses import dataclass
 from itertools import combinations
 import json
 import math
+import os
 from pathlib import Path
 import queue
+import re
 import selectors
 import socket
 import sys
@@ -47,6 +49,10 @@ from motion_pipeline.calibration import to_pelvis_local
 from motion_pipeline.telemetry import AsyncJsonUdpPublisher
 from motion_pipeline.udp_codec import decode_json_datagram
 from hand_tracking.contracts import validate_hand_packet
+from hand_tracking.gesture import (
+    GESTURE_SCHEMA, GestureDex3Retargeter, compact_gesture_packet, fuse_gesture_packets,
+    valid_gesture_packet,
+)
 from hand_tracking.fusion import CameraPose, fuse_hand_packets, interpolate_landmarks
 from hand_tracking.normalization import PalmNormalizer
 from hand_tracking.retargeting import (
@@ -84,6 +90,41 @@ class Sample:
     capture_timeline_ns: int | None = None
     source_clock_offset_ns: int | None = None
     source_host_id: str = ""
+
+
+def raw_body38_observations(
+    views: list[tuple[Sample, Any]], histories: dict[int, deque[Sample]],
+) -> list[dict[str, Any]]:
+    """Recover original camera packets for disk only, before temporal alignment."""
+    observations = []
+    selected_by_serial = {sample.serial: sample for sample, _ in views}
+    for serial, history in sorted(histories.items()):
+        selected = selected_by_serial.get(serial)
+        original = (next((item for item in reversed(history)
+                          if item.sequence == selected.sequence and
+                          item.capture_timeline_ns == selected.capture_timeline_ns), None)
+                    if selected is not None else (history[-1] if history else None))
+        source = original.packet if original is not None else {}
+        observations.append({
+            "serial_number": serial,
+            "sequence": original.sequence if original else None,
+            "selected_for_fusion": selected is not None,
+            "raw_source_status": "RECORDED" if original is not None else "NOT_RETAINED",
+            "source_host_id": original.source_host_id if original else None,
+            "research_session_id": source.get("research_session_id"),
+            "clock_sync": source.get("clock_sync"),
+            "capture_timestamp_ns": source.get("timestamp_ns"),
+            "receiver_timestamp_ns": original.received_ns if original else None,
+            "source_latency_trace_ns": source.get("latency_trace_ns"),
+            "source_transport_metrics": source.get("transport_metrics"),
+            "normalized_capture_timestamp_ns": original.capture_timeline_ns if original else None,
+            "keypoint_names": source.get("keypoint_names"),
+            "keypoints_3d_camera_m": source.get("keypoints_3d_m"),
+            "keypoint_confidence": source.get("keypoint_confidence"),
+            "occlusion_analysis": source.get("occlusion_analysis"),
+            "operator_selection": source.get("operator_selection"),
+        })
+    return observations
 
 
 @dataclass(frozen=True)
@@ -1371,7 +1412,7 @@ def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
     analysis fields cannot stop the real-time control path again.
     """
     keep = (
-        "schema", "source_serial", "source_host_id", "sequence",
+        "schema", "source_serial", "source_host_id", "research_session_id", "clock_sync", "sequence",
         "timestamp_ns", "coordinate_system", "units", "body_id",
         "unique_object_id", "tracking_state", "action_state",
         "body_confidence", "root_position_m", "global_root_orientation_xyzw",
@@ -1450,7 +1491,8 @@ def compact_live_packet(packet: dict[str, Any]) -> dict[str, Any]:
                 "status", "body_fps", "rx_fps", "received_fps",
                 "capture_to_receive_ms", "received_latency_ms",
                 "corrected_capture_to_receive_ms", "network_queue_ms",
-                "source_host_id",
+                "source_host_id", "receiver_decode_ms", "source_grab_hz",
+                "source_body_hz", "source_configured_fps",
             )
             if key in source_metrics
         }
@@ -1487,8 +1529,9 @@ def compact_hand_analysis(value: dict[str, Any]) -> dict[str, Any]:
             hand_summary = {
                 key: hand.get(key)
                 for key in (
-                    "side", "roi_xywh", "candidate_count", "inference_ms",
+                    "side", "roi_xywh", "hand_bbox_px", "candidate_count", "inference_ms",
                     "rejection_reason", "depth_valid_count",
+                    "state", "fist_score", "confidence", "reason",
                     "handedness_label", "handedness_score",
                     "handedness_mismatch", "association_score",
                     "projected_wrist_distance_px",
@@ -1509,6 +1552,7 @@ def compact_hand_analysis(value: dict[str, Any]) -> dict[str, Any]:
             "capture_timestamp_ns": root.get("capture_timestamp_ns"),
             "hands": fused_hands,
             "per_camera": per_camera,
+            "transport_health": root.get("transport_health"),
         }.items()
         if item is not None
     }
@@ -1797,6 +1841,7 @@ def make_output_packet(
             "normalized_capture_timestamp_ns": sample_timeline_ns(sample),
             "source_clock_offset_ns": sample.source_clock_offset_ns,
             "source_host_id": sample.source_host_id,
+            "clock_sync": sample.packet.get("clock_sync"),
             "receiver_timestamp_ns": sample.received_ns,
             "receiver_age_ms": (now_ns - sample.received_ns) / 1.0e6,
             "quality_score": item.quality,
@@ -2147,6 +2192,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", type=parse_endpoint, action="append", required=True, help="Her kamera icin SERIAL:UDP_PORT; runtime'da uc veya dort kez verin.")
     parser.add_argument("--hand-source", type=parse_endpoint, action="append", default=[], help="21-landmark kanali icin SERIAL:UDP_PORT; el takibinde kaynak sayisi kadar verin.")
     parser.add_argument("--hand-tracking", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--hand-gesture-only", action="store_true",
+                        help="Ac/kapat el siniflamasi; 3-D el fusion ve Dex3 retargeting yok")
     parser.add_argument("--dex3-retargeting", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hand-max-age-ms", type=float, default=120.0)
     parser.add_argument("--hand-max-spread-ms", type=float, default=70.0)
@@ -2251,6 +2298,11 @@ def validate_endpoint_configuration(
 
 def main() -> int:
     args = parse_args()
+    if args.hand_gesture_only and not args.hand_tracking:
+        print("HATA: --hand-gesture-only icin --hand-tracking gerekli.", file=sys.stderr)
+        return 2
+    if args.hand_gesture_only:
+        args.dex3_retargeting = False
     endpoints: list[InputEndpoint] = args.source
     preview_endpoints: list[InputEndpoint] = args.preview_source
     hand_endpoints: list[InputEndpoint] = args.hand_source
@@ -2428,6 +2480,7 @@ def main() -> int:
         AsyncJsonUdpPublisher(
             output_targets["monitor"][0],
             transform=encode_monitor_packet,
+            latest_only=True,
             maximum_datagram_bytes=UDP_SAFE_DATAGRAM_BYTES,
         )
         if "monitor" in output_targets else None
@@ -2458,7 +2511,16 @@ def main() -> int:
 
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    record_path = args.output_dir / f"{args.record_stem}_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+    candidate_session_id = os.environ.get("G1_RESEARCH_SESSION_ID", "")
+    research_session_id = (
+        candidate_session_id
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", candidate_session_id) else None
+    )
+    record_stem = (
+        f"{args.record_stem}_{research_session_id}"
+        if research_session_id else args.record_stem
+    )
+    record_path = args.output_dir / f"{record_stem}_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
     fusion_record_file = None
     recording = False
     recorded = 0
@@ -2505,8 +2567,9 @@ def main() -> int:
                 "body_sources": [{"serial": item.serial, "port": item.port} for item in endpoints],
                 "preview_sources": [{"serial": item.serial, "port": item.port} for item in preview_endpoints],
                 "hand_sources": [{"serial": item.serial, "port": item.port} for item in hand_endpoints],
-                "hand_schema": "zed_operator_hand/v1" if args.hand_tracking else None,
+                "hand_schema": (GESTURE_SCHEMA if args.hand_gesture_only else "zed_operator_hand/v1") if args.hand_tracking else None,
                 "record_detail": args.record_detail,
+                "research_session_id": research_session_id,
                 "extrinsics_path": str(resolved_extrinsics) if resolved_extrinsics else None,
                 "extrinsics": extrinsic_document,
                 "operator_workspace": {
@@ -2546,7 +2609,13 @@ def main() -> int:
         channel: str,
     ) -> bool:
         """Validate, timestamp-align and de-duplicate the dual hand transport."""
-        valid, _reason = validate_hand_packet(document)
+        if args.hand_gesture_only and isinstance(document, dict) and document.get("schema") == "zed_operator_hand/v1":
+            if not validate_hand_packet(document)[0]:
+                hand_rx[serial]["invalid"] += 1
+                return False
+            document = compact_gesture_packet(document)
+        valid = (valid_gesture_packet(document) if args.hand_gesture_only
+                 else validate_hand_packet(document)[0])
         if not valid or int(document.get("camera_serial", 0)) != int(serial):
             hand_rx[serial]["invalid"] += 1
             return False
@@ -2575,6 +2644,7 @@ def main() -> int:
             if args.dex3_official_root else None
         )
         dex3_retargeter = Dex3Retargeter(args.dex3_config, solver=dex3_solver) if args.hand_tracking and args.dex3_retargeting else None
+        gesture_retargeter = GestureDex3Retargeter(args.dex3_config) if args.hand_gesture_only else None
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"HATA: Dex3 config yuklenemedi: {exc}", file=sys.stderr)
         return 2
@@ -2677,6 +2747,7 @@ def main() -> int:
                 while True:
                     try:
                         payload, _sender = key.fileobj.recvfrom(65535)
+                        payload_received_ns = time.time_ns()
                     except BlockingIOError:
                         break
                     except OSError:
@@ -2689,7 +2760,7 @@ def main() -> int:
                     if not isinstance(document, dict):
                         invalid_packets += 1
                         continue
-                    received_ns = time.time_ns()
+                    received_ns = payload_received_ns
                     last_any_packet_ns[endpoint.serial] = received_ns
                     any_events[endpoint.serial].append(time.monotonic())
                     if document.get("schema") == "zed_body38_live/status/v1":
@@ -2729,7 +2800,15 @@ def main() -> int:
                         source_host_id, document, received_ns
                     )
                     source_metrics[endpoint.serial].update(clock_metrics)
+                    source_metrics[endpoint.serial]["receiver_decode_ms"] = max(
+                        0.0, (time.time_ns() - payload_received_ns) / 1e6
+                    )
                     source_metrics[endpoint.serial]["source_host_id"] = source_host_id
+                    source_transport = document.get("transport_metrics") or {}
+                    source_config = document.get("source_configuration") or {}
+                    source_metrics[endpoint.serial]["source_grab_hz"] = source_transport.get("camera_grab_hz_observed")
+                    source_metrics[endpoint.serial]["source_body_hz"] = source_transport.get("body_output_hz_observed")
+                    source_metrics[endpoint.serial]["source_configured_fps"] = source_config.get("fps")
                     source_metrics[endpoint.serial]["capture_to_receive_ms"] = clock_metrics.get(
                         "corrected_capture_to_receive_ms"
                     )
@@ -2907,6 +2986,7 @@ def main() -> int:
                             "source_transport": sample.packet.get("transport_metrics") or {},
                         })
                     effective_hz = event_rate(output_events, now)
+                    fusion_compute_started_ns = time.time_ns()
                     packet = make_output_packet(
                         views,
                         minimum_confidence=args.confidence,
@@ -2931,6 +3011,14 @@ def main() -> int:
                             args.source_priority_recovery
                         ),
                     )
+                    fusion_compute_done_ns = time.time_ns()
+                    packet["latency_trace_ns"]["t3_application_fused_ns"] = fusion_compute_done_ns
+                    packet["transport_metrics"]["fusion_compute_ms"] = (
+                        fusion_compute_done_ns - fusion_compute_started_ns
+                    ) / 1e6
+                    if research_session_id:
+                        packet["research_session_id"] = research_session_id
+                    hand_compute_started_ns = time.time_ns()
                     if args.hand_tracking and extrinsics is not None:
                         target_capture_ns = int(packet["timestamp_ns"])
                         selected_hand_packets: list[dict[str, Any]] = []
@@ -2958,7 +3046,11 @@ def main() -> int:
                                 continue
                             past = [item for item in normalized_items if item["capture_timestamp_ns"] <= target_capture_ns]
                             aligned = None
-                            if len(past) >= 2:
+                            if args.hand_gesture_only and past:
+                                aligned = past[-1]
+                            elif args.hand_gesture_only:
+                                aligned = min(normalized_items, key=lambda item: abs(item["capture_timestamp_ns"] - target_capture_ns))
+                            elif len(past) >= 2:
                                 aligned = interpolate_landmarks(
                                     past[-2], past[-1], target_capture_ns,
                                     maximum_prediction_ms=args.hand_max_age_ms,
@@ -2973,20 +3065,34 @@ def main() -> int:
                             serial: CameraPose(value.rotation, value.translation)
                             for serial, value in extrinsics.cameras.items()
                         }
-                        fused_hands = fuse_hand_packets(
-                            selected_hand_packets, camera_poses,
-                            target_timestamp_ns=target_capture_ns,
-                            maximum_age_ms=args.hand_max_age_ms,
-                            maximum_capture_spread_ms=args.hand_max_spread_ms,
-                            single_view_depth=args.hand_single_view_depth,
-                        )
+                        if args.hand_gesture_only:
+                            fused_hands = fuse_gesture_packets(
+                                selected_hand_packets, target_capture_ns,
+                                maximum_age_ms=args.hand_max_age_ms,
+                                maximum_capture_spread_ms=args.hand_max_spread_ms,
+                            )
+                        else:
+                            fused_hands = fuse_hand_packets(
+                                selected_hand_packets, camera_poses,
+                                target_timestamp_ns=target_capture_ns,
+                                maximum_age_ms=args.hand_max_age_ms,
+                                maximum_capture_spread_ms=args.hand_max_spread_ms,
+                                single_view_depth=args.hand_single_view_depth,
+                            )
                         fused_hands["per_camera"] = selected_hand_packets
                         fused_hands["transport_health"] = {
                             str(serial): dict(counts)
                             for serial, counts in hand_rx.items()
                         }
                         dex3_targets: dict[str, Any] = {"physical_robot_output_enabled": False}
-                        for hand in fused_hands["hands"]:
+                        if gesture_retargeter is not None:
+                            for hand in fused_hands["hands"]:
+                                side = hand["side"]
+                                dex3_targets[side] = gesture_retargeter.update(
+                                    side, hand["state"], target_capture_ns,
+                                    float(hand["confidence"]),
+                                )
+                        for hand in ([] if args.hand_gesture_only else fused_hands["hands"]):
                             side = hand["side"]
                             normalized = None
                             confidence = 0.0
@@ -3019,7 +3125,14 @@ def main() -> int:
                                 dex3_targets["right"],
                             )
                         packet["hand_tracking"] = fused_hands
-                        packet["dex3_targets"] = dex3_targets
+                        if not args.hand_gesture_only:
+                            packet["dex3_targets"] = dex3_targets
+                        elif gesture_retargeter is not None:
+                            packet["dex3_targets"] = dex3_targets
+                    if args.hand_tracking:
+                        packet["transport_metrics"]["hand_fusion_and_retarget_ms"] = (
+                            time.time_ns() - hand_compute_started_ns
+                        ) / 1e6
                     calibration_state = str(
                         (packet.get("calibration") or {}).get("state", "MISSING")
                     )
@@ -3074,11 +3187,16 @@ def main() -> int:
                             name: dict(statistics)
                             for name, statistics in control_publish_statistics.items()
                         }
+                        serialization_started_ns = time.time_ns()
                         compact = compact_live_packet(packet)
                         compact_encoded = json.dumps(
                             compact, ensure_ascii=False, allow_nan=False,
                             separators=(",", ":"),
                         ).encode("utf-8")
+                        packet["transport_metrics"]["control_serialize_ms"] = (
+                            time.time_ns() - serialization_started_ns
+                        ) / 1e6
+                        packet["transport_metrics"]["control_datagram_bytes"] = len(compact_encoded)
                         if len(compact_encoded) > UDP_SAFE_DATAGRAM_BYTES:
                             print(
                                 f"HATA: kontrol fusion UDP paketi cok buyuk "
@@ -3090,6 +3208,7 @@ def main() -> int:
                             # The detailed monitor packet is encoded on its own
                             # worker so Rerun/disk pressure cannot stall fusion.
                             if output_socket is not None:
+                                control_send_started_ns = time.time_ns()
                                 for target_name in ("gmr", "ros"):
                                     target_config = synchronous_targets.get(target_name)
                                     if target_config is None:
@@ -3118,6 +3237,9 @@ def main() -> int:
                                             f"UYARI: {target_name} UDP gonderilemedi: {exc}",
                                             file=sys.stderr,
                                         )
+                                packet["transport_metrics"]["control_send_calls_ms"] = (
+                                    time.time_ns() - control_send_started_ns
+                                ) / 1e6
                             packet["transport_metrics"][
                                 "control_publishers"
                             ] = {
@@ -3158,6 +3280,13 @@ def main() -> int:
                                         if args.record_detail == "minimal"
                                         else research_record_packet(packet)
                                     )
+                                    if args.record_detail == "full":
+                                        record_item = dict(record_item,
+                                            raw_camera_body38=raw_body38_observations(
+                                                views, histories))
+                                    if research_session_id:
+                                        record_item = dict(record_item,
+                                                           research_session_id=research_session_id)
                                     record_queue.put_nowait(record_item)
                                 except queue.Full:
                                     record_dropped += 1
@@ -3267,6 +3396,16 @@ def main() -> int:
             writer_stop.set()
             if writer_thread is not None:
                 writer_thread.join(timeout=5.0)
+            fusion_record_file.write(json.dumps({
+                "schema": "zed_four_body38_g1_reference/footer/v1",
+                "kind": "record_footer",
+                "research_session_id": research_session_id,
+                "recorded_frames": recorded,
+                "dropped_frames": record_dropped,
+                "writer_errors": writer_errors,
+                "clean_shutdown": not writer_errors and not record_dropped
+                                  and (writer_thread is None or not writer_thread.is_alive()),
+            }, ensure_ascii=False, allow_nan=False) + "\n")
             fusion_record_file.flush()
             fusion_record_file.close()
         if cv2 is not None and not args.headless:

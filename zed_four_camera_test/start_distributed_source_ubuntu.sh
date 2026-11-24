@@ -18,6 +18,7 @@ preview_host=""
 preview_port="16100"
 preview_hz="8"
 hand_tracking=0
+hand_gesture_only=0
 hand_model="$project/models/hand_landmarker.task"
 hand_delegate="cpu"
 hand_inference_fps="8"
@@ -38,7 +39,7 @@ Kullanim: start_distributed_source_ubuntu.sh --serial N --target-host IP --targe
   --distance-min M --distance-max M
   --disable-distance-gate
   --preview-host IP --preview-port PORT --preview-hz HZ
-  --hand-tracking --hand-model PATH --hand-port PORT
+  --hand-tracking --hand-model PATH --hand-port PORT [--hand-gesture-only]
   --record-local | --record-svo2
   --output-dir PATH --record-stem NAME
 EOF
@@ -61,6 +62,7 @@ while (($#)); do
     --preview-port) preview_port="${2:?}"; shift 2 ;;
     --preview-hz) preview_hz="${2:?}"; shift 2 ;;
     --hand-tracking) hand_tracking=1; shift ;;
+    --hand-gesture-only) hand_gesture_only=1; shift ;;
     --hand-model) hand_model="${2:?}"; shift 2 ;;
     --hand-delegate) hand_delegate="${2:?}"; shift 2 ;;
     --hand-inference-fps) hand_inference_fps="${2:?}"; shift 2 ;;
@@ -129,8 +131,12 @@ if (( hand_tracking )); then
     --hand-inference-fps "$hand_inference_fps"
     --hand-stream-host "$target_host"
     --hand-stream-port "$hand_port"
-    --embed-hand-in-body
   )
+  if (( hand_gesture_only )); then
+    args+=(--hand-gesture-only --no-dex3-retargeting)
+  else
+    args+=(--embed-hand-in-body)
+  fi
 fi
 
 echo "ZED $serial | BODY_38 -> $target_host:$target_port | preview=${preview_host:-kapali}:$preview_port"

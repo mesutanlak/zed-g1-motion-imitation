@@ -23,6 +23,7 @@ record_detail="research"
 workspace_x_min="2.0"
 workspace_x_max="4.0"
 hand_tracking=0
+hand_gesture_only=0
 hand_max_age_ms="120"
 hand_max_spread_ms="70"
 disable_dex3_retargeting=0
@@ -51,7 +52,7 @@ Kullanim: start_distributed_receiver_ubuntu.sh [secenekler]
   --exclude-source SERIAL          (yalniz runtime; tekrarlanabilir)
   --no-source-priority-recovery
   --workspace-x-min M --workspace-x-max M
-  --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
+  --hand-tracking [--hand-gesture-only] [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
   --disable-dex3-retargeting --disable-single-view-hand-depth
   --dex3-official-root PATH --dex3-official-python PATH
   --record [--record-stem NAME] [--record-detail minimal|research|full]
@@ -81,6 +82,7 @@ while (($#)); do
     --workspace-x-min) workspace_x_min="${2:?}"; shift 2 ;;
     --workspace-x-max) workspace_x_max="${2:?}"; shift 2 ;;
     --hand-tracking) hand_tracking=1; shift ;;
+    --hand-gesture-only) hand_gesture_only=1; shift ;;
     --hand-max-age-ms) hand_max_age_ms="${2:?}"; shift 2 ;;
     --hand-max-spread-ms) hand_max_spread_ms="${2:?}"; shift 2 ;;
     --disable-dex3-retargeting) disable_dex3_retargeting=1; shift ;;
@@ -98,6 +100,10 @@ while (($#)); do
 done
 
 [[ -x "$zed_python" ]] || { echo "ZED Python bulunamadi: $zed_python" >&2; exit 1; }
+if (( hand_gesture_only && ! hand_tracking )); then
+  echo "--hand-gesture-only icin --hand-tracking gerekli." >&2
+  exit 2
+fi
 case "$minimum_sources" in 2|3|4) ;; *) echo "--minimum-sources 2, 3 veya 4 olmali." >&2; exit 2 ;; esac
 case "$record_detail" in minimal|research|full) ;; *) echo "--record-detail minimal, research veya full olmali." >&2; exit 2 ;; esac
 if [[ -n "$calibration_record" && -n "$extrinsics" ]]; then
@@ -180,6 +186,7 @@ if (( hand_tracking )); then
     --hand-max-age-ms "$hand_max_age_ms"
     --hand-max-spread-ms "$hand_max_spread_ms"
   )
+  (( hand_gesture_only )) && args+=(--hand-gesture-only)
   (( disable_dex3_retargeting )) && args+=(--no-dex3-retargeting)
   (( disable_single_view_hand_depth )) && args+=(--no-hand-single-view-depth)
   [[ -n "$dex3_official_root" ]] && args+=(--dex3-official-root "$dex3_official_root")

@@ -18,6 +18,7 @@ preview_hz=4
 record_local=0
 record_svo2=0
 hand_tracking=0
+hand_gesture_only=0
 require_ptp=0
 hand_model="$project/models/hand_landmarker.task"
 excluded_serials=()
@@ -34,7 +35,7 @@ Kullanim: ./start_zed_four_sources_ubuntu.sh --role laptop|main-pc [secenekler]
   --calibration-mode [--disable-calibration-distance-gate]
   --preview-hz HZ
   --record-local | --record-svo2
-  --hand-tracking [--hand-model PATH]
+  --hand-tracking [--hand-model PATH] [--hand-gesture-only]
   --exclude-serial SERIAL (runtime'da yerel kamerayi baslatma; tekrarlanabilir)
   --require-ptp  (PTP MASTER/SLAVE kilitli degilse baslatma; kayit boyunca izle)
 
@@ -58,6 +59,7 @@ while (($#)); do
     --record-local) record_local=1; shift ;;
     --record-svo2) record_svo2=1; shift ;;
     --hand-tracking) hand_tracking=1; shift ;;
+    --hand-gesture-only) hand_gesture_only=1; shift ;;
     --exclude-serial) excluded_serials+=("${2:?}"); shift 2 ;;
     --require-ptp) require_ptp=1; shift ;;
     --hand-model) hand_model="${2:?}"; shift 2 ;;
@@ -86,6 +88,10 @@ case "$role" in
   *) echo "--role laptop veya main-pc olmali." >&2; usage >&2; exit 2 ;;
 esac
 case "$fps" in 15|30) ;; *) echo "Dort kamera icin --fps 15 veya 30 olmali." >&2; exit 2 ;; esac
+if (( hand_gesture_only && ! hand_tracking )); then
+  echo "--hand-gesture-only icin --hand-tracking gerekli." >&2
+  exit 2
+fi
 if (( calibration_mode && ${#excluded_serials[@]} > 0 )); then
   echo "Kalibrasyon modunda kamera dislanamaz; roldeki iki kamera da zorunludur." >&2
   exit 2
@@ -202,6 +208,7 @@ for index in "${!serials[@]}"; do
   (( ! record_svo2 && record_local )) && args+=(--record-local)
   if (( hand_tracking )); then
     args+=(--hand-tracking --hand-model "$hand_model" --hand-port "${hand_ports[$index]}")
+    (( hand_gesture_only )) && args+=(--hand-gesture-only)
   fi
   "$launcher" "${args[@]}" > >(sed -u "s/^/[ZED $serial] /") 2> >(sed -u "s/^/[ZED $serial HATA] /" >&2) &
   pids+=("$!")

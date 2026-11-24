@@ -13,10 +13,12 @@ Official references:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sys
@@ -38,6 +40,7 @@ from motion_pipeline.operator_selector import OperatorSelector, OperatorState
 from hand_tracking.geometry import CameraIntrinsics
 from hand_tracking.mediapipe_backend import MediaPipeHandBackend
 from hand_tracking.pipeline import HandSourcePipeline
+from hand_tracking.gesture import compact_gesture_packet, valid_gesture_packet
 from hand_tracking.roi import RoiConfig
 from hand_tracking.single_camera import SingleCameraDex3Pipeline
 
@@ -473,7 +476,7 @@ def sanitize_for_json(value: Any) -> Any:
 
 
 SOURCE_NETWORK_FIELDS = (
-    "schema", "source_serial", "source_host_id", "sequence", "timestamp_ns",
+    "schema", "source_serial", "source_host_id", "research_session_id", "clock_sync", "sequence", "timestamp_ns",
     "coordinate_system", "units", "body_id", "unique_object_id",
     "tracking_state", "action_state", "body_confidence", "root_position_m",
     "global_root_orientation_xyzw", "keypoint_names", "keypoints_3d_m",
@@ -1143,6 +1146,10 @@ def parse_args() -> argparse.Namespace:
         help="Kilitli operator bilek ROI'lerinde 21-landmark el takibini ac",
     )
     parser.add_argument(
+        "--hand-gesture-only", action="store_true",
+        help="Yalniz acik/kapali el gozlemi; derinlik, parmak retargeting ve gomulu el kopyasi yok",
+    )
+    parser.add_argument(
         "--hand-model", type=Path, default=None,
         help="Resmi MediaPipe hand_landmarker.task yolu; otomatik indirilmez",
     )
@@ -1370,8 +1377,46 @@ def list_devices() -> int:
     return 0
 
 
+def read_ptp_status(path: str | None, now_ns: int) -> dict[str, Any]:
+    """Read fresh external clock evidence for telemetry only.
+
+    A PTP monitor can update this file independently of the camera process.
+    Missing/stale evidence is explicit and never authorizes motor output.
+    """
+    if not path:
+        return {"state": "NOT_MEASURED", "uncertainty_ns": None}
+    try:
+        with open(path, encoding="utf-8") as stream:
+            status = json.load(stream)
+        measured_ns = int(status["measured_unix_ns"])
+        uncertainty_ns = int(status["uncertainty_ns"])
+        offset_ns = int(status["offset_ns"])
+        age_ns = now_ns - measured_ns
+        if uncertainty_ns < 0 or age_ns < 0 or age_ns > 5_000_000_000:
+            return {"state": "STALE", "uncertainty_ns": None}
+        return {
+            "state": str(status.get("state", "UNKNOWN")),
+            "measured_unix_ns": measured_ns,
+            "offset_ns": offset_ns,
+            "uncertainty_ns": uncertainty_ns,
+            "age_ms": age_ns / 1e6,
+            "source": path,
+        }
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return {"state": "NOT_MEASURED", "uncertainty_ns": None}
+
+
 def main() -> int:
     args = parse_args()
+    candidate_research_id = os.environ.get("G1_RESEARCH_SESSION_ID", "")
+    research_session_id = (
+        candidate_research_id
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", candidate_research_id)
+        else None
+    )
+    ptp_status_path = os.environ.get("G1_PTP_STATUS_JSON")
+    ptp_status: dict[str, Any] = {"state": "NOT_MEASURED", "uncertainty_ns": None}
+    ptp_next_read_monotonic = 0.0
     if not 0 <= args.confidence <= 100:
         print("--confidence 0 ile 100 arasında olmalıdır.", file=sys.stderr)
         return 2
@@ -1413,6 +1458,12 @@ def main() -> int:
     if args.hand_tracking and args.hand_model is None:
         print("--hand-tracking icin --hand-model zorunludur; model otomatik indirilmez.", file=sys.stderr)
         return 2
+    if args.hand_gesture_only and not args.hand_tracking:
+        print("--hand-gesture-only icin --hand-tracking gerekli.", file=sys.stderr)
+        return 2
+    if args.hand_gesture_only:
+        args.dex3_retargeting = False
+        args.embed_hand_in_body = False
     if args.dex3_retargeting and not args.hand_tracking:
         # Retargeting has no input while hand tracking is disabled. Keep the
         # legacy BODY_38-only command valid without constructing hand state.
@@ -1616,6 +1667,7 @@ def main() -> int:
     fps_started_at = started_at
     fps_frames = 0
     measured_fps = 0.0
+    grab_events: deque[float] = deque(maxlen=240)
     diagnostics_visible = True
     policy_powered_requested = False
     control_mode_revision = 0
@@ -1875,6 +1927,15 @@ def main() -> int:
                 time.sleep(0.002)
                 continue
             grab_failure_started = None
+            grab_now = time.monotonic()
+            grab_events.append(grab_now)
+            while grab_events and grab_now - grab_events[0] > 2.0:
+                grab_events.popleft()
+            observed_grab_hz = (
+                (len(grab_events) - 1) / (grab_events[-1] - grab_events[0])
+                if len(grab_events) > 1 and grab_events[-1] > grab_events[0]
+                else None
+            )
 
             zed.retrieve_image(left_image, sl.VIEW.LEFT)
             # sl.Mat owns a reusable SDK buffer.  Copy it immediately: the
@@ -2180,7 +2241,7 @@ def main() -> int:
                 # compact, separately versioned hand datagram is transmitted.
                 if hand_pipeline is not None:
                     depth_image = None
-                    if hand_pipeline.due(timestamp_ns):
+                    if not args.hand_gesture_only and hand_pipeline.due(timestamp_ns):
                         depth_result = zed.retrieve_measure(
                             hand_depth, sl.MEASURE.DEPTH
                         )
@@ -2203,6 +2264,8 @@ def main() -> int:
                             indices=IDX,
                         )
                         if hand_packet is not None:
+                            if args.hand_gesture_only:
+                                hand_packet = compact_gesture_packet(hand_packet)
                             record["hand_tracking"] = hand_packet
                             if single_camera_dex3 is not None:
                                 dex3_targets, dex3_control = (
@@ -2213,7 +2276,13 @@ def main() -> int:
                                 record["dex3_targets"] = dex3_targets
                                 record["dex3_control"] = dex3_control
                             if hand_socket is not None and hand_target is not None:
-                                hand_socket.sendto(hand_pipeline.encode(hand_packet), hand_target)
+                                if args.hand_gesture_only:
+                                    if not valid_gesture_packet(hand_packet):
+                                        raise ValueError("invalid coarse hand gesture packet")
+                                    hand_payload = json.dumps(hand_packet, allow_nan=False, separators=(",", ":")).encode("utf-8")
+                                else:
+                                    hand_payload = hand_pipeline.encode(hand_packet)
+                                hand_socket.sendto(hand_payload, hand_target)
                                 hand_packets_sent += 1
                     except (OSError, ValueError, RuntimeError) as exc:
                         record["hand_tracking"] = {
@@ -2276,13 +2345,19 @@ def main() -> int:
                         0.0, (time.time_ns() - timestamp_ns) / 1e6
                     )
                     processing_complete_ns = time.time_ns()
+                    if time.monotonic() >= ptp_next_read_monotonic:
+                        ptp_status = read_ptp_status(ptp_status_path, processing_complete_ns)
+                        ptp_next_read_monotonic = time.monotonic() + 1.0
                     packet = sanitize_for_json(
                         {
                             "schema": "zed_body38_live/v1",
                             "source_serial": source_serial,
                             "source_host_id": str(args.source_host_id),
+                            "research_session_id": research_session_id,
+                            "clock_sync": ptp_status,
                             "source_configuration": {
                                 "fps": int(args.fps),
+                                "resolution": "HD720",
                                 "body_model": str(args.model),
                                 "depth_mode": str(args.depth_mode),
                                 "frame_integrity_mode": str(args.frame_integrity_mode),
@@ -2358,6 +2433,8 @@ def main() -> int:
                                 "t2_windows_udp_send_ns": processing_complete_ns,
                             },
                             "transport_metrics": {
+                                "camera_grab_hz_observed": observed_grab_hz,
+                                "body_output_hz_observed": measured_fps if measured_fps > 0 else None,
                                 "source_interval_ms": source_interval_ms,
                                 "capture_to_send_ms": capture_to_send_ms,
                                 "zed_processing_ms": max(

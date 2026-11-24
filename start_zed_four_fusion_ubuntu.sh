@@ -16,6 +16,7 @@ record=0
 headless=0
 skip_gmr_check=0
 hand_tracking=0
+hand_gesture_only=0
 hand_max_age_ms="120"
 hand_max_spread_ms="70"
 disable_dex3_retargeting=0
@@ -24,6 +25,8 @@ dex3_official_root=""
 dex3_official_python=""
 record_detail="research"
 fusion_priority_profile="balanced"
+workspace_x_min_m="${G1_OPERATOR_WORKSPACE_X_MIN_M:-2.0}"
+workspace_x_max_m="${G1_OPERATOR_WORKSPACE_X_MAX_M:-4.0}"
 
 usage() {
   cat <<'EOF'
@@ -32,11 +35,13 @@ Kullanim: ./start_zed_four_fusion_ubuntu.sh [secenekler]
   --reference-serial 33773329
   --minimum-sources 2|3|4  (canli teleoperation varsayilani: 2)
   --fps 1..30 --preview-hz HZ
-  --hand-tracking [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
+  --hand-tracking [--hand-gesture-only] [--hand-max-age-ms 120] [--hand-max-spread-ms 70]
   --disable-dex3-retargeting --disable-single-view-hand-depth
   --dex3-official-root PATH --dex3-official-python PATH
   --record-detail minimal|research|full
   --fusion-priority-profile balanced|main-pc-preferred|main-pc-dominant-shadow
+  --workspace-x-min-m M --workspace-x-max-m M
+                           (referans ZED dunya X operator hacmi; varsayilan 2.0..4.0 m)
   --record --headless --skip-gmr-check
 EOF
 }
@@ -49,6 +54,7 @@ while (($#)); do
     --fps) fps="${2:?}"; shift 2 ;;
     --preview-hz) preview_hz="${2:?}"; shift 2 ;;
     --hand-tracking) hand_tracking=1; shift ;;
+    --hand-gesture-only) hand_gesture_only=1; shift ;;
     --hand-max-age-ms) hand_max_age_ms="${2:?}"; shift 2 ;;
     --hand-max-spread-ms) hand_max_spread_ms="${2:?}"; shift 2 ;;
     --disable-dex3-retargeting) disable_dex3_retargeting=1; shift ;;
@@ -57,6 +63,8 @@ while (($#)); do
     --dex3-official-python) dex3_official_python="${2:?}"; shift 2 ;;
     --record-detail) record_detail="${2:?}"; shift 2 ;;
     --fusion-priority-profile) fusion_priority_profile="${2:?}"; shift 2 ;;
+    --workspace-x-min-m) workspace_x_min_m="${2:?}"; shift 2 ;;
+    --workspace-x-max-m) workspace_x_max_m="${2:?}"; shift 2 ;;
     --record) record=1; shift ;;
     --headless) headless=1; shift ;;
     --skip-gmr-check) skip_gmr_check=1; shift ;;
@@ -66,6 +74,10 @@ while (($#)); do
 done
 
 [[ -x "$zed_python" ]] || { echo "ZED Python bulunamadi: $zed_python" >&2; exit 1; }
+if (( hand_gesture_only && ! hand_tracking )); then
+  echo "--hand-gesture-only icin --hand-tracking gerekli." >&2
+  exit 2
+fi
 case "$minimum_sources" in 2|3|4) ;; *) echo "--minimum-sources 2, 3 veya 4 olmali." >&2; exit 2 ;; esac
 case "$record_detail" in minimal|research|full) ;; *) echo "--record-detail minimal, research veya full olmali." >&2; exit 2 ;; esac
 case "$fusion_priority_profile" in
@@ -151,22 +163,24 @@ args=(
   --minimum-sources "$minimum_sources"
   --preview-hz "$preview_hz"
   --record-detail "$record_detail"
+  --workspace-x-min "$workspace_x_min_m"
+  --workspace-x-max "$workspace_x_max_m"
 )
 if [[ "$fusion_priority_profile" == "main-pc-preferred" ]]; then
   args+=(
-    --source-priority 31571870:1.0
-    --source-priority 33773329:1.0
-    --source-priority 34760587:0.60
-    --source-priority 39504762:0.60
+    --source-priority 39504762:1.5
+    --source-priority 34760587:1.5
+    --source-priority 31571870:0.50
+    --source-priority 33773329:0.50
   )
 elif [[ "$fusion_priority_profile" == "main-pc-dominant-shadow" ]]; then
-  # 34760587 is not opened by the receiver. Recovery is disabled so the
+  # 31571870 is not opened by the receiver. Recovery is disabled so the
   # remaining laptop view can never be promoted over the two main-PC views.
   args+=(
-    --exclude-source 34760587
-    --source-priority 31571870:2.0
-    --source-priority 33773329:2.0
-    --source-priority 39504762:0.75
+    --exclude-source 31571870
+    --source-priority 39504762:2.0
+    --source-priority 34760587:2.0
+    --source-priority 33773329:0.75
     --no-source-priority-recovery
   )
 fi
@@ -176,6 +190,7 @@ if (( hand_tracking )); then
     --hand-max-age-ms "$hand_max_age_ms"
     --hand-max-spread-ms "$hand_max_spread_ms"
   )
+  (( hand_gesture_only )) && args+=(--hand-gesture-only --disable-dex3-retargeting)
   (( disable_dex3_retargeting )) && args+=(--disable-dex3-retargeting)
   (( disable_single_view_hand_depth )) && args+=(--disable-single-view-hand-depth)
   [[ -n "$dex3_official_root" ]] && args+=(--dex3-official-root "$dex3_official_root")
@@ -186,5 +201,5 @@ fi
 
 source_count=4
 [[ "$fusion_priority_profile" == "main-pc-dominant-shadow" ]] && source_count=3
-echo "${source_count}-ZED Fusion | GMR=127.0.0.1:15050 | Rerun=:15052 | ROS=:15054 | kaynak>=${minimum_sources}/${source_count} | oncelik=${fusion_priority_profile}"
+echo "${source_count}-ZED Fusion | GMR=127.0.0.1:15050 | Rerun=:15052 | ROS=:15054 | kaynak>=${minimum_sources}/${source_count} | oncelik=${fusion_priority_profile} | operator_X=${workspace_x_min_m}..${workspace_x_max_m}m"
 exec "$project/zed_four_camera_test/start_distributed_receiver_ubuntu.sh" "${args[@]}"
